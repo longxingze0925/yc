@@ -1,0 +1,211 @@
+# 系统架构设计
+
+## 1. 总体架构
+
+```text
+主控端 iOS 16+ / Windows / Ubuntu
+        |
+        | HTTPS / WSS
+        v
+API Server + Signal Server
+        |
+        | 会话协商、权限校验、候选地址、Relay 分配
+        v
+被控端 Windows / Ubuntu
+
+实际远控数据链路：
+LAN Direct -> UDP P2P -> QUIC Relay -> TLS 443 Relay
+```
+
+## 2. 模块划分
+
+客户端：
+
+- `remote-core`：设备身份、会话状态机、权限策略。
+- `remote-protocol`：协议结构、信令消息、二进制消息头。
+- `remote-transport`：连接路径、候选链路、传输抽象。
+- `remote-crypto`：设备密钥、会话密钥、密钥材料封装。
+- `remote-capture`：Windows/Ubuntu 屏幕采集抽象。
+- `remote-render`：Windows/Ubuntu/iOS 画面渲染抽象。
+- `remote-input`：键盘、IME、组合键和输入状态恢复抽象。
+- `remote-media`：媒体能力协商、质量控制和统计抽象。
+- `apps/desktop`：Windows/Ubuntu 桌面 UI。
+- `apps/ios`：iOS 主控端。
+
+服务端：
+
+- `api-server`：账号、设备、权限、会话、审计 API。
+- `signal-server`：WebSocket 信令、在线状态、会话协商。
+- `relay-server`：QUIC Relay、TLS 443 Relay、流量统计。
+- `admin-web`：企业后台。
+- `release pipeline`：客户端安装包、更新 manifest、SBOM 和发布审计。
+- `abuse/risk engine`：反诈、限流、举报和处置评估。
+
+基础设施：
+
+- PostgreSQL：持久数据。
+- Redis：在线状态、验证码、短期会话状态。
+- Object Storage：客户端升级包、SBOM、日志归档、QA 证据和后续可选大对象。
+- Prometheus/Grafana/OpenTelemetry：指标、日志、链路追踪。
+
+V1 Core 基础文件传输内容默认走应用层端到端加密远控数据通道，不经服务端对象存储。对象存储中的文件传输临时缓存只作为离线传输、断点续传或 M8 企业增强的可选能力；启用前必须另行冻结对象元数据、权限、区域驻留和留存策略。
+
+## 3. 连接路径
+
+连接优先级：
+
+```text
+1. LAN Direct
+2. UDP P2P
+3. QUIC Relay
+4. TLS 443 Relay
+```
+
+选择规则：
+
+- 优先选择直连路径，降低延迟和中继成本。
+- Relay 只在直连失败或策略要求时使用。
+- TLS 443 Relay 是企业网络和 UDP 阻断场景的兜底。
+- 连接状态机必须支持链路切换和断线重连。
+- M8 企业区域策略启用后，Relay 选择必须先满足组织允许区域；无合规 Relay 时按策略 fail-closed。
+
+## 4. 会话生命周期
+
+```text
+Created
+  -> WaitingForApproval
+  -> Approved
+  -> Connecting
+  -> Connected
+  -> Degraded
+  -> Reconnecting
+  -> Closed
+
+Created/WaitingForApproval 可由主控端取消进入 Cancelled
+
+任意阶段可进入 Failed
+```
+
+状态映射：
+
+- `Created`：对应 `pending_code_verification`、`pending_unattended_verification` 或 `WaitingForApproval` 前的会话创建结果。
+- `WaitingForApproval`：对应 `code_verified` 后等待被控端确认，或 `waiting_approval`。
+- `Approved`：对应 `accepted`、无需当次确认的 `unattended_verified`。
+- `Connecting`：对应候选交换、链路竞速和 signed key exchange 阶段。
+- `Connected`：对应 `connected`。
+- `Degraded`：对应 `degraded`，表示业务仍可用但链路质量下降，可能触发路径切换或重协商。
+- `Reconnecting`：对应 `reconnecting`。
+- `Cancelled`：对应 `cancelled`，只表示业务通道建立前主控端主动取消。
+- `Closed`：对应 `closed`。
+- `Failed`：对应 `failed`。
+
+关键原则：
+
+- 会话创建前必须完成账号和设备权限校验。
+- 候选交换、Relay 分配、signed key exchange 和业务传输开始前，必须由 API 状态确认已达到可建链门槛；Signal 只能推送通知，不能绕过 `accepted` 或 `unattended_verified` 状态。
+- 会话结束必须释放采集、编码、输入和网络资源。
+- 会话状态变化必须写入审计或会话事件。
+- 远程重启会关闭旧会话；设备重启后只能通过新会话恢复，不能复用旧会话密钥。
+
+## 5. 安全架构
+
+设备身份：
+
+- 每台设备生成长期密钥对。
+- 服务端保存设备公钥，不保存私钥。
+- 账号身份和设备身份分离。
+- 设备上线必须通过设备私钥签名服务端 challenge。
+
+会话安全：
+
+- 登录和信令走 HTTPS/WSS。
+- 数据传输走 QUIC/TLS。
+- 首版远控业务通道必须使用应用层端到端会话密钥。
+- 文件传输、剪贴板、无人值守均为独立权限。
+- 隐私屏和本地输入保护均为独立权限，必须绑定 `permissions_digest`。
+- MFA、风险验证、反诈与滥用、条件访问和供应链防伪以对应专项文档为准。
+- 密钥交换、重放保护和日志禁止项以 `docs/spec/20260719171718533_安全与密钥协议设计.md` 为准。
+- NAT 穿透、链路竞速和断线重连以 `docs/spec/20260719171718533_NAT穿透与连接状态机设计.md` 为准。
+- 远程重启、键盘/IME、媒体协商、会话录制边界和企业区域驻留以新增专项文档为准。
+
+被控端安全：
+
+- 必须有连接状态提示。
+- 必须有一键断开。
+- 不能隐藏运行远控。
+- 不能绕过系统权限提示。
+- 隐私屏和本地输入保护必须显式授权、明显提示、可恢复。
+- 临时协助和陌生账号连接必须显示反诈风险提示和举报入口。
+- 远程重启必须本地可见、可取消，执行前释放隐私屏、本地输入保护和采集资源。
+
+## 6. 高可用设计
+
+第一版：
+
+- 单区域部署。
+- API、Signal、Relay 可单实例启动。
+- PostgreSQL 和 Redis 本地部署。
+
+商用版：
+
+- API Server 横向扩展。
+- Signal Server 使用 Redis 共享在线状态。
+- Relay Server 多节点调度。
+- PostgreSQL 主从或云托管。
+- Redis 高可用。
+- 企业区域路由和数据驻留策略。
+
+## 7. 可观测性
+
+必须采集：
+
+- API 请求延迟和错误率。
+- WebSocket 在线连接数。
+- 会话创建、连接、失败、断开次数。
+- P2P 成功率。
+- Relay 使用率和流量。
+- RTT、丢包、抖动、码率、帧率。
+- 客户端 CPU、内存、编码耗时。
+- 反诈限流、举报、处置和误报恢复。
+- 媒体协商结果、质量档位、关键帧请求和降级原因。
+- 键盘/IME unsupported、按键释放恢复结果。
+- 远程重启请求、执行、上线恢复和失败原因。
+
+日志要求：
+
+- 不记录密码、验证码明文、私钥、剪贴板内容和文件内容。
+- 错误日志必须包含会话 ID、设备 ID、连接路径和错误码。
+
+## 8. 部署形态
+
+SaaS：
+
+- 官方托管 API、Signal、Relay。
+- 用户开箱即用。
+- `V1 Core` 只要求官方托管基础服务可支撑个人/小团队远控闭环，不包含商业运营后台、计费、企业组织策略和私有化交付。
+
+私有化：
+
+- 企业自部署全部服务。
+- 客户端支持配置服务地址。
+- Relay 节点可独立扩展。
+- 私有化客户端必须有独立 release channel 或明确企业配置，不能伪装官方 SaaS 客户端。
+- M8 必须支持组织区域策略、Relay 区域 allow/deny 和数据驻留配置。
+
+`V1 Core` 只要求官方托管基础服务和本地 Docker Compose 编排能启动必要服务，客户端支持配置服务地址。完整商业 SaaS 运营、私有化部署、Admin Web 和企业策略属于 `V1 Commercial/M8`；`V1 Commercial` 首版私有化使用 Docker Compose，后续预留 Kubernetes。
+
+## 9. 架构禁止项
+
+不得引入：
+
+- Electron 作为桌面客户端核心 UI。
+- 纯 VNC/RDP 作为核心远控协议。
+- 单 TCP 长连接承载所有远控数据。
+- 服务端可解密所有远控控制内容的设计。
+- 无审计的无人值守访问。
+- 无审计或不可恢复的隐私屏、本地输入保护。
+- 服务端集中解密录制远控业务流。
+- 静默远程重启或重启后复用旧会话密钥。
+- 未签名 manifest 或 hash 不可验证的客户端自动更新。
+- 未经设备签名证明就允许设备上线的设计。
+- 只实现 Relay、不实现 P2P 探测和链路竞速的设计。

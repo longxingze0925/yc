@@ -1,0 +1,11 @@
+/target/
+**/target/
+**/target-agent-ubuntu/
+/.build/
+/.idea/
+/.vscode/
+*.log
+*.tmp
+.DS_Store
+/infra/docker-compose/.env
+/infra/docker-compose/local-secrets/

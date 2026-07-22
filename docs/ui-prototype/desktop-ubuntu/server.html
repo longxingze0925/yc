@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>自建服务器 - 远控 Ubuntu 26.04 LTS</title>
+  <link rel="stylesheet" href="../_shared/base.css">
+</head>
+<body class="desktop-preview-page">
+  <main class="desktop-preview">
+    <section class="desktop-app-frame reference-layout" aria-label="自建服务器设置">
+      <header class="desktop-titlebar ubuntu"><span class="ubuntu-window-controls" aria-hidden="true"><i></i><i></i><i></i></span><strong>远控</strong><span class="desktop-platform-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M8 8h8M8 12h5M8 16h3"/></svg>Ubuntu 26.04 LTS</span></header>
+      <div class="desktop-app-body">
+        <aside class="desktop-sidebar">
+          <div class="desktop-brand">
+            <span class="desktop-brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect width="18" height="12" x="3" y="4" rx="2"/><path d="M8 20h8M12 16v4M8 10l2 2 4-4"/></svg></span>
+            <span class="desktop-brand-copy"><strong>远控</strong><small>统一桌面客户端</small></span>
+          </div>
+
+          <nav class="desktop-sidebar-menu" aria-label="主导航">
+            <section class="desktop-sidebar-group">
+              <div class="desktop-sidebar-group-title">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                <span>我的设备</span>
+                <svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>
+              </div>
+              <div class="desktop-sidebar-device-list">
+                <a class="desktop-sidebar-device" href="controlled.html">
+                  <span class="desktop-sidebar-device-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+                  <span class="desktop-sidebar-device-copy"><strong>办公室 Ubuntu</strong><small>本机 · 在线</small></span>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                </a>
+                <a class="desktop-sidebar-device" href="devices.html">
+                  <span class="desktop-sidebar-device-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+                  <span class="desktop-sidebar-device-copy"><strong>设计部 Windows</strong><small>在线 · 无人值守</small></span>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                </a>
+                <a class="desktop-sidebar-device" href="devices.html#home-ubuntu">
+                  <span class="desktop-sidebar-device-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+                  <span class="desktop-sidebar-device-copy"><strong>家中 Ubuntu</strong><small>在线 · 需确认</small></span>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                </a>
+                <a class="desktop-sidebar-command" href="home.html">
+                  <span class="command-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span>
+                  <span>全部设备</span>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                </a>
+              </div>
+            </section>
+
+            <section class="desktop-sidebar-group">
+              <div class="desktop-sidebar-group-title">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/><path d="M8 12h8M12 8v8"/></svg>
+                <span>远程协助</span>
+                <svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>
+              </div>
+              <a class="desktop-sidebar-command" href="assist.html">
+                <span class="command-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4M12 8v5M9.5 10.5h5"/></svg></span>
+                <span>开始协助</span>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+              </a>
+            </section>
+
+            <section class="desktop-sidebar-group">
+              <div class="desktop-sidebar-group-title">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 15v6M9 18h6M5 3h14a2 2 0 0 1 2 2v8H3V5a2 2 0 0 1 2-2Z"/></svg>
+                <span>工具</span>
+                <svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>
+              </div>
+              <a class="desktop-sidebar-command" href="transfer.html">
+                <span class="command-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M12 18v-6M9 15l3 3 3-3"/></svg></span>
+                <span>文件传输</span>
+              </a>
+              <a class="desktop-sidebar-command" href="history.html">
+                <span class="command-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l4 2"/></svg></span>
+                <span>会话记录</span>
+              </a>
+            </section>
+          </nav>
+
+          <div class="desktop-sidebar-spacer"></div>
+          <div class="desktop-sidebar-tools">
+            <a class="desktop-sidebar-command active" href="settings.html">
+              <span class="command-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1a8 8 0 0 0-1.8-1L14.4 3h-4l-.4 3a8 8 0 0 0-1.8 1l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2.1l-2 1.5 2 3.4 2.4-1a8 8 0 0 0 1.8 1l.4 3h4l.4-3a8 8 0 0 0 1.8-1l2.4 1 2-3.4-2-1.5a7 7 0 0 0 .1-1Z"/></svg></span>
+              <span>设置</span>
+            </a>
+          </div>
+          <a class="desktop-account-chip" href="settings.html">
+            <span class="desktop-avatar">LX</span>
+            <span class="desktop-account-copy"><strong>龙行者</strong><small>owner@example.com</small></span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </a>
+        </aside>
+
+        <section class="desktop-workspace">
+          <header class="desktop-pagebar"><a class="desktop-icon-button" href="settings.html" title="返回设置" aria-label="返回设置"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg></a><div class="desktop-page-heading"><h1>自建服务器</h1><p>连接你自己部署的 API、Signal 和 Relay 服务</p></div></header>
+          <div class="desktop-content">
+            <div class="desktop-server-banner" id="server-status">
+              <span class="desktop-server-banner-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6 6h.01M6 18h.01"/></svg></span>
+              <span><strong>使用自建服务器</strong><small>地址由你配置，客户端不会写死服务端信息</small></span>
+              <label class="desktop-switch" title="启用自建服务器"><input id="custom-server-enabled" type="checkbox"><span></span></label>
+            </div>
+
+            <section class="desktop-card">
+              <div class="desktop-card-header"><div><h2>连接配置</h2><p>所有地址必须使用受信任证书；保存前会校验服务器身份</p></div></div>
+              <form class="desktop-settings-form" id="server-form">
+                <div class="desktop-field"><label for="api-url">API 地址</label><input id="api-url" name="api-url" type="url" placeholder="https://api.example.com" autocomplete="off"><div class="desktop-field-hint">账号、设备与会话 API 的 HTTPS 地址</div></div>
+                <div class="desktop-field"><label for="signal-url">Signal 地址</label><input id="signal-url" name="signal-url" type="url" placeholder="wss://signal.example.com" autocomplete="off"><div class="desktop-field-hint">设备在线状态与会话协商的 WebSocket 地址</div></div>
+                <div class="desktop-field"><label for="relay-url">Relay 地址</label><input id="relay-url" name="relay-url" type="text" placeholder="relay.example.com:443" autocomplete="off"><div class="desktop-field-hint">P2P 不可用时使用的 QUIC / TLS 443 Relay 入口</div></div>
+                <div class="desktop-field"><label for="server-key">服务器公钥</label><input id="server-key" name="server-key" type="text" placeholder="粘贴服务器公钥或公钥指纹" autocomplete="off" spellcheck="false"><div class="desktop-field-hint">用于固定服务器身份；变更公钥时必须重新确认</div></div>
+                <div class="desktop-inline-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-8 8.8C7.5 20.5 4 18 4 13V5l8-3 8 3z"/><path d="m9 12 2 2 4-4"/></svg><span>自建 API、Signal 和 Relay 仍不能解密远控业务内容。首次连接前请从可信渠道核对服务器公钥。</span></div>
+                <div class="desktop-settings-form-actions"><button class="desktop-button" id="test-server" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20 11a8.1 8.1 0 1 0 .5 4M20 4v7h-7"/></svg>测试连接</button><button class="desktop-button primary" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg>保存配置</button></div>
+              </form>
+            </section>
+
+            <section class="desktop-section desktop-card desktop-settings-group">
+              <div class="desktop-card-header"><div><h2>当前配置</h2><p>未启用自建服务器时使用默认部署配置</p></div></div>
+              <div class="desktop-setting-row"><span class="desktop-setting-copy"><strong>配置状态</strong><small>切换服务端后需要重新登录并注册设备在线状态</small></span><span class="desktop-setting-value" id="configuration-state">默认配置</span></div>
+              <div class="desktop-setting-row"><span class="desktop-setting-copy"><strong>证书校验</strong><small>拒绝无效、过期或主机名不匹配的证书</small></span><span class="desktop-status-label">强制开启</span></div>
+            </section>
+          </div>
+          <footer class="desktop-statusbar"><span id="server-footer-state">尚未填写自建服务器</span><span>证书校验开启</span><span class="status-spacer"></span><a href="login.html">返回登录</a></footer>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const serverForm = document.querySelector('#server-form');
+    const serverToggle = document.querySelector('#custom-server-enabled');
+    const configurationState = document.querySelector('#configuration-state');
+    const serverFooterState = document.querySelector('#server-footer-state');
+
+    function hasCompleteConfiguration() {
+      return ['#api-url', '#signal-url', '#relay-url', '#server-key']
+        .every((selector) => document.querySelector(selector).value.trim().length > 0);
+    }
+
+    serverToggle.addEventListener('change', () => {
+      configurationState.textContent = serverToggle.checked ? '自建服务器待配置' : '默认配置';
+    });
+
+    document.querySelector('#test-server').addEventListener('click', () => {
+      serverFooterState.textContent = hasCompleteConfiguration()
+        ? '配置格式完整，等待真实客户端执行连通性检测'
+        : '请先完整填写 API、Signal、Relay 和服务器公钥';
+    });
+
+    serverForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      if (!hasCompleteConfiguration()) {
+        serverFooterState.textContent = '配置未保存：必填项不完整';
+        return;
+      }
+      serverToggle.checked = true;
+      configurationState.textContent = '自建服务器已配置';
+      serverFooterState.textContent = '配置已保存，重新登录后生效';
+    });
+  </script>
+  <script src="../_shared/desktop-shell.js"></script>
+</body>
+</html>

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>iOS 主控 - 设备</title>
+  <link rel="stylesheet" href="../_shared/base.css">
+</head>
+<body class="ios-preview-page">
+  <main class="ios-preview">
+    <section class="ios-frame" aria-label="iOS 设备页面预览">
+      <div class="ios-app">
+        <header class="ios-statusbar">
+          <span>9:41</span>
+          <span class="ios-system-status" aria-label="5G 网络，电量 82%">
+            <span class="ios-signal" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+            <span>5G</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M8.5 16a6 6 0 0 1 7 0"/><path d="M12 20h.01"/></svg>
+            <span class="ios-battery" aria-hidden="true"></span>
+          </span>
+        </header>
+
+        <div class="ios-scroll">
+          <header class="ios-large-header">
+            <div class="ios-header-copy">
+              <h1 class="ios-device-title">可控设备</h1>
+            </div>
+            <button class="ios-filter-button" type="button" title="筛选设备">
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16"/><path d="M7 12h10"/><path d="M10 18h4"/></svg>
+              全部设备
+            </button>
+          </header>
+
+          <section class="ios-device-group" aria-labelledby="controllable-devices">
+            <div class="ios-group-heading">
+              <h2 id="controllable-devices">在线设备 <span class="ios-group-count">2</span><svg class="ios-group-collapse" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></h2>
+            </div>
+            <div class="ios-device-list">
+              <a class="ios-device-row" href="session.html">
+                <span class="ios-device-visual office">
+                  <span class="ios-online-badge">在线</span>
+                  <span class="ios-os-mark">WIN</span>
+                </span>
+                <span class="ios-device-copy">
+                  <span class="ios-device-name">办公室 Windows</span>
+                  <span class="ios-device-meta">Windows 11 · 可直接连接</span>
+                </span>
+                <svg class="ios-device-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
+              </a>
+
+              <a class="ios-device-row" href="session.html">
+                <span class="ios-device-visual ubuntu">
+                  <span class="ios-online-badge">在线</span>
+                  <span class="ios-os-mark">U</span>
+                </span>
+                <span class="ios-device-copy">
+                  <span class="ios-device-name">Ubuntu 工作站</span>
+                  <span class="ios-device-meta">Ubuntu 26.04 · 可直接连接</span>
+                </span>
+                <svg class="ios-device-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
+              </a>
+            </div>
+          </section>
+
+          <section class="ios-device-group" aria-labelledby="offline-devices">
+            <div class="ios-group-heading">
+              <h2 id="offline-devices">离线设备 <span class="ios-group-count">2</span><svg class="ios-group-collapse" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></h2>
+            </div>
+            <div class="ios-device-list">
+              <a class="ios-device-row offline" href="#">
+                <span class="ios-device-visual offline"><span class="ios-os-mark">WIN</span></span>
+                <span class="ios-device-copy">
+                  <span class="ios-device-name">家用电脑</span>
+                  <span class="ios-device-meta">2 小时前在线</span>
+                </span>
+                <svg class="ios-device-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
+              </a>
+
+              <a class="ios-device-row offline" href="#">
+                <span class="ios-device-visual offline"><span class="ios-os-mark">U</span></span>
+                <span class="ios-device-copy">
+                  <span class="ios-device-name">测试主机</span>
+                  <span class="ios-device-meta">已关闭远程访问</span>
+                </span>
+                <svg class="ios-device-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
+              </a>
+            </div>
+          </section>
+        </div>
+
+        <nav class="ios-tabbar" aria-label="主导航">
+          <a class="tab active" href="mine.html" aria-current="page">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="10" x="2" y="3" rx="2"/><path d="M8 17h4M10 13v4"/><rect width="6" height="10" x="16" y="11" rx="2"/></svg>
+            <span>设备</span>
+          </a>
+          <a class="tab" href="assist.html">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a8 8 0 0 1 16 0"/><path d="M18 19c0 1.1-.9 2-2 2h-3"/><path d="M4 14h3v6H6a2 2 0 0 1-2-2v-4ZM20 14h-3v6h1a2 2 0 0 0 2-2v-4Z"/></svg>
+            <span>远程协助</span>
+          </a>
+          <a class="tab" href="profile.html">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            <span>我的</span>
+          </a>
+        </nav>
+        <div class="ios-home-indicator" aria-hidden="true"></div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

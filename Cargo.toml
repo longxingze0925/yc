@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/remote-core",
+    "crates/remote-protocol",
+    "crates/remote-store",
+    "crates/remote-transport",
+    "crates/remote-crypto",
+    "crates/remote-capture",
+    "crates/remote-render",
+    "services/api-server",
+    "services/signal-server",
+    "services/relay-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+authors = ["Remote Control Project"]
+
+[workspace.dependencies]
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

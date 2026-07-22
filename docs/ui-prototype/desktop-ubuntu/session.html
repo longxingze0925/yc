@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RC 远控 - Ubuntu 远控会话</title>
+    <link rel="stylesheet" href="../_shared/base.css">
+  </head>
+  <body class="desktop-preview-page">
+    <main class="desktop-preview">
+      <section class="desktop-app-frame desktop-session-frame">
+        <header class="desktop-titlebar ubuntu">
+          <span class="ubuntu-window-controls" aria-hidden="true"><i></i><i></i><i></i></span>
+          <strong>办公室 Windows 11 - 远程桌面</strong>
+          <span class="desktop-platform-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M8 8h8M8 12h5M8 16h3"/></svg>Ubuntu 26.04 LTS</span>
+        </header>
+
+        <section class="desktop-session-layout">
+          <header class="desktop-session-head">
+            <span class="desktop-device-symbol"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+            <span class="desktop-session-device"><strong>办公室 Windows 11</strong><span>583 026 194 · 端到端加密</span></span>
+            <span class="desktop-session-head-spacer"></span>
+            <span class="desktop-session-metric">P2P · 24 ms · 60 fps</span>
+            <button class="desktop-icon-button" type="button" title="进入全屏"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/></svg></button>
+          </header>
+
+          <div class="desktop-session-stage">
+            <div class="desktop-remote-screen" role="img" aria-label="远程 Windows 桌面画面">
+              <div class="desktop-session-hud"><span>1920 × 1080</span><span>H.264</span><span>自适应画质</span></div>
+            </div>
+          </div>
+
+          <section class="desktop-session-panel" id="actions-panel" hidden>
+            <div class="desktop-session-panel-section">
+              <h2>快捷操作</h2>
+              <div class="desktop-session-quick">
+                <button type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>锁定设备</button>
+                <button type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 4v6h6M20 20v-6h-6"/><path d="M5.5 15A8 8 0 0 0 19 17M18.5 9A8 8 0 0 0 5 7"/></svg>发送 Ctrl+Alt+Del</button>
+                <button type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>远程重启</button>
+                <button class="active" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>适应窗口</button>
+                <button type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v18M3 12h18"/></svg>原始尺寸</button>
+                <button type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 8h8v8H8z"/></svg>窗口模式</button>
+              </div>
+            </div>
+
+            <div class="desktop-session-panel-section">
+              <h2>控制与画质</h2>
+              <div class="desktop-session-option-list">
+                <div class="desktop-session-option"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m5 3 14 8-6 2-2 6L5 3Z"/></svg><span class="desktop-session-option-copy"><strong>控制模式</strong><small>鼠标与键盘</small></span><label class="desktop-switch"><input type="checkbox" checked><span></span></label></div>
+                <div class="desktop-session-option"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h18M12 3v18"/></svg><span class="desktop-session-option-copy"><strong>画面质量</strong><small>自适应 · 优先流畅</small></span><span class="desktop-setting-value">自动</span></div>
+                <div class="desktop-session-option"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20V10M18 20V4M6 20v-4"/></svg><span class="desktop-session-option-copy"><strong>帧率上限</strong><small>当前 60 fps</small></span><span class="desktop-setting-value">60</span></div>
+              </div>
+            </div>
+
+            <div class="desktop-session-panel-section">
+              <h2>会话权限</h2>
+              <div class="desktop-session-option-list">
+                <div class="desktop-session-option"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="8" y="3" width="8" height="4" rx="1"/><path d="M9 5H6a2 2 0 0 0-2 2v13h16V7a2 2 0 0 0-2-2h-3"/></svg><span class="desktop-session-option-copy"><strong>剪贴板同步</strong><small>已获得本次授权</small></span><label class="desktop-switch"><input type="checkbox" checked><span></span></label></div>
+                <div class="desktop-session-option"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg><span class="desktop-session-option-copy"><strong>隐私屏</strong><small>需要远端单独授权</small></span><label class="desktop-switch"><input type="checkbox"><span></span></label></div>
+                <div class="desktop-session-option"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="M9 12h6"/></svg><span class="desktop-session-option-copy"><strong>本地输入保护</strong><small>高风险 · 当前关闭</small></span><label class="desktop-switch"><input type="checkbox"><span></span></label></div>
+              </div>
+            </div>
+          </section>
+
+          <nav class="desktop-session-toolbar" aria-label="远控工具栏">
+            <button class="desktop-session-tool" type="button" title="选择远程显示器"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span>显示桌面</span></button>
+            <button class="desktop-session-tool active" type="button" title="打开远程键盘"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h.01M11 9h.01M15 9h.01M7 13h.01M11 13h6M7 16h10"/></svg><span>键盘</span></button>
+            <button class="desktop-session-tool" id="actions-button" type="button" aria-controls="actions-panel" aria-expanded="false" title="展开会话操作"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1a8 8 0 0 0-1.8-1L14.4 3h-4l-.4 3a8 8 0 0 0-1.8 1l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2.1l-2 1.5 2 3.4 2.4-1a8 8 0 0 0 1.8 1l.4 3h4l.4-3a8 8 0 0 0 1.8-1l2.4 1 2-3.4-2-1.5a7 7 0 0 0 .1-1Z"/></svg><span>操作</span></button>
+            <button class="desktop-session-tool danger" id="disconnect-button" type="button" title="断开远程会话"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10.7 13.3a4 4 0 0 0 5.7 0l2.3-2.3a4 4 0 0 0-5.7-5.7l-1.3 1.3M13.3 10.7a4 4 0 0 0-5.7 0L5.3 13a4 4 0 0 0 5.7 5.7l1.3-1.3M4 4l16 16"/></svg><span>断开</span></button>
+          </nav>
+        </section>
+      </section>
+    </main>
+    <script>
+      const actionsButton = document.querySelector('#actions-button');
+      const actionsPanel = document.querySelector('#actions-panel');
+      const setActionsOpen = (open) => {
+        actionsPanel.hidden = !open;
+        actionsButton.classList.toggle('active', open);
+        actionsButton.setAttribute('aria-expanded', String(open));
+        if (open) history.replaceState(null, '', '#actions');
+        else history.replaceState(null, '', location.pathname);
+      };
+      actionsButton.addEventListener('click', () => setActionsOpen(actionsPanel.hidden));
+      document.querySelector('#disconnect-button').addEventListener('click', () => { window.location.href = 'home.html'; });
+      if (location.hash === '#actions') setActionsOpen(true);
+    </script>
+  </body>
+</html>

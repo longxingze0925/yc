@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>iOS 主控 - 账号资料</title>
+  <link rel="stylesheet" href="../_shared/base.css">
+</head>
+<body class="ios-preview-page">
+  <main class="ios-preview">
+    <section class="ios-frame" aria-label="iOS 账号资料页面预览">
+      <div class="ios-app">
+        <header class="ios-statusbar">
+          <span>9:41</span>
+          <span class="ios-system-status" aria-label="5G 网络，电量 82%"><span class="ios-signal" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span>5G</span><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M8.5 16a6 6 0 0 1 7 0"/><path d="M12 20h.01"/></svg><span class="ios-battery" aria-hidden="true"></span></span>
+        </header>
+        <header class="ios-nav-header">
+          <a class="ios-nav-back" href="profile.html" title="返回我的"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg></a>
+          <h1>账号资料</h1>
+          <span></span>
+        </header>
+
+        <div class="ios-scroll ios-detail-scroll">
+          <section class="ios-panel ios-account-card ios-account-summary">
+            <span class="ios-account-avatar">LX</span>
+            <span><span class="ios-account-name">owner@example.com</span><span class="ios-account-meta">个人账号</span></span>
+            <span class="ios-status-badge">正常</span>
+          </section>
+
+          <section class="ios-detail-section">
+            <h2>账号信息</h2>
+            <div class="ios-panel ios-detail-card">
+              <div class="ios-detail-row"><span class="ios-detail-label">邮箱</span><span class="ios-detail-value">owner@example.com</span></div>
+              <div class="ios-detail-row"><span class="ios-detail-label">账号 ID</span><span class="ios-detail-value">AC-8294-1072</span></div>
+              <div class="ios-detail-row"><span class="ios-detail-label">注册时间</span><span class="ios-detail-value">2026-07-18</span></div>
+            </div>
+          </section>
+
+          <section class="ios-detail-section">
+            <h2>当前环境</h2>
+            <div class="ios-panel ios-detail-card">
+              <div class="ios-detail-row"><span class="ios-detail-label">服务类型</span><span class="ios-environment-badge">自建服务器</span></div>
+              <div class="ios-detail-row"><span class="ios-detail-label">服务地址</span><span class="ios-detail-value js-service-address">尚未配置</span></div>
+            </div>
+          </section>
+        </div>
+
+        <nav class="ios-tabbar" aria-label="主导航">
+          <a class="tab" href="mine.html"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="10" x="2" y="3" rx="2"/><path d="M8 17h4M10 13v4"/><rect width="6" height="10" x="16" y="11" rx="2"/></svg><span>设备</span></a>
+          <a class="tab" href="assist.html"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a8 8 0 0 1 16 0"/><path d="M18 19c0 1.1-.9 2-2 2h-3"/><path d="M4 14h3v6H6a2 2 0 0 1-2-2v-4ZM20 14h-3v6h1a2 2 0 0 0 2-2v-4Z"/></svg><span>远程协助</span></a>
+          <a class="tab active" href="profile.html" aria-current="page"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg><span>我的</span></a>
+        </nav>
+        <div class="ios-home-indicator" aria-hidden="true"></div>
+      </div>
+    </section>
+  </main>
+  <script>
+    try {
+      const savedServer = JSON.parse(localStorage.getItem("remote-server-profile") || "null");
+      if (savedServer?.api) document.querySelector(".js-service-address").textContent = savedServer.api;
+    } catch (_) {
+      localStorage.removeItem("remote-server-profile");
+    }
+  </script>
+</body>
+</html>

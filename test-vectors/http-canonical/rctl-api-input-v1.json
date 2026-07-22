@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "body": "{\"z\":1.0,\"a\":\"text\"}",
+  "canonical_body": "{\"a\":\"text\",\"z\":1}",
+  "body_hash": "7bff84f34c3fb2b08ee4145bc6d4dda5f45bba9d2db0b6f8c3923ce66f75b18c",
+  "method": "post",
+  "request_target": "/v1/a/./b/../devices?b=2&a=3&a=1",
+  "canonical_request_target": "/v1/a/devices?a=1&a=3&b=2",
+  "request_id": "request-1",
+  "device_id": "desktop-test",
+  "account_id": "account-1",
+  "timestamp_epoch_millis": 42,
+  "api_nonce": "nonce-1",
+  "api_input_hash": "ddd86a74757e2a0a592aea436411ced5e23882340752cbe4eb6a18c7413fabcf",
+  "purpose": "mfa_factor_change",
+  "expires_at_epoch_millis": 99,
+  "operation_binding_hash": "57c425e2b2b4f7a524ac3637e255f9dbf9ac4880a16bc7ae7d1eb958eecec869",
+  "idempotency_binding_hash": "3d0f60008ddfc836ba6cd19e7d230643c7349625d0d0bb8b908d15e1f194ed76"
+}

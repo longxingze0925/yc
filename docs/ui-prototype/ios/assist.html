@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>iOS 主控 - 远程协助</title>
+  <link rel="stylesheet" href="../_shared/base.css">
+</head>
+<body class="ios-preview-page">
+  <main class="ios-preview">
+    <section class="ios-frame" aria-label="iOS 远程协助页面预览">
+      <div class="ios-app">
+        <header class="ios-statusbar">
+          <span>9:41</span>
+          <span class="ios-system-status" aria-label="5G 网络，电量 82%">
+            <span class="ios-signal" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+            <span>5G</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M8.5 16a6 6 0 0 1 7 0"/><path d="M12 20h.01"/></svg>
+            <span class="ios-battery" aria-hidden="true"></span>
+          </span>
+        </header>
+
+        <div class="ios-scroll">
+          <header class="ios-large-header">
+            <div class="ios-header-copy">
+              <span class="ios-eyebrow">临时连接</span>
+              <h1>远程协助</h1>
+            </div>
+          </header>
+
+          <section class="ios-panel ios-assist-panel">
+            <h2 class="ios-panel-title">连接伙伴设备</h2>
+            <p class="ios-panel-copy">输入对方设备显示的设备 ID 和一次性验证码。</p>
+
+            <form action="session.html">
+              <div class="ios-field">
+                <div class="ios-field-head">
+                  <label for="partner-device-id">设备 ID</label>
+                  <a class="ios-text-action" href="#">
+                    <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 5h18v14H3z"/><path d="M7 9h10M7 13h6"/></svg>
+                    最近连接
+                  </a>
+                </div>
+                <input id="partner-device-id" name="device_id" type="text" inputmode="numeric" autocomplete="off" placeholder="请输入设备 ID" required>
+              </div>
+
+              <div class="ios-field">
+                <div class="ios-field-head">
+                  <label for="partner-code">一次性验证码</label>
+                  <span class="ios-eyebrow">短时有效</span>
+                </div>
+                <input id="partner-code" name="verification_code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="请输入验证码" required>
+              </div>
+
+              <button class="ios-primary-action" type="submit">
+                开始远控
+                <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+              </button>
+            </form>
+          </section>
+
+          <p class="ios-safety-note">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>
+            对方设备确认后才会建立端到端加密会话。
+          </p>
+        </div>
+
+        <nav class="ios-tabbar" aria-label="主导航">
+          <a class="tab" href="mine.html">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="10" x="2" y="3" rx="2"/><path d="M8 17h4M10 13v4"/><rect width="6" height="10" x="16" y="11" rx="2"/></svg>
+            <span>设备</span>
+          </a>
+          <a class="tab active" href="assist.html" aria-current="page">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a8 8 0 0 1 16 0"/><path d="M18 19c0 1.1-.9 2-2 2h-3"/><path d="M4 14h3v6H6a2 2 0 0 1-2-2v-4ZM20 14h-3v6h1a2 2 0 0 0 2-2v-4Z"/></svg>
+            <span>远程协助</span>
+          </a>
+          <a class="tab" href="profile.html">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            <span>我的</span>
+          </a>
+        </nav>
+        <div class="ios-home-indicator" aria-hidden="true"></div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

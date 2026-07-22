@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>远程桌面画面素材</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { width: 1600px; height: 900px; margin: 0; overflow: hidden; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+    body { position: relative; background: #2c6786; color: #252a31; }
+    .wallpaper {
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(125deg, transparent 0 48%, rgba(255,255,255,.09) 48% 64%, transparent 64%),
+        linear-gradient(32deg, #24566f 0 42%, #377a99 42% 72%, #275c78 72%);
+    }
+    .desktop-icon { position: absolute; left: 28px; width: 74px; color: #fff; font-size: 12px; text-align: center; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
+    .desktop-icon::before { content: ""; width: 38px; height: 32px; display: block; margin: 0 auto 6px; border-radius: 4px; background: #f7c95f; box-shadow: inset 0 7px #e7b84e, 0 2px 4px rgba(0,0,0,.2); }
+    .desktop-icon.one { top: 24px; }
+    .desktop-icon.two { top: 112px; }
+    .desktop-icon.two::before { border-radius: 3px; background: #e8eef5; box-shadow: inset 0 -8px #b7c8dc, 0 2px 4px rgba(0,0,0,.2); }
+    .window { position: absolute; left: 248px; top: 94px; width: 1104px; height: 680px; overflow: hidden; border: 1px solid rgba(43,54,66,.3); border-radius: 8px; background: #f5f6f8; box-shadow: 0 22px 56px rgba(19,31,42,.32); }
+    .titlebar { height: 42px; display: flex; align-items: center; padding: 0 15px; border-bottom: 1px solid #dce1e6; background: #fff; font-size: 13px; font-weight: 600; }
+    .controls { margin-left: auto; display: flex; gap: 20px; color: #69737e; }
+    .app { height: calc(100% - 42px); display: grid; grid-template-columns: 184px 1fr; }
+    .sidebar { padding: 20px 14px; border-right: 1px solid #e0e4e8; background: #f2f4f6; }
+    .brand { display: flex; align-items: center; gap: 9px; margin-bottom: 24px; font-size: 13px; font-weight: 700; }
+    .brand i { width: 28px; height: 28px; display: block; border-radius: 6px; background: #3374d4; }
+    .nav { height: 35px; display: flex; align-items: center; margin-bottom: 5px; padding: 0 10px; border-radius: 6px; color: #65707c; font-size: 11px; }
+    .nav.active { background: #e3ecf9; color: #2f70d0; font-weight: 650; }
+    .main { padding: 24px 28px; background: #f7f8fa; }
+    h1 { margin: 0 0 20px; font-size: 22px; }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .card { padding: 16px; border: 1px solid #dfe3e7; border-radius: 7px; background: #fff; }
+    .card span { display: block; color: #7c8692; font-size: 10px; }
+    .card strong { display: block; margin-top: 7px; font-size: 22px; }
+    .content { display: grid; grid-template-columns: 1.35fr .65fr; gap: 14px; margin-top: 14px; }
+    .chart { height: 292px; position: relative; overflow: hidden; }
+    .chart h2, .activity h2 { margin: 0 0 18px; font-size: 13px; }
+    .chart-grid { height: 208px; border-left: 1px solid #dfe4e8; border-bottom: 1px solid #dfe4e8; background: repeating-linear-gradient(to bottom, transparent 0 51px, #edf0f3 51px 52px); }
+    .bars { position: absolute; left: 31px; right: 16px; bottom: 33px; height: 174px; display: flex; align-items: end; gap: 18px; }
+    .bars i { flex: 1; border-radius: 3px 3px 0 0; background: #4b86dd; }
+    .activity { height: 292px; }
+    .row { display: flex; align-items: center; gap: 9px; min-height: 52px; border-bottom: 1px solid #edf0f2; font-size: 10px; }
+    .row i { width: 8px; height: 8px; border-radius: 50%; background: #38a466; }
+    .row div { flex: 1; }
+    .row strong, .row span { display: block; }
+    .row span { margin-top: 2px; color: #8b949e; font-size: 9px; }
+    .taskbar { position: absolute; left: 0; right: 0; bottom: 0; height: 48px; display: flex; align-items: center; justify-content: center; gap: 8px; background: rgba(242,246,249,.94); border-top: 1px solid rgba(255,255,255,.7); box-shadow: 0 -1px 5px rgba(26,38,49,.08); }
+    .taskbar i { width: 30px; height: 30px; border-radius: 6px; background: #fff; box-shadow: 0 1px 3px rgba(20,30,40,.15); }
+    .taskbar i:first-child { background: #397bdc; }
+    .clock { position: absolute; right: 18px; color: #38424d; font-size: 11px; text-align: right; }
+  </style>
+</head>
+<body>
+  <div class="wallpaper"></div>
+  <div class="desktop-icon one">项目文档</div>
+  <div class="desktop-icon two">工作台</div>
+  <section class="window">
+    <header class="titlebar">设备运行概览 <span class="controls"><span>─</span><span>□</span><span>×</span></span></header>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand"><i></i> 设备中心</div>
+        <div class="nav active">概览</div>
+        <div class="nav">在线设备</div>
+        <div class="nav">任务记录</div>
+        <div class="nav">系统设置</div>
+      </aside>
+      <main class="main">
+        <h1>今日运行状态</h1>
+        <div class="stats">
+          <div class="card"><span>在线设备</span><strong>12</strong></div>
+          <div class="card"><span>待处理任务</span><strong>4</strong></div>
+          <div class="card"><span>平均响应</span><strong>28 ms</strong></div>
+        </div>
+        <div class="content">
+          <div class="card chart">
+            <h2>最近 7 天连接数</h2>
+            <div class="chart-grid"></div>
+            <div class="bars"><i style="height:42%"></i><i style="height:68%"></i><i style="height:51%"></i><i style="height:82%"></i><i style="height:65%"></i><i style="height:91%"></i><i style="height:73%"></i></div>
+          </div>
+          <div class="card activity">
+            <h2>最近活动</h2>
+            <div class="row"><i></i><div><strong>办公室主机</strong><span>已上线</span></div></div>
+            <div class="row"><i></i><div><strong>设计工作站</strong><span>任务已完成</span></div></div>
+            <div class="row"><i></i><div><strong>家用电脑</strong><span>连接正常</span></div></div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </section>
+  <footer class="taskbar"><i></i><i></i><i></i><i></i><span class="clock">16:28<br>2026/7/20</span></footer>
+</body>
+</html>

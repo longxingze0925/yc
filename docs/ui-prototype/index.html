@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>远程控制软件 UI 原型索引</title>
+  <link rel="stylesheet" href="_shared/base.css">
+</head>
+<body>
+  <header class="app-bar">
+    <div class="brand">
+      <div class="logo">RC</div>
+      <div>
+        <div class="title">远程控制软件 · UI 原型索引</div>
+        <div class="subtitle muted">统一客户端模型 · 桌面端登录即绑定本机 · 静态原型</div>
+      </div>
+    </div>
+    <nav class="crumbs"><a href="index.html" class="active">原型总览</a></nav>
+  </header>
+
+  <main class="page">
+    <div class="preview-banner">
+      <span><strong>UI 原型</strong> 用于确认页面、信息结构和交互，不包含远控业务实现。</span>
+      <span class="meta">3 个客户端 · 34 个页面</span>
+    </div>
+
+    <h2 class="section-title">统一客户端</h2>
+    <div class="grid cols-2">
+      <a class="card" href="desktop-windows/login.html" style="text-decoration:none;color:inherit">
+        <div class="row" style="justify-content:space-between">
+          <div>
+            <div class="title">Windows 桌面客户端</div>
+            <div class="subtitle muted">Windows 10/11 · 主控 + 被控</div>
+          </div>
+          <span class="tag ok">产品边界内</span>
+        </div>
+        <div class="muted">登录 → 我的设备 → 远程协助 → 远控会话 → 文件传输 → 设置</div>
+      </a>
+
+      <a class="card" href="desktop-ubuntu/login.html" style="text-decoration:none;color:inherit">
+        <div class="row" style="justify-content:space-between">
+          <div>
+            <div class="title">Ubuntu 桌面客户端</div>
+            <div class="subtitle muted">Ubuntu 26.04 LTS · Wayland 优先 · 主控 + 被控</div>
+          </div>
+          <span class="tag ok">产品边界内</span>
+        </div>
+        <div class="muted">登录 → 我的设备 → 远程协助 → 远控会话 → 文件传输 → 设置</div>
+      </a>
+
+      <a class="card" href="ios/login.html" style="text-decoration:none;color:inherit">
+        <div class="row" style="justify-content:space-between">
+          <div>
+            <div class="title">iOS 主控客户端</div>
+            <div class="subtitle muted">iOS 16+ · 仅主控能力</div>
+          </div>
+          <span class="tag warn">controller only</span>
+        </div>
+        <div class="muted">登录 → 我的设备 → 远程协助 → 远控会话 → 我的</div>
+      </a>
+    </div>
+
+    <h2 class="section-title" style="margin-top:24px">第一版不实现</h2>
+    <div class="grid cols-3">
+      <div class="card"><div class="title">macOS</div><div class="muted">不在 V1 客户端范围内。</div></div>
+      <div class="card"><div class="title">Android</div><div class="muted">不在 V1 客户端范围内。</div></div>
+      <div class="card"><div class="title">浏览器远控</div><div class="muted">不做浏览器主控端或被控端。</div></div>
+    </div>
+  </main>
+</body>
+</html>

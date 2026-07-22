@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>iOS 主控 - 登录</title>
+  <link rel="stylesheet" href="../_shared/base.css">
+</head>
+<body class="ios-preview-page">
+  <main class="ios-preview">
+    <section class="ios-frame" aria-label="iOS 登录页面预览">
+      <div class="ios-app">
+        <header class="ios-statusbar">
+          <span>9:41</span>
+          <span class="ios-system-status" aria-label="5G 网络，电量 82%">
+            <span class="ios-signal" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+            <span>5G</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M8.5 16a6 6 0 0 1 7 0"/><path d="M12 20h.01"/></svg>
+            <span class="ios-battery" aria-hidden="true"></span>
+          </span>
+        </header>
+
+        <div class="ios-scroll ios-login-scroll">
+          <div class="ios-login-brand" aria-hidden="true">R</div>
+          <h1 class="ios-login-title">登录远控</h1>
+          <p class="ios-login-subtitle">使用同一账号访问你的远程设备。</p>
+
+          <a class="ios-server-login-link" href="server.html?from=login">
+            <span class="ios-server-login-main">
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="18" height="7" x="3" y="3" rx="2"/><rect width="18" height="7" x="3" y="14" rx="2"/><path d="M7 6.5h.01M7 17.5h.01"/></svg>
+              <span class="ios-server-login-copy"><strong>自建服务器</strong><span class="js-service-address">点击配置服务地址</span></span>
+            </span>
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
+          </a>
+
+          <div class="ios-segmented" role="tablist" aria-label="登录方式">
+            <button class="active" type="button" role="tab" aria-selected="true">密码登录</button>
+            <button type="button" role="tab" aria-selected="false">通行密钥</button>
+          </div>
+
+          <section class="ios-panel ios-login-panel">
+            <form action="mine.html">
+              <div class="ios-field">
+                <div class="ios-field-head"><label for="login-account">邮箱或手机号</label></div>
+                <input id="login-account" name="account" type="text" autocomplete="username" placeholder="请输入账号" required>
+              </div>
+              <div class="ios-field">
+                <div class="ios-field-head"><label for="login-password">密码</label></div>
+                <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="请输入密码" required>
+              </div>
+
+              <div class="ios-login-options">
+                <label class="ios-check-label"><input type="checkbox" checked>保持登录</label>
+                <a href="#">忘记密码</a>
+              </div>
+
+              <button class="ios-primary-action" type="submit">登录</button>
+            </form>
+          </section>
+
+          <p class="ios-controller-note">登录后，此 iPhone 会注册为受信任主控设备，不会成为可被远控设备。</p>
+        </div>
+        <div class="ios-home-indicator" aria-hidden="true"></div>
+      </div>
+    </section>
+  </main>
+  <script>
+    try {
+      const savedServer = JSON.parse(localStorage.getItem("remote-server-profile") || "null");
+      if (savedServer?.api) document.querySelector(".js-service-address").textContent = savedServer.api;
+    } catch (_) {
+      localStorage.removeItem("remote-server-profile");
+    }
+  </script>
+</body>
+</html>

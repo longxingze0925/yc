@@ -1,0 +1,21 @@
+[package]
+name = "remote-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytes = "1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+remote-crypto = { path = "../remote-crypto" }
+remote-protocol = { path = "../remote-protocol" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+zeroize = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>iOS 主控 - 服务器设置</title>
+  <link rel="stylesheet" href="../_shared/base.css">
+</head>
+<body class="ios-preview-page">
+  <main class="ios-preview">
+    <section class="ios-frame" aria-label="iOS 服务器设置页面预览">
+      <div class="ios-app">
+        <header class="ios-statusbar"><span>9:41</span><span class="ios-system-status" aria-label="5G 网络，电量 82%"><span class="ios-signal" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span>5G</span><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M8.5 16a6 6 0 0 1 7 0"/><path d="M12 20h.01"/></svg><span class="ios-battery" aria-hidden="true"></span></span></header>
+        <header class="ios-nav-header">
+          <a id="server-back" class="ios-nav-back" href="login.html" title="返回"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg></a>
+          <h1>服务器设置</h1><button class="ios-nav-action" type="submit" form="server-form">保存</button>
+        </header>
+
+        <div class="ios-scroll ios-detail-scroll">
+          <div class="ios-detail-intro"><h2>连接服务</h2><p>可以使用官方服务，也可以填写自己部署的服务器。</p></div>
+
+          <div class="ios-segmented" role="tablist" aria-label="服务器类型">
+            <button id="official-mode" type="button" role="tab" aria-selected="false">官方服务</button>
+            <button id="private-mode" class="active" type="button" role="tab" aria-selected="true">自建服务器</button>
+          </div>
+
+          <div id="server-status" class="ios-server-status">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="18" height="7" x="3" y="3" rx="2"/><rect width="18" height="7" x="3" y="14" rx="2"/><path d="M7 6.5h.01M7 17.5h.01"/></svg>
+            <span><strong>自建服务器</strong><span id="server-status-copy">等待填写服务地址</span></span>
+          </div>
+
+          <form id="server-form">
+            <section id="private-server-fields" class="ios-panel ios-server-fields">
+              <div class="ios-field">
+                <div class="ios-field-head"><label for="api-server">API 服务地址</label></div>
+                <input id="api-server" name="api" type="url" inputmode="url" autocomplete="url" placeholder="https://your-domain.com" required>
+              </div>
+              <div class="ios-field">
+                <div class="ios-field-head"><label for="signal-server">信令服务地址</label><span class="ios-eyebrow">可选</span></div>
+                <input id="signal-server" name="signal" type="url" inputmode="url" placeholder="wss://your-domain.com/signal">
+                <p class="ios-field-hint">留空时从 API 服务自动发现。</p>
+              </div>
+              <div class="ios-field">
+                <div class="ios-field-head"><label for="relay-server">中继（Relay）服务地址</label><span class="ios-eyebrow">可选</span></div>
+                <input id="relay-server" name="relay" type="text" inputmode="url" placeholder="your-domain.com:443">
+                <p class="ios-field-hint">可以填写域名、IP 和端口；留空时自动发现。</p>
+              </div>
+              <div class="ios-field">
+                <div class="ios-field-head"><label for="server-key">服务器公钥</label></div>
+                <input id="server-key" class="ios-key-input" name="key" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴服务器公钥或指纹" required>
+              </div>
+            </section>
+
+            <button class="ios-secondary-action" id="test-server" type="button">
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 7 9 18l-5-5"/></svg>
+              检查配置
+            </button>
+            <p id="server-feedback" class="ios-save-feedback" aria-live="polite"></p>
+          </form>
+        </div>
+        <div class="ios-home-indicator" aria-hidden="true"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const backTarget = params.get("from") === "profile" ? "profile.html" : "login.html";
+    document.getElementById("server-back").href = backTarget;
+
+    const form = document.getElementById("server-form");
+    const feedback = document.getElementById("server-feedback");
+    const statusCopy = document.getElementById("server-status-copy");
+    const officialMode = document.getElementById("official-mode");
+    const privateMode = document.getElementById("private-mode");
+    const privateFields = document.getElementById("private-server-fields");
+    const testServer = document.getElementById("test-server");
+    let mode = "private";
+    let savedMode = "private";
+
+    try {
+      const saved = JSON.parse(localStorage.getItem("remote-server-profile") || "null");
+      if (saved) {
+        savedMode = saved.mode || "private";
+        form.elements.api.value = saved.api || "";
+        form.elements.signal.value = saved.signal || "";
+        form.elements.relay.value = saved.relay || "";
+        form.elements.key.value = saved.key || "";
+        statusCopy.textContent = saved.api || "等待填写服务地址";
+      }
+    } catch (_) {
+      localStorage.removeItem("remote-server-profile");
+    }
+
+    function setMode(nextMode) {
+      mode = nextMode;
+      const usePrivate = mode === "private";
+      privateMode.classList.toggle("active", usePrivate);
+      officialMode.classList.toggle("active", !usePrivate);
+      privateMode.setAttribute("aria-selected", String(usePrivate));
+      officialMode.setAttribute("aria-selected", String(!usePrivate));
+      privateFields.hidden = !usePrivate;
+      testServer.hidden = !usePrivate;
+      Array.from(form.elements).filter((element) => element.name).forEach((element) => {
+        element.disabled = !usePrivate;
+      });
+      statusCopy.textContent = usePrivate ? (form.elements.api.value || "等待填写服务地址") : "官方托管服务";
+    }
+
+    officialMode.addEventListener("click", () => setMode("official"));
+    privateMode.addEventListener("click", () => setMode("private"));
+
+    setMode(savedMode);
+
+    testServer.addEventListener("click", () => {
+      feedback.textContent = form.reportValidity() ? "配置格式检查通过" : "请先补全必填信息";
+    });
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (mode === "private" && !form.reportValidity()) return;
+      const profile = Object.fromEntries(new FormData(form));
+      profile.mode = mode;
+      localStorage.setItem("remote-server-profile", JSON.stringify(profile));
+      statusCopy.textContent = mode === "private" ? profile.api : "官方托管服务";
+      feedback.textContent = "服务器配置已保存";
+    });
+  </script>
+</body>
+</html>
