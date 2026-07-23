@@ -1231,7 +1231,7 @@ fn auth_audit_entry(
         audit_id: random_uuid_v4(),
         actor_type: "account".to_owned(),
         actor_account_id: Some(account_id.to_owned()),
-        actor_device_id: device_id.map(ToOwned::to_owned),
+        actor_device_id: None,
         actor_role: None,
         actor_service: None,
         target_device_id: device_id.map(ToOwned::to_owned),
@@ -1322,6 +1322,7 @@ async fn record_login_failure(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use axum::body::Body;
@@ -1333,11 +1334,11 @@ mod tests {
 
     use super::*;
     use crate::security::{
-        canonical_request_body_hash, encode_public_key, sign_device_request_for_test,
+        canonical_request_body_hash, encode_public_key, sign_device_request_for_test, totp_code,
     };
     use crate::{
         build_router, AppConfig, AppState, Architecture, Device, DeviceCapabilities,
-        DeviceLifecycleStatus, MemoryRepository, Platform, SignalNotifier,
+        DeviceLifecycleStatus, MemoryRepository, MfaFactor, Platform, RecoveryCode, SignalNotifier,
     };
 
     #[tokio::test]
@@ -1691,6 +1692,257 @@ mod tests {
         )
         .await;
         assert_eq!(refresh_status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mfa_totp_step_up_does_not_replace_current_password_validation() {
+        let fixture = mfa_password_change_fixture("totp-current-password").await;
+        let request_id = "totp-current-password-change";
+        let password_body = serde_json::to_vec(&json!({
+            "current_password": "wrong current password",
+            "new_password": "new correct horse battery staple"
+        }))
+        .expect("password body");
+        let (totp, _) =
+            totp_code(&fixture.totp_secret, now_epoch_millis()).expect("current TOTP code");
+        let (challenge_id, step_up_token) =
+            complete_password_change_step_up(&fixture, request_id, &password_body, "totp", &totp)
+                .await;
+
+        let mut before_request = None;
+        fixture
+            .state
+            .repository
+            .read(&mut |database| before_request = Some(database.clone()))
+            .await;
+        let before_request = before_request.expect("database snapshot");
+        assert_eq!(
+            before_request.risk_challenges[&challenge_id].status,
+            RiskChallengeStatus::Verified
+        );
+        assert!(before_request
+            .mfa_factors
+            .values()
+            .any(|factor| factor.last_used_counter.is_some()));
+
+        let response = send_password_change(
+            &fixture,
+            request_id,
+            &challenge_id,
+            &step_up_token,
+            password_body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response_body: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("password change response")
+                .to_bytes(),
+        )
+        .expect("password change error JSON");
+        assert_eq!(response_body["code"], "invalid_current_password");
+
+        fixture
+            .state
+            .repository
+            .read(&mut |database| assert_eq!(database, &before_request))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn mfa_recovery_code_password_change_revokes_all_authority_and_allows_new_login() {
+        let fixture = mfa_password_change_fixture("recovery-password-change").await;
+        let request_id = "recovery-password-change-final";
+        let new_password = "new correct horse battery staple";
+        let password_body = serde_json::to_vec(&json!({
+            "current_password": "correct horse battery staple",
+            "new_password": new_password
+        }))
+        .expect("password body");
+        let (challenge_id, step_up_token) = complete_password_change_step_up(
+            &fixture,
+            request_id,
+            &password_body,
+            "recovery_code",
+            &fixture.recovery_code,
+        )
+        .await;
+
+        let mut active_session_ids = BTreeSet::new();
+        let mut active_trust_ids = BTreeSet::new();
+        fixture
+            .state
+            .repository
+            .read(&mut |database| {
+                active_session_ids.extend(
+                    database
+                        .account_sessions
+                        .values()
+                        .filter(|session| {
+                            session.account_id == fixture.account_id
+                                && session.revoked_at_epoch_millis.is_none()
+                        })
+                        .map(|session| session.account_session_id.clone()),
+                );
+                active_trust_ids.extend(
+                    database
+                        .trusted_controller_devices
+                        .values()
+                        .filter(|trusted| {
+                            trusted.account_id == fixture.account_id
+                                && trusted.status == TrustedDeviceStatus::Active
+                        })
+                        .map(|trusted| trusted.trusted_device_id.clone()),
+                );
+            })
+            .await;
+        assert_eq!(active_session_ids.len(), 3);
+        assert_eq!(active_trust_ids.len(), 2);
+
+        let response = send_password_change(
+            &fixture,
+            request_id,
+            &challenge_id,
+            &step_up_token,
+            password_body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        for token_header in [
+            "authorization",
+            "x-rctl-access-token",
+            "x-rctl-refresh-token",
+            "x-rctl-step-up-token",
+        ] {
+            assert!(!response.headers().contains_key(token_header));
+        }
+        assert!(response
+            .into_body()
+            .collect()
+            .await
+            .expect("empty password response")
+            .to_bytes()
+            .is_empty());
+
+        fixture
+            .state
+            .repository
+            .read(&mut |database| {
+                let account = &database.accounts[&fixture.account_id];
+                assert!(!verify_password(
+                    &account.password_hash,
+                    "correct horse battery staple"
+                ));
+                assert!(verify_password(&account.password_hash, new_password));
+                assert_eq!(
+                    database.risk_challenges[&challenge_id].status,
+                    RiskChallengeStatus::Consumed
+                );
+                assert!(database
+                    .recovery_codes
+                    .values()
+                    .find(|record| record.account_id == fixture.account_id)
+                    .is_some_and(|record| record.used_at_epoch_millis.is_some()));
+
+                for session_id in &active_session_ids {
+                    let session = &database.account_sessions[session_id];
+                    assert!(session.revoked_at_epoch_millis.is_some());
+                    assert_eq!(session.revoked_reason.as_deref(), Some("password_changed"));
+                }
+                for trusted_device_id in &active_trust_ids {
+                    let trusted = &database.trusted_controller_devices[trusted_device_id];
+                    assert_eq!(trusted.status, TrustedDeviceStatus::Revoked);
+                    assert!(trusted.revoked_at_epoch_millis.is_some());
+                }
+
+                let session_audit_ids = database
+                    .audit_logs
+                    .iter()
+                    .filter(|entry| {
+                        entry.action == "account_session_revoked" && entry.request_id == request_id
+                    })
+                    .map(|entry| {
+                        assert_eq!(
+                            entry.actor_account_id.as_deref(),
+                            Some(&*fixture.account_id)
+                        );
+                        assert_eq!(entry.reason.as_deref(), Some("password_changed"));
+                        assert_eq!(entry.result, "success");
+                        entry.metadata["account_session_id"]
+                            .as_str()
+                            .expect("audited account session id")
+                            .to_owned()
+                    })
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(session_audit_ids, active_session_ids);
+
+                let trust_audit_ids = database
+                    .audit_logs
+                    .iter()
+                    .filter(|entry| {
+                        entry.action == "trusted_device_revoked" && entry.request_id == request_id
+                    })
+                    .map(|entry| {
+                        assert_eq!(
+                            entry.actor_account_id.as_deref(),
+                            Some(&*fixture.account_id)
+                        );
+                        assert_eq!(entry.reason.as_deref(), Some("password_changed"));
+                        assert_eq!(entry.result, "success");
+                        entry.metadata["trusted_device_id"]
+                            .as_str()
+                            .expect("audited trusted device id")
+                            .to_owned()
+                    })
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(trust_audit_ids, active_trust_ids);
+                assert_eq!(
+                    database
+                        .audit_logs
+                        .iter()
+                        .filter(|entry| {
+                            entry.action == "password_changed" && entry.request_id == request_id
+                        })
+                        .count(),
+                    1
+                );
+            })
+            .await;
+
+        let (access_status, _) = send_json(
+            fixture.router.clone(),
+            Method::GET,
+            "/v1/devices",
+            Value::Null,
+            Some(&fixture.access_token),
+        )
+        .await;
+        assert_eq!(access_status, StatusCode::UNAUTHORIZED);
+        let (refresh_status, _) = send_json(
+            fixture.router.clone(),
+            Method::POST,
+            "/v1/auth/refresh",
+            json!({ "refresh_token": fixture.refresh_token }),
+            None,
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::UNAUTHORIZED);
+
+        let logged_in = login_registered_device_with_totp(&fixture, new_password).await;
+        assert!(logged_in["access_token"].is_string());
+        assert!(logged_in["refresh_token"].is_string());
+        let (new_access_status, _) = send_json(
+            fixture.router.clone(),
+            Method::GET,
+            "/v1/devices",
+            Value::Null,
+            logged_in["access_token"].as_str(),
+        )
+        .await;
+        assert_eq!(new_access_status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -2128,6 +2380,355 @@ mod tests {
             .await
             .expect("login failure state")
             .is_locked_at(now_epoch_millis()));
+    }
+
+    struct MfaPasswordChangeFixture {
+        state: AppState,
+        router: axum::Router,
+        account_id: String,
+        email: String,
+        access_token: String,
+        refresh_token: String,
+        device_id: String,
+        public_key_id: String,
+        signing_key: SigningKey,
+        totp_secret: String,
+        recovery_code: String,
+    }
+
+    async fn mfa_password_change_fixture(prefix: &str) -> MfaPasswordChangeFixture {
+        let state = AppState::for_test();
+        let account_id = format!("{prefix}-account");
+        let email = format!("{prefix}-{}@example.com", random_uuid_v4());
+        let device_id = format!("{prefix}-device");
+        let other_device_id = format!("{prefix}-other-device");
+        let public_key_id = format!("{prefix}-key");
+        let signing_key = SigningKey::from_bytes(&sha256(prefix.as_bytes()));
+        let other_signing_key = SigningKey::from_bytes(&sha256(other_device_id.as_bytes()));
+        let totp_secret = "JBSWY3DPEHPK3PXP".to_owned();
+        let recovery_code = "RECOVERY-CODE-0001".to_owned();
+        let now = now_epoch_millis();
+        let password_hash =
+            hash_password("correct horse battery staple").expect("fixture password hash");
+        state
+            .repository
+            .transact(&mut |database| {
+                database.accounts.insert(
+                    account_id.clone(),
+                    Account {
+                        account_id: account_id.clone(),
+                        email: email.clone(),
+                        display_name: "MFA Password Change".into(),
+                        password_hash: password_hash.clone(),
+                        status: AccountStatus::Active,
+                        created_at_epoch_millis: now,
+                        updated_at_epoch_millis: now,
+                    },
+                );
+                database
+                    .account_by_email
+                    .insert(email.clone(), account_id.clone());
+                database.devices.insert(
+                    device_id.clone(),
+                    password_change_device(
+                        &device_id,
+                        &account_id,
+                        &public_key_id,
+                        signing_key.verifying_key().to_bytes(),
+                        now,
+                    ),
+                );
+                database.devices.insert(
+                    other_device_id.clone(),
+                    password_change_device(
+                        &other_device_id,
+                        &account_id,
+                        &format!("{prefix}-other-key"),
+                        other_signing_key.verifying_key().to_bytes(),
+                        now,
+                    ),
+                );
+                database.mfa_factors.insert(
+                    format!("{prefix}-factor"),
+                    MfaFactor {
+                        factor_id: format!("{prefix}-factor"),
+                        account_id: account_id.clone(),
+                        secret_base32: totp_secret.clone(),
+                        active: true,
+                        last_used_counter: None,
+                        created_at_epoch_millis: now,
+                    },
+                );
+                database.recovery_codes.insert(
+                    format!("{prefix}-recovery-code"),
+                    RecoveryCode {
+                        recovery_code_id: format!("{prefix}-recovery-code"),
+                        account_id: account_id.clone(),
+                        code_hash: sha256(recovery_code.as_bytes()),
+                        used_at_epoch_millis: None,
+                        expires_at_epoch_millis: None,
+                    },
+                );
+                for session_id in [
+                    format!("{prefix}-other-session-a"),
+                    format!("{prefix}-other-session-b"),
+                ] {
+                    database.account_sessions.insert(
+                        session_id.clone(),
+                        AccountSession {
+                            account_session_id: session_id.clone(),
+                            account_id: account_id.clone(),
+                            refresh_token_hash: sha256(session_id.as_bytes()),
+                            mfa_verified: true,
+                            expires_at_epoch_millis: now + 300_000,
+                            revoked_at_epoch_millis: None,
+                            revoked_reason: None,
+                        },
+                    );
+                }
+                for (trusted_device_id, controller_device_id, public_key) in [
+                    (
+                        format!("{prefix}-trust-a"),
+                        device_id.clone(),
+                        signing_key.verifying_key().to_bytes(),
+                    ),
+                    (
+                        format!("{prefix}-trust-b"),
+                        other_device_id.clone(),
+                        other_signing_key.verifying_key().to_bytes(),
+                    ),
+                ] {
+                    database.trusted_controller_devices.insert(
+                        trusted_device_id.clone(),
+                        TrustedControllerDevice {
+                            trusted_device_id,
+                            account_id: account_id.clone(),
+                            controller_device_id,
+                            device_fingerprint_hash: sha256(&public_key),
+                            trust_level: "standard".into(),
+                            status: TrustedDeviceStatus::Active,
+                            trust_proof_type: "device_signature_and_mfa".into(),
+                            created_at_epoch_millis: now,
+                            last_used_at_epoch_millis: None,
+                            expires_at_epoch_millis: now + 300_000,
+                            revoked_at_epoch_millis: None,
+                        },
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed MFA password change fixture");
+        let tokens = issue_tokens(&state, &account_id, true, &format!("{prefix}-token-issue"))
+            .await
+            .expect("issue MFA-authenticated fixture tokens");
+        let router = build_router(state.clone());
+
+        MfaPasswordChangeFixture {
+            state,
+            router,
+            account_id,
+            email,
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            device_id,
+            public_key_id,
+            signing_key,
+            totp_secret,
+            recovery_code,
+        }
+    }
+
+    fn password_change_device(
+        device_id: &str,
+        account_id: &str,
+        public_key_id: &str,
+        public_key: [u8; 32],
+        now: u64,
+    ) -> Device {
+        Device {
+            device_id: device_id.to_owned(),
+            account_id: account_id.to_owned(),
+            display_name: device_id.to_owned(),
+            platform: Platform::Windows,
+            os_version: "11".into(),
+            arch: Architecture::X86_64,
+            capabilities: DeviceCapabilities {
+                controller: true,
+                controlled: true,
+                file_transfer: false,
+                unattended: false,
+            },
+            public_key_id: public_key_id.to_owned(),
+            public_key,
+            public_key_version: 1,
+            public_key_revoked_at_epoch_millis: None,
+            status: DeviceLifecycleStatus::Offline,
+            last_seen_epoch_millis: None,
+            created_at_epoch_millis: now,
+            updated_at_epoch_millis: now,
+        }
+    }
+
+    async fn complete_password_change_step_up(
+        fixture: &MfaPasswordChangeFixture,
+        request_id: &str,
+        password_body: &[u8],
+        factor: &str,
+        code: &str,
+    ) -> (String, String) {
+        let body_hash = canonical_request_body_hash(password_body, Some("application/json"))
+            .expect("canonical password body hash");
+        let (challenge_status, challenge) = send_json(
+            fixture.router.clone(),
+            Method::POST,
+            "/v1/auth/risk-challenge",
+            json!({
+                "purpose": "password_change",
+                "device_id": fixture.device_id,
+                "method": "PATCH",
+                "path": "/v1/me/password",
+                "body_hash": hex_encode(&body_hash),
+                "request_id": request_id
+            }),
+            Some(&fixture.access_token),
+        )
+        .await;
+        assert_eq!(challenge_status, StatusCode::CREATED, "{challenge}");
+        assert_eq!(
+            challenge["required_methods"],
+            json!(["totp", "recovery_code"])
+        );
+        let challenge_id = challenge["risk_challenge_id"]
+            .as_str()
+            .expect("risk challenge id")
+            .to_owned();
+        let verify_path = format!("/v1/auth/risk-challenge/{challenge_id}/verify");
+        let (verify_status, verified) = send_json(
+            fixture.router.clone(),
+            Method::POST,
+            &verify_path,
+            json!({ "factor": factor, "code": code }),
+            Some(&fixture.access_token),
+        )
+        .await;
+        assert_eq!(verify_status, StatusCode::OK, "{verified}");
+        let step_up_token = verified["step_up_token"]
+            .as_str()
+            .expect("step-up token")
+            .to_owned();
+        (challenge_id, step_up_token)
+    }
+
+    async fn send_password_change(
+        fixture: &MfaPasswordChangeFixture,
+        request_id: &str,
+        challenge_id: &str,
+        step_up_token: &str,
+        password_body: Vec<u8>,
+    ) -> axum::response::Response {
+        fixture
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri("/v1/me/password")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", fixture.access_token))
+                    .header("x-rctl-protocol-version", remote_protocol::PROTOCOL_VERSION)
+                    .header("x-request-id", request_id)
+                    .header("x-rctl-risk-challenge-id", challenge_id)
+                    .header("x-rctl-step-up-token", step_up_token)
+                    .body(Body::from(password_body))
+                    .expect("password change request"),
+            )
+            .await
+            .expect("password change response")
+    }
+
+    async fn login_registered_device_with_totp(
+        fixture: &MfaPasswordChangeFixture,
+        password: &str,
+    ) -> Value {
+        let nonce_byte = 71;
+        let mut login_request = login_request_json(
+            &fixture.email,
+            password,
+            &fixture.device_id,
+            &fixture.signing_key,
+            nonce_byte,
+        );
+        login_request["public_key_id"] = Value::String(fixture.public_key_id.clone());
+        login_request["public_key_version"] = Value::from(1);
+        let (login_status, challenge) = send_json(
+            fixture.router.clone(),
+            Method::POST,
+            "/v1/auth/login",
+            login_request,
+            None,
+        )
+        .await;
+        assert_eq!(login_status, StatusCode::ACCEPTED, "{challenge}");
+        assert_eq!(
+            challenge["required_factors"],
+            json!(["totp", "recovery_code"])
+        );
+        let (totp, _) =
+            totp_code(&fixture.totp_secret, now_epoch_millis()).expect("login TOTP code");
+        let finish_body = serde_json::to_vec(&json!({
+            "login_challenge_id": challenge["login_challenge_id"],
+            "login_request_binding_hash": challenge["login_request_binding_hash"],
+            "login_challenge_binding_hash": challenge["login_challenge_binding_hash"],
+            "client_nonce": encode_base64url(&[nonce_byte; 32]),
+            "server_nonce": challenge["server_nonce"],
+            "factor": "totp",
+            "code": totp,
+            "protocol_version": remote_protocol::PROTOCOL_VERSION
+        }))
+        .expect("login finish body");
+        let request_id = "new-password-login-finish";
+        let timestamp = now_epoch_millis();
+        let signature = sign_device_request_for_test(
+            &fixture.signing_key,
+            "POST",
+            "/v1/auth/login/finish",
+            &finish_body,
+            request_id,
+            &fixture.device_id,
+            &fixture.account_id,
+            timestamp,
+            "new-password-login-nonce",
+        );
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/auth/login/finish")
+                    .header("content-type", "application/json")
+                    .header("x-rctl-protocol-version", remote_protocol::PROTOCOL_VERSION)
+                    .header("x-request-id", request_id)
+                    .header("x-rctl-device-id", &fixture.device_id)
+                    .header("x-rctl-timestamp", timestamp)
+                    .header("x-rctl-api-nonce", "new-password-login-nonce")
+                    .header("x-rctl-device-signature", signature)
+                    .body(Body::from(finish_body))
+                    .expect("login finish request"),
+            )
+            .await
+            .expect("login finish response");
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("login finish body")
+                .to_bytes(),
+        )
+        .expect("login finish JSON")
     }
 
     async fn register_account(router: axum::Router) -> (StatusCode, Value) {

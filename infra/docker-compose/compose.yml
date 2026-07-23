@@ -123,13 +123,13 @@ services:
       <<: *service-build
       args:
         SERVICE: relay-server
+    user: "0:0"
     environment:
       <<: *service-environment
       REMOTE_RELAY_QUIC_BIND: 0.0.0.0:18082
       REMOTE_RELAY_TLS_BIND: 0.0.0.0:18082
       REMOTE_RELAY_HEALTH_BIND: 127.0.0.1:18083
-      REMOTE_RELAY_TLS_CERT_PATH: /run/secrets/relay/tls.crt
-      REMOTE_RELAY_TLS_KEY_PATH: /run/secrets/relay/tls.key
+      REMOTE_RELAY_STAGE_TLS: "1"
       REMOTE_RELAY_NODE_ID: relay-local-1
       REMOTE_RELAY_TOKEN_SECRET: ${REMOTE_RELAY_TOKEN_SECRET:-local-relay-token-secret-change-before-sharing}
       REMOTE_RELAY_ALLOWED_TRANSPORTS: quic_relay,tls_443_relay
@@ -143,11 +143,11 @@ services:
     volumes:
       - type: bind
         source: ${RELAY_TLS_CERT_PATH:?set RELAY_TLS_CERT_PATH to a readable PEM certificate chain}
-        target: /run/secrets/relay/tls.crt
+        target: /run/secrets/relay/relay.crt
         read_only: true
       - type: bind
-        source: ${RELAY_TLS_KEY_PATH:?set RELAY_TLS_KEY_PATH to a readable PEM private key}
-        target: /run/secrets/relay/tls.key
+        source: ${RELAY_TLS_KEY_PATH:?set RELAY_TLS_KEY_PATH to a PEM private key with mode 0600}
+        target: /run/secrets/relay/relay.key
         read_only: true
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18083/health"]

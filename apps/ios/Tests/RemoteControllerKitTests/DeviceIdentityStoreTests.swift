@@ -16,18 +16,26 @@ final class DeviceIdentityStoreTests: XCTestCase {
 
         XCTAssertEqual(first, second)
         XCTAssertEqual(first.publicKey.count, 32)
+        XCTAssertNil(first.publicKeyID)
+        XCTAssertEqual(first.publicKeyVersion, 0)
         XCTAssertEqual(signature.count, 64)
         XCTAssertTrue(publicKey.isValidSignature(signature, for: digest))
     }
 
+    @MainActor
     func testRegistrationIsControllerOnlyAndPersistsServerKeyBinding() throws {
         let secureStore = MemorySecureStore()
         let identityStore = DeviceIdentityStore(store: secureStore)
-        let request = try identityStore.registration(displayName: "QA iPhone")
+        let request = try identityStore.registration(
+            enrollmentGrant: "grant-id.grant-secret",
+            displayName: "QA iPhone"
+        )
 
         XCTAssertEqual(request.platform, .ios)
         XCTAssertEqual(request.roleCapabilities, .iosControllerOnly)
         XCTAssertFalse(request.osVersion.isEmpty)
+        XCTAssertFalse(request.publicKey.contains("="))
+        XCTAssertEqual(request.deviceEnrollmentGrant, "grant-id.grant-secret")
 
         try identityStore.updateRegistration(publicKeyID: "server-key-1", publicKeyVersion: 3)
         let updated = try identityStore.loadOrCreate()
@@ -55,6 +63,29 @@ final class DeviceIdentityStoreTests: XCTestCase {
             guard case KeychainError.corruptValue(_) = error else {
                 return XCTFail("Expected corrupt Keychain identity, got \(error)")
             }
+        }
+    }
+
+    func testSignalCannotStartForUnregisteredIdentity() async throws {
+        let identityStore = DeviceIdentityStore(store: MemorySecureStore())
+        _ = try identityStore.loadOrCreate()
+        let configuration = try ServiceConfiguration(
+            environment: .official,
+            apiBaseURL: try XCTUnwrap(URL(string: "https://api.example.test")),
+            signalURL: try XCTUnwrap(URL(string: "wss://signal.example.test/ws"))
+        )
+        let client = SignalClient(configuration: configuration)
+
+        do {
+            try await client.start(
+                accountID: "account-1",
+                identityStore: identityStore,
+                capabilities: .ios(appVersion: "1.0.0", osVersion: "16.7", arch: "aarch64"),
+                accessTokenProvider: { () async throws -> String in "unused" }
+            )
+            XCTFail("unregistered identity must not start Signal")
+        } catch {
+            XCTAssertEqual(error as? APIClientError, .authenticationRequired)
         }
     }
 }

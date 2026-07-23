@@ -66,7 +66,7 @@ public final class KeychainStore: SecureStoring, @unchecked Sendable {
     }
 }
 
-public enum KeychainError: LocalizedError {
+public enum KeychainError: LocalizedError, Sendable {
     case unexpectedStatus(OSStatus)
     case corruptValue(String)
 

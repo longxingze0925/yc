@@ -4,16 +4,29 @@ import Security
 
 public protocol RemoteAPI: Sendable {
     func health() async throws
-    func login(_ request: LoginRequest) async throws -> LoginResponse
-    func verifyMFA(_ request: MFAVerifyRequest) async throws -> LoginResponse
+    func login(_ request: LoginRequest) async throws -> LoginChallenge
+    func finishLogin(
+        challenge: LoginChallenge,
+        factor: String?,
+        code: String?
+    ) async throws -> LoginResponse
     func refresh(using refreshToken: String) async throws -> LoginResponse
     func logout() async throws
+    func startTOTPEnrollment(
+        _ request: TOTPEnrollmentStartRequest,
+        authorizationToken: String
+    ) async throws -> TOTPEnrollmentStartResponse
+    func finishTOTPEnrollment(
+        _ request: TOTPEnrollmentFinishRequest,
+        idempotencyKey: String,
+        authorizationToken: String
+    ) async throws -> RecoveryCodeDeliveryEnvelope
     func registerControllerDevice(_ request: DeviceRegistrationRequest) async throws -> DeviceRegistrationResponse
     func listDevices() async throws -> [DeviceSummary]
     func createSession(_ request: SessionCreateRequest) async throws -> SessionCreateResponse
 }
 
-public enum APIClientError: LocalizedError, Equatable {
+public enum APIClientError: LocalizedError, Equatable, Sendable {
     case serviceNotConfigured
     case authenticationRequired
     case invalidResponse
@@ -85,11 +98,13 @@ public struct CanonicalDeviceRequestAuthenticator: DeviceRequestAuthenticating {
         // Header names are isolated here until the server exports a shared wire-contract crate.
         request.setValue(requestID, forHTTPHeaderField: "X-Request-Id")
         request.setValue(identity.deviceID, forHTTPHeaderField: "X-Rctl-Device-Id")
-        request.setValue(identity.publicKeyID, forHTTPHeaderField: "X-Rctl-Public-Key-Id")
-        request.setValue(String(identity.publicKeyVersion), forHTTPHeaderField: "X-Rctl-Public-Key-Version")
+        if let publicKeyID = identity.publicKeyID {
+            request.setValue(publicKeyID, forHTTPHeaderField: "X-Rctl-Public-Key-Id")
+            request.setValue(String(identity.publicKeyVersion), forHTTPHeaderField: "X-Rctl-Public-Key-Version")
+        }
         request.setValue(String(timestamp), forHTTPHeaderField: "X-Rctl-Timestamp")
         request.setValue(nonce, forHTTPHeaderField: "X-Rctl-Api-Nonce")
-        request.setValue(signature.base64EncodedString(), forHTTPHeaderField: "X-Rctl-Device-Signature")
+        request.setValue(signature.base64URLEncodedString(), forHTTPHeaderField: "X-Rctl-Device-Signature")
     }
 
     static func normalizedRequestTarget(_ url: URL) throws -> String {
@@ -235,6 +250,8 @@ public actor URLSessionRemoteAPI: RemoteAPI {
         case anonymous
         case account
         case accountAndDevice
+        case deviceSignature(accountID: String)
+        case bearerToken(String)
     }
 
     private struct EmptyResponse: Decodable {}
@@ -271,25 +288,75 @@ public actor URLSessionRemoteAPI: RemoteAPI {
         let _: EmptyResponse = try await request(path: "/health", method: "GET", body: Optional<String>.none, auth: .anonymous)
     }
 
-    public func login(_ request: LoginRequest) async throws -> LoginResponse {
-        try await self.request(path: "/v1/auth/login", method: "POST", body: request, auth: .anonymous)
+    public func login(_ request: LoginRequest) async throws -> LoginChallenge {
+        try await self.request(
+            path: "/v1/auth/login",
+            method: "POST",
+            body: request,
+            auth: .anonymous,
+            decoderUserInfo: [.loginClientNonce: request.clientNonce]
+        )
     }
 
-    public func verifyMFA(_ request: MFAVerifyRequest) async throws -> LoginResponse {
-        try await self.request(path: "/v1/auth/mfa/verify", method: "POST", body: request, auth: .anonymous)
+    public func finishLogin(
+        challenge: LoginChallenge,
+        factor: String?,
+        code: String?
+    ) async throws -> LoginResponse {
+        try await request(
+            path: "/v1/auth/login/finish",
+            method: "POST",
+            body: try LoginFinishRequest(challenge: challenge, factor: factor, code: code),
+            auth: .deviceSignature(accountID: challenge.accountID)
+        )
     }
 
     public func refresh(using refreshToken: String) async throws -> LoginResponse {
-        try await request(
+        let response: LoginResponse = try await request(
             path: "/v1/auth/refresh",
             method: "POST",
             body: RefreshRequest(refreshToken: refreshToken),
             auth: .anonymous
         )
+        guard response.deviceEnrollmentGrant == nil else {
+            throw APIClientError.invalidResponse
+        }
+        return response
     }
 
     public func logout() async throws {
         let _: EmptyResponse = try await request(path: "/v1/auth/logout", method: "POST", body: Optional<String>.none, auth: .account)
+    }
+
+    public func startTOTPEnrollment(
+        _ request: TOTPEnrollmentStartRequest,
+        authorizationToken: String
+    ) async throws -> TOTPEnrollmentStartResponse {
+        try await self.request(
+            path: "/v1/me/mfa/totp/start",
+            method: "POST",
+            body: request,
+            auth: .bearerToken(authorizationToken)
+        )
+    }
+
+    public func finishTOTPEnrollment(
+        _ request: TOTPEnrollmentFinishRequest,
+        idempotencyKey: String,
+        authorizationToken: String
+    ) async throws -> RecoveryCodeDeliveryEnvelope {
+        guard !idempotencyKey.isEmpty,
+              idempotencyKey.utf8.count <= 128,
+              idempotencyKey.utf8.allSatisfy({ (0x21...0x7E).contains($0) }) else {
+            throw APIClientError.invalidResponse
+        }
+        return try await self.request(
+            path: "/v1/me/mfa/totp/finish",
+            method: "POST",
+            body: request,
+            auth: .bearerToken(authorizationToken),
+            additionalHeaders: ["Idempotency-Key": idempotencyKey]
+        )
     }
 
     public func registerControllerDevice(_ request: DeviceRegistrationRequest) async throws -> DeviceRegistrationResponse {
@@ -309,7 +376,9 @@ public actor URLSessionRemoteAPI: RemoteAPI {
         path: String,
         method: String,
         body: Body?,
-        auth: Authentication
+        auth: Authentication,
+        decoderUserInfo: [CodingUserInfoKey: Any] = [:],
+        additionalHeaders: [String: String] = [:]
     ) async throws -> Response {
         guard let url = URL(string: path, relativeTo: configuration.apiBaseURL)?.absoluteURL else {
             throw APIClientError.serviceNotConfigured
@@ -319,6 +388,7 @@ public actor URLSessionRemoteAPI: RemoteAPI {
         request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue(String(ProtocolConstants.version), forHTTPHeaderField: "X-Rctl-Protocol-Version")
+        additionalHeaders.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
 
         let bodyData: Data
         if let body {
@@ -329,7 +399,10 @@ public actor URLSessionRemoteAPI: RemoteAPI {
             bodyData = Data()
         }
 
-        if auth != .anonymous {
+        switch auth {
+        case .anonymous:
+            break
+        case .account, .accountAndDevice:
             guard let tokens = try tokenVault.load() else { throw APIClientError.authenticationRequired }
             request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
             if auth == .accountAndDevice {
@@ -340,6 +413,16 @@ public actor URLSessionRemoteAPI: RemoteAPI {
                     identityStore: identityStore
                 )
             }
+        case let .deviceSignature(accountID):
+            try authenticator.authenticate(
+                &request,
+                body: bodyData,
+                accountID: accountID,
+                identityStore: identityStore
+            )
+        case let .bearerToken(accessToken):
+            guard !accessToken.isEmpty else { throw APIClientError.authenticationRequired }
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         }
 
         do {
@@ -356,7 +439,9 @@ public actor URLSessionRemoteAPI: RemoteAPI {
             if Response.self == EmptyResponse.self, data.isEmpty {
                 return EmptyResponse() as! Response
             }
-            return try decoder.decode(Response.self, from: data)
+            let responseDecoder = JSONDecoder()
+            responseDecoder.userInfo = decoderUserInfo
+            return try responseDecoder.decode(Response.self, from: data)
         } catch let error as APIClientError {
             throw error
         } catch is DecodingError {

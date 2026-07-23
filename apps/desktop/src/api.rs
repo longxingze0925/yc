@@ -1,6 +1,9 @@
 use crate::config::ServiceConfig;
 use crate::identity::{DeviceIdentity, IdentityError};
 use crate::secret_store::AccountTokens;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use rand::RngCore;
 use remote_protocol::{canonical_json_bytes, PROTOCOL_VERSION};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -197,24 +200,22 @@ impl ApiClient {
         ensure_success(response).map(|_| ())
     }
 
-    pub fn login(&self, request: &LoginRequest) -> Result<LoginOutcome, ApiClientError> {
+    pub fn login(&self, request: &LoginRequest) -> Result<LoginChallenge, ApiClientError> {
         let response = self.send_json(HttpMethod::Post, "/v1/auth/login", request, None)?;
-        let value = ensure_success(response)?;
-        if value
-            .get("mfa_required")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            let challenge: MfaChallenge =
-                serde_json::from_value(value).map_err(|_| ApiClientError::Serialization)?;
-            return Ok(LoginOutcome::MfaRequired(challenge));
-        }
-        parse_tokens(value).map(LoginOutcome::Authenticated)
+        serde_json::from_value(ensure_success(response)?)
+            .map(|challenge: LoginChallenge| challenge.with_client_nonce(request.client_nonce.clone()))
+            .map_err(|_| ApiClientError::Serialization)
     }
 
-    pub fn verify_mfa(&self, request: &MfaVerifyRequest) -> Result<AccountTokens, ApiClientError> {
-        let response = self.send_json(HttpMethod::Post, "/v1/auth/mfa/verify", request, None)?;
-        parse_tokens(ensure_success(response)?)
+    pub fn finish_login(
+        &self,
+        challenge: &LoginChallenge,
+        identity: &DeviceIdentity,
+        factor: Option<MfaFactor>,
+        code: Option<&str>,
+    ) -> Result<LoginFinishOutcome, ApiClientError> {
+        let request = LoginFinishRequest::new(challenge, factor, code);
+        self.send_login_finish_json(&request, challenge, identity)
     }
 
     pub fn register_device(
@@ -223,6 +224,7 @@ impl ApiClient {
         account_id: &str,
         identity: &DeviceIdentity,
         metadata: DeviceRegistrationMetadata,
+        enrollment_grant: &str,
     ) -> Result<DeviceView, ApiClientError> {
         let request = RegisterDeviceRequest {
             device_id: identity.device_id().to_owned(),
@@ -232,6 +234,7 @@ impl ApiClient {
             arch: metadata.arch,
             role_capabilities: metadata.role_capabilities,
             public_key: identity.encoded_public_key(),
+            device_enrollment_grant: enrollment_grant.to_owned(),
         };
         self.send_signed_json(
             HttpMethod::Post,
@@ -337,6 +340,45 @@ impl ApiClient {
         serde_json::from_value(ensure_success(response)?).map_err(|_| ApiClientError::Serialization)
     }
 
+    fn send_login_finish_json(
+        &self,
+        body: &LoginFinishRequest,
+        challenge: &LoginChallenge,
+        identity: &DeviceIdentity,
+    ) -> Result<LoginFinishOutcome, ApiClientError> {
+        let request_id = new_request_id();
+        let api_nonce = Uuid::new_v4().to_string();
+        let timestamp = now_epoch_millis();
+        let encoded = canonical_json_bytes(body).map_err(|_| ApiClientError::Serialization)?;
+        let signature = identity.sign_api_request(
+            HttpMethod::Post.as_str(),
+            "/v1/auth/login/finish",
+            body,
+            &request_id,
+            &challenge.account_id,
+            timestamp,
+            &api_nonce,
+        )?;
+        let mut headers = common_headers(&request_id);
+        headers.insert("content-type".into(), CONTENT_TYPE_JSON.into());
+        headers.insert("x-rctl-device-id".into(), identity.device_id().into());
+        headers.insert("x-rctl-timestamp".into(), timestamp.to_string());
+        headers.insert("x-rctl-api-nonce".into(), api_nonce);
+        headers.insert("x-rctl-device-signature".into(), signature);
+        let response = self.transport.execute(HttpRequest {
+            method: HttpMethod::Post,
+            url: self.endpoint("/v1/auth/login/finish"),
+            headers,
+            body: encoded,
+        })?;
+        let response: LoginFinishResponse = serde_json::from_value(ensure_success(response)?)
+            .map_err(|_| ApiClientError::Serialization)?;
+        Ok(LoginFinishOutcome::from_response(
+            response,
+            challenge.device_state.clone(),
+        ))
+    }
+
     fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.config.api_base_url)
     }
@@ -372,18 +414,6 @@ fn ensure_success(response: HttpResponse) -> Result<serde_json::Value, ApiClient
     })
 }
 
-fn parse_tokens(value: serde_json::Value) -> Result<AccountTokens, ApiClientError> {
-    let response: TokenResponse =
-        serde_json::from_value(value).map_err(|_| ApiClientError::Serialization)?;
-    Ok(AccountTokens::new(
-        response.account_id,
-        response.access_token,
-        response.refresh_token,
-        response.access_token_expires_at_epoch_millis,
-        response.refresh_token_expires_at_epoch_millis,
-    ))
-}
-
 fn new_request_id() -> String {
     Uuid::new_v4().to_string()
 }
@@ -401,14 +431,30 @@ pub fn now_epoch_millis() -> u64 {
 pub struct LoginRequest {
     email: String,
     password: String,
+    device_id: String,
+    device_public_key: String,
+    public_key_id: Option<String>,
+    public_key_version: u32,
+    client_nonce: String,
     protocol_version: u16,
 }
 
 impl LoginRequest {
-    pub fn new(email: impl Into<String>, password: impl Into<String>) -> Self {
+    pub fn new(
+        email: impl Into<String>,
+        password: impl Into<String>,
+        identity: &DeviceIdentity,
+    ) -> Self {
+        let mut nonce = [0_u8; 32];
+        rand::rng().fill_bytes(&mut nonce);
         Self {
             email: email.into(),
             password: password.into(),
+            device_id: identity.device_id().to_owned(),
+            device_public_key: identity.encoded_public_key(),
+            public_key_id: identity.public_key_id().map(ToOwned::to_owned),
+            public_key_version: identity.public_key_version(),
+            client_nonce: URL_SAFE_NO_PAD.encode(nonce),
             protocol_version: PROTOCOL_VERSION,
         }
     }
@@ -420,6 +466,10 @@ impl fmt::Debug for LoginRequest {
             .debug_struct("LoginRequest")
             .field("email", &self.email)
             .field("password", &"<redacted>")
+            .field("device_id", &self.device_id)
+            .field("public_key_id", &self.public_key_id)
+            .field("public_key_version", &self.public_key_version)
+            .field("client_nonce", &"<redacted>")
             .field("protocol_version", &self.protocol_version)
             .finish()
     }
@@ -431,10 +481,45 @@ impl Drop for LoginRequest {
     }
 }
 
-#[derive(Debug)]
-pub enum LoginOutcome {
-    Authenticated(AccountTokens),
-    MfaRequired(MfaChallenge),
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct LoginChallenge {
+    pub account_id: String,
+    pub login_challenge_id: String,
+    pub login_request_binding_hash: String,
+    pub login_challenge_binding_hash: String,
+    pub server_nonce: String,
+    pub device_state: String,
+    pub required_factors: Vec<String>,
+    pub expires_at_epoch_millis: u64,
+    pub attempts_remaining: u8,
+    #[serde(skip)]
+    pub client_nonce: String,
+}
+
+impl LoginChallenge {
+    pub fn with_client_nonce(mut self, client_nonce: String) -> Self {
+        self.client_nonce = client_nonce;
+        self
+    }
+
+    pub fn mfa_challenge(&self) -> MfaChallenge {
+        MfaChallenge {
+            code: "login_challenge_required".into(),
+            mfa_required: !self.required_factors.is_empty(),
+            mfa_challenge_id: self.login_challenge_id.clone(),
+            allowed_factors: self
+                .required_factors
+                .iter()
+                .filter_map(|value| match value.as_str() {
+                    "totp" => Some(MfaFactor::Totp),
+                    "recovery_code" => Some(MfaFactor::RecoveryCode),
+                    _ => None,
+                })
+                .collect(),
+            expires_at_epoch_millis: self.expires_at_epoch_millis,
+            attempts_remaining: self.attempts_remaining,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -455,53 +540,92 @@ pub enum MfaFactor {
 }
 
 #[derive(Serialize)]
-pub struct MfaVerifyRequest {
-    mfa_challenge_id: String,
-    factor: MfaFactor,
-    code: String,
+struct LoginFinishRequest {
+    login_challenge_id: String,
+    login_request_binding_hash: String,
+    login_challenge_binding_hash: String,
+    client_nonce: String,
+    server_nonce: String,
+    factor: Option<MfaFactor>,
+    code: Option<String>,
     protocol_version: u16,
 }
 
-impl MfaVerifyRequest {
-    pub fn new(
-        mfa_challenge_id: impl Into<String>,
-        factor: MfaFactor,
-        code: impl Into<String>,
-    ) -> Self {
+impl LoginFinishRequest {
+    fn new(challenge: &LoginChallenge, factor: Option<MfaFactor>, code: Option<&str>) -> Self {
         Self {
-            mfa_challenge_id: mfa_challenge_id.into(),
+            login_challenge_id: challenge.login_challenge_id.clone(),
+            login_request_binding_hash: challenge.login_request_binding_hash.clone(),
+            login_challenge_binding_hash: challenge.login_challenge_binding_hash.clone(),
+            client_nonce: challenge.client_nonce.clone(),
+            server_nonce: challenge.server_nonce.clone(),
             factor,
-            code: code.into(),
+            code: code.map(ToOwned::to_owned),
             protocol_version: PROTOCOL_VERSION,
         }
     }
 }
 
-impl fmt::Debug for MfaVerifyRequest {
+impl fmt::Debug for LoginFinishRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("MfaVerifyRequest")
-            .field("mfa_challenge_id", &self.mfa_challenge_id)
+            .debug_struct("LoginFinishRequest")
+            .field("login_challenge_id", &self.login_challenge_id)
             .field("factor", &self.factor)
             .field("code", &"<redacted>")
-            .field("protocol_version", &self.protocol_version)
             .finish()
     }
 }
 
-impl Drop for MfaVerifyRequest {
+impl Drop for LoginFinishRequest {
     fn drop(&mut self) {
-        self.code.zeroize();
+        if let Some(code) = &mut self.code {
+            code.zeroize();
+        }
+    }
+}
+
+pub struct LoginFinishOutcome {
+    pub tokens: AccountTokens,
+    pub device_enrollment_grant: Option<String>,
+    pub device_state: String,
+}
+
+impl LoginFinishOutcome {
+    fn from_response(response: LoginFinishResponse, device_state: String) -> Self {
+        Self {
+            tokens: AccountTokens::new(
+                response.account_id,
+                response.access_token,
+                response.refresh_token,
+                response.access_token_expires_at_epoch_millis,
+                response.refresh_token_expires_at_epoch_millis,
+            ),
+            device_enrollment_grant: response.device_enrollment_grant,
+            device_state,
+        }
+    }
+}
+
+impl fmt::Debug for LoginFinishOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoginFinishOutcome")
+            .field("tokens", &self.tokens)
+            .field("device_enrollment_grant", &"<redacted>")
+            .field("device_state", &self.device_state)
+            .finish()
     }
 }
 
 #[derive(Deserialize)]
-struct TokenResponse {
+struct LoginFinishResponse {
     account_id: String,
     access_token: String,
     refresh_token: String,
     access_token_expires_at_epoch_millis: u64,
     refresh_token_expires_at_epoch_millis: u64,
+    device_enrollment_grant: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -574,6 +698,7 @@ struct RegisterDeviceRequest {
     arch: Architecture,
     role_capabilities: DeviceCapabilities,
     public_key: String,
+    device_enrollment_grant: String,
 }
 
 #[derive(Deserialize)]
@@ -723,98 +848,153 @@ mod tests {
     }
 
     #[test]
-    fn login_models_authenticated_and_mfa_responses_without_debug_leaks() {
-        let transport = Arc::new(RecordingTransport::default());
-        transport.respond(200, token_json());
-        transport.respond(
-            202,
-            serde_json::json!({
-                "code": "mfa_required",
-                "mfa_required": true,
-                "mfa_challenge_id": "challenge-1",
-                "allowed_factors": ["totp", "recovery_code"],
-                "expires_at_epoch_millis": 5_000,
-                "attempts_remaining": 5,
-            }),
-        );
-        let client = ApiClient::new(config(), transport);
-        let request = LoginRequest::new("owner@example.com", "password-private");
-        assert!(matches!(
-            client.login(&request).expect("login"),
-            LoginOutcome::Authenticated(_)
-        ));
-        assert!(matches!(
-            client.login(&request).expect("mfa"),
-            LoginOutcome::MfaRequired(MfaChallenge {
-                attempts_remaining: 5,
-                ..
-            })
-        ));
-        assert!(!format!("{request:?}").contains("password-private"));
-    }
-
-    #[test]
-    fn mfa_mock_flow_verifies_challenge_and_returns_authenticated_tokens() {
+    fn login_starts_with_a_device_bound_challenge_without_tokens() {
         let transport = Arc::new(RecordingTransport::default());
         transport.respond(
             202,
             serde_json::json!({
-                "code": "mfa_required",
-                "mfa_required": true,
-                "mfa_challenge_id": "challenge-1",
-                "allowed_factors": ["totp", "recovery_code"],
+                "code": "login_challenge_required",
+                "account_id": "account-1",
+                "login_challenge_id": "challenge-1",
+                "login_request_binding_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "login_challenge_binding_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "server_nonce": "c2VydmVyLW5vbmNl",
+                "device_state": "pending_enrollment",
+                "required_factors": ["totp", "recovery_code"],
                 "expires_at_epoch_millis": u64::MAX,
                 "attempts_remaining": 5,
             }),
         );
-        transport.respond(200, token_json());
         let client = ApiClient::new(config(), transport.clone());
+        let store = Arc::new(ProcessSecretStore::default());
+        let mut manager = DeviceIdentityManager::new(store);
+        manager.load_or_create().expect("identity");
+        let identity = manager.current().expect("identity");
+        let request = LoginRequest::new("owner@example.com", "password-private", identity);
+        let challenge = client.login(&request).expect("challenge");
 
-        let challenge = match client
-            .login(&LoginRequest::new("owner@example.com", "password-private"))
-            .expect("mfa challenge")
-        {
-            LoginOutcome::MfaRequired(challenge) => challenge,
-            LoginOutcome::Authenticated(_) => panic!("expected MFA challenge"),
-        };
-        let request = MfaVerifyRequest::new(
-            challenge.mfa_challenge_id,
-            MfaFactor::Totp,
-            "123456-private",
-        );
-        let tokens = client.verify_mfa(&request).expect("MFA authenticated");
-
-        assert_eq!(tokens.account_id, "account-1");
-        let _login = transport.take_request();
-        let verify = transport.take_request();
-        assert!(verify.url.ends_with("/v1/auth/mfa/verify"));
-        let body: serde_json::Value = serde_json::from_slice(&verify.body).expect("verify body");
-        assert_eq!(body["factor"], "totp");
-        assert_eq!(body["mfa_challenge_id"], "challenge-1");
-        assert!(!format!("{request:?}").contains("123456-private"));
-        assert!(!format!("{verify:?}").contains("123456-private"));
+        assert_eq!(challenge.device_state, "pending_enrollment");
+        assert_eq!(challenge.mfa_challenge().attempts_remaining, 5);
+        assert!(!format!("{request:?}").contains("password-private"));
+        let login = transport.take_request();
+        assert!(!login.headers.contains_key("authorization"));
+        let body: serde_json::Value = serde_json::from_slice(&login.body).expect("login body");
+        assert_eq!(body["device_id"], identity.device_id());
+        assert_eq!(body["public_key_version"], 0);
+        assert!(body["client_nonce"].as_str().is_some_and(|value| !value.is_empty()));
+        assert!(body.get("access_token").is_none());
     }
 
     #[test]
-    fn mfa_mock_rejection_uses_generic_error_without_exposing_code() {
+    fn login_finish_uses_device_signature_and_never_bearer_auth() {
         let transport = Arc::new(RecordingTransport::default());
+        transport.respond(
+            202,
+            serde_json::json!({
+                "code": "login_challenge_required",
+                "account_id": "account-1",
+                "login_challenge_id": "challenge-1",
+                "login_request_binding_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "login_challenge_binding_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "server_nonce": "c2VydmVyLW5vbmNl",
+                "device_state": "pending_enrollment",
+                "required_factors": ["totp", "recovery_code"],
+                "expires_at_epoch_millis": u64::MAX,
+                "attempts_remaining": 5,
+            }),
+        );
+        let mut finish_response = token_json();
+        finish_response.as_object_mut().expect("object").insert(
+            "device_enrollment_grant".into(),
+            serde_json::Value::String("grant-id.grant-private".into()),
+        );
+        transport.respond(200, finish_response);
+        let client = ApiClient::new(config(), transport.clone());
+        let store = Arc::new(ProcessSecretStore::default());
+        let mut manager = DeviceIdentityManager::new(store);
+        manager.load_or_create().expect("identity");
+        let identity = manager.current().expect("identity");
+        let login_request = LoginRequest::new("owner@example.com", "password-private", identity);
+        let challenge = client.login(&login_request).expect("challenge");
+        let outcome = client
+            .finish_login(
+                &challenge,
+                identity,
+                Some(MfaFactor::Totp),
+                Some("123456-private"),
+            )
+            .expect("finish");
+
+        assert_eq!(outcome.tokens.account_id, "account-1");
+        assert_eq!(outcome.device_state, "pending_enrollment");
+        assert_eq!(
+            outcome.device_enrollment_grant.as_deref(),
+            Some("grant-id.grant-private")
+        );
+        assert!(!format!("{outcome:?}").contains("grant-private"));
+        let _login = transport.take_request();
+        let finish = transport.take_request();
+        assert!(finish.url.ends_with("/v1/auth/login/finish"));
+        assert!(!finish.headers.contains_key("authorization"));
+        assert!(finish.headers.contains_key("x-rctl-device-signature"));
+        let body: serde_json::Value = serde_json::from_slice(&finish.body).expect("finish body");
+        assert_eq!(body["factor"], "totp");
+        assert_eq!(body["login_challenge_id"], "challenge-1");
+        assert!(!format!("{finish:?}").contains("123456-private"));
+    }
+
+    #[test]
+    fn login_finish_rejection_uses_generic_error_without_exposing_code() {
+        let transport = Arc::new(RecordingTransport::default());
+        transport.respond(
+            202,
+            serde_json::json!({
+                "code": "login_challenge_required",
+                "account_id": "account-1",
+                "login_challenge_id": "challenge-1",
+                "login_request_binding_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "login_challenge_binding_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "server_nonce": "c2VydmVyLW5vbmNl",
+                "device_state": "registered",
+                "required_factors": ["recovery_code"],
+                "expires_at_epoch_millis": u64::MAX,
+                "attempts_remaining": 5
+            }),
+        );
         transport.respond(
             403,
             serde_json::json!({
-                "code": "mfa_verification_failed",
+                "code": "login_verification_failed",
                 "message": "challenge is invalid, expired, consumed, or the code is incorrect",
                 "request_id": "request-1",
             }),
         );
-        let client = ApiClient::new(config(), transport);
-        let request =
-            MfaVerifyRequest::new("challenge-1", MfaFactor::RecoveryCode, "recovery-private");
+        let client = ApiClient::new(config(), transport.clone());
+        let store = Arc::new(ProcessSecretStore::default());
+        let mut manager = DeviceIdentityManager::new(store);
+        manager.load_or_create().expect("identity");
+        let identity = manager.current().expect("identity");
+        let challenge = client
+            .login(&LoginRequest::new(
+                "owner@example.com",
+                "password-private",
+                identity,
+            ))
+            .expect("challenge");
+        let error = client
+            .finish_login(
+                &challenge,
+                identity,
+                Some(MfaFactor::RecoveryCode),
+                Some("recovery-private"),
+            )
+            .expect_err("finish must fail");
 
-        let error = client.verify_mfa(&request).expect_err("MFA must fail");
-
-        assert_eq!(error.code(), Some("mfa_verification_failed"));
-        assert!(!format!("{request:?}").contains("recovery-private"));
+        assert_eq!(error.code(), Some("login_verification_failed"));
         assert!(!error.to_string().contains("recovery-private"));
+        let _login = transport.take_request();
+        let finish = transport.take_request();
+        assert!(!format!("{finish:?}").contains("recovery-private"));
     }
 
     #[test]
@@ -870,7 +1050,13 @@ mod tests {
             },
         };
         client
-            .register_device("access-private", "account-1", identity, metadata)
+            .register_device(
+                "access-private",
+                "account-1",
+                identity,
+                metadata,
+                "grant-id.grant-private",
+            )
             .expect("register");
         let registration = transport.take_request();
         assert_eq!(registration.method, HttpMethod::Post);
@@ -879,6 +1065,13 @@ mod tests {
             registration.headers.get("x-rctl-device-id"),
             Some(&identity.device_id().to_owned())
         );
+        let registration_body: serde_json::Value =
+            serde_json::from_slice(&registration.body).expect("registration body");
+        assert_eq!(
+            registration_body["device_enrollment_grant"],
+            "grant-id.grant-private"
+        );
+        assert!(!format!("{registration:?}").contains("grant-private"));
 
         let request = CreateSessionRequest::account_prompt(identity.device_id(), "controlled-1");
         client

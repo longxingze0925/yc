@@ -4383,6 +4383,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "futures-util",
+ "rand 0.9.5",
  "remote-capture",
  "remote-crypto",
  "remote-protocol",

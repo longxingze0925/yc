@@ -19,11 +19,12 @@ RUN case "$SERVICE" in \
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates curl netcat-openbsd \
+    && apt-get install --yes --no-install-recommends ca-certificates curl gosu netcat-openbsd \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 remote
 
 COPY --from=builder /tmp/service /usr/local/bin/service
+COPY --chmod=0755 infra/docker-compose/service-entrypoint.sh /usr/local/bin/service-entrypoint
 
 USER remote
-ENTRYPOINT ["/usr/local/bin/service"]
+ENTRYPOINT ["/usr/local/bin/service-entrypoint"]

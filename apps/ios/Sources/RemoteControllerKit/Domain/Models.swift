@@ -168,19 +168,146 @@ public struct TokenSet: Codable, Equatable, Sendable {
 public struct LoginRequest: Encodable, Sendable {
     public let email: String
     public let password: String
+    public let deviceID: String
+    public let devicePublicKey: String
+    public let publicKeyID: String?
+    public let publicKeyVersion: UInt32
+    public let clientNonce: String
     public let protocolVersion: UInt16
 
-    public init(email: String, password: String) {
+    public init(email: String, password: String, identity: DeviceIdentity, clientNonce: Data) {
         self.email = email
         self.password = password
+        deviceID = identity.deviceID
+        devicePublicKey = identity.publicKey.base64URLEncodedString()
+        publicKeyID = identity.publicKeyID
+        publicKeyVersion = identity.publicKeyVersion
+        self.clientNonce = clientNonce.base64URLEncodedString()
         protocolVersion = ProtocolConstants.version
     }
 
     private enum CodingKeys: String, CodingKey {
         case email
         case password
+        case deviceID = "device_id"
+        case devicePublicKey = "device_public_key"
+        case publicKeyID = "public_key_id"
+        case publicKeyVersion = "public_key_version"
+        case clientNonce = "client_nonce"
         case protocolVersion = "protocol_version"
     }
+}
+
+public enum LoginDeviceState: String, Decodable, Equatable, Sendable {
+    case pendingEnrollment = "pending_enrollment"
+    case registered
+}
+
+public struct LoginChallenge: Decodable, Sendable {
+    public let accountID: String
+    public let loginChallengeID: String
+    public let loginRequestBindingHash: String
+    public let loginChallengeBindingHash: String
+    public let serverNonce: String
+    public let deviceState: LoginDeviceState
+    public let requiredFactors: [String]
+    public let expiresAtEpochMillis: Int64
+    public let attemptsRemaining: Int
+    public let clientNonce: String
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        guard try values.decode(String.self, forKey: .code) == "login_challenge_required" else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .code,
+                in: values,
+                debugDescription: "unexpected login challenge response code"
+            )
+        }
+        guard !values.contains(.accessToken),
+              !values.contains(.refreshToken),
+              !values.contains(.accessTokenExpiresAtEpochMillis),
+              !values.contains(.refreshTokenExpiresAtEpochMillis),
+              !values.contains(.deviceEnrollmentGrant),
+              !values.contains(.deviceEnrollmentGrantExpiresAtEpochMillis) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .code,
+                in: values,
+                debugDescription: "login challenge response must not contain credentials"
+            )
+        }
+        accountID = try values.decode(String.self, forKey: .accountID)
+        loginChallengeID = try values.decode(String.self, forKey: .loginChallengeID)
+        loginRequestBindingHash = try values.decode(String.self, forKey: .loginRequestBindingHash)
+        loginChallengeBindingHash = try values.decode(String.self, forKey: .loginChallengeBindingHash)
+        serverNonce = try values.decode(String.self, forKey: .serverNonce)
+        deviceState = try values.decode(LoginDeviceState.self, forKey: .deviceState)
+        requiredFactors = try values.decode([String].self, forKey: .requiredFactors)
+        expiresAtEpochMillis = try values.decode(Int64.self, forKey: .expiresAtEpochMillis)
+        attemptsRemaining = try values.decode(Int.self, forKey: .attemptsRemaining)
+        guard !accountID.isEmpty,
+              !loginChallengeID.isEmpty,
+              Self.isSHA256Hex(loginRequestBindingHash),
+              Self.isSHA256Hex(loginChallengeBindingHash),
+              Data(base64URLEncoded: serverNonce)?.count == 32,
+              Set(requiredFactors).count == requiredFactors.count,
+              requiredFactors.allSatisfy({ $0 == "totp" || $0 == "recovery_code" }),
+              expiresAtEpochMillis > 0,
+              attemptsRemaining > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .loginChallengeID,
+                in: values,
+                debugDescription: "invalid login challenge contract"
+            )
+        }
+        guard let requestClientNonce = decoder.userInfo[.loginClientNonce] as? String,
+              Data(base64URLEncoded: requestClientNonce)?.count == 32 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .serverNonce,
+                in: values,
+                debugDescription: "login challenge is missing its request client nonce"
+            )
+        }
+        clientNonce = requestClientNonce
+    }
+
+    public var mfaChallenge: MFAChallenge {
+        MFAChallenge(
+            mfaChallengeID: loginChallengeID,
+            allowedFactors: requiredFactors,
+            expiresAtEpochMillis: expiresAtEpochMillis,
+            attemptsRemaining: attemptsRemaining
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case code
+        case accountID = "account_id"
+        case loginChallengeID = "login_challenge_id"
+        case loginRequestBindingHash = "login_request_binding_hash"
+        case loginChallengeBindingHash = "login_challenge_binding_hash"
+        case serverNonce = "server_nonce"
+        case deviceState = "device_state"
+        case requiredFactors = "required_factors"
+        case expiresAtEpochMillis = "expires_at_epoch_millis"
+        case attemptsRemaining = "attempts_remaining"
+        case accessToken = "access_token"
+        case refreshToken = "refresh_token"
+        case accessTokenExpiresAtEpochMillis = "access_token_expires_at_epoch_millis"
+        case refreshTokenExpiresAtEpochMillis = "refresh_token_expires_at_epoch_millis"
+        case deviceEnrollmentGrant = "device_enrollment_grant"
+        case deviceEnrollmentGrantExpiresAtEpochMillis = "device_enrollment_grant_expires_at_epoch_millis"
+    }
+
+    private static func isSHA256Hex(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (65...70).contains(byte) || (97...102).contains(byte)
+        }
+    }
+}
+
+public extension CodingUserInfoKey {
+    static let loginClientNonce = CodingUserInfoKey(rawValue: "rctl.login_client_nonce")!
 }
 
 public struct MFAChallenge: Codable, Identifiable, Equatable, Sendable {
@@ -191,6 +318,18 @@ public struct MFAChallenge: Codable, Identifiable, Equatable, Sendable {
 
     public var id: String { mfaChallengeID }
 
+    public init(
+        mfaChallengeID: String,
+        allowedFactors: [String],
+        expiresAtEpochMillis: Int64,
+        attemptsRemaining: Int?
+    ) {
+        self.mfaChallengeID = mfaChallengeID
+        self.allowedFactors = allowedFactors
+        self.expiresAtEpochMillis = expiresAtEpochMillis
+        self.attemptsRemaining = attemptsRemaining
+    }
+
     private enum CodingKeys: String, CodingKey {
         case mfaChallengeID = "mfa_challenge_id"
         case allowedFactors = "allowed_factors"
@@ -199,65 +338,229 @@ public struct MFAChallenge: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
-public struct LoginResponse: Decodable, Sendable {
-    public let accountID: String?
-    public let accessToken: String?
-    public let refreshToken: String?
-    public let accessTokenExpiresAtEpochMillis: Int64?
-    public let refreshTokenExpiresAtEpochMillis: Int64?
-    public let mfaRequired: Bool?
-    public let mfaChallengeID: String?
-    public let allowedFactors: [String]?
-    public let expiresAtEpochMillis: Int64?
-    public let attemptsRemaining: Int?
+public struct TOTPEnrollmentStartRequest: Encodable, Sendable {
+    public let recoveryDeliveryPublicKey: String
+
+    public init(recoveryDeliveryPublicKey: String) throws {
+        guard Data(base64URLEncoded: recoveryDeliveryPublicKey)?.count == 32 else {
+            throw EncodingError.invalidValue(
+                recoveryDeliveryPublicKey,
+                EncodingError.Context(
+                    codingPath: [],
+                    debugDescription: "recovery delivery public key must be 32 base64url bytes"
+                )
+            )
+        }
+        self.recoveryDeliveryPublicKey = recoveryDeliveryPublicKey
+    }
 
     private enum CodingKeys: String, CodingKey {
+        case recoveryDeliveryPublicKey = "recovery_delivery_public_key"
+    }
+}
+
+public struct TOTPEnrollmentStartResponse: Decodable, Equatable, Sendable {
+    public let factorID: String
+    public let secretBase32: String
+    public let otpauthURI: String
+    public let expiresInSeconds: UInt64
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        factorID = try values.decode(String.self, forKey: .factorID)
+        secretBase32 = try values.decode(String.self, forKey: .secretBase32)
+        otpauthURI = try values.decode(String.self, forKey: .otpauthURI)
+        expiresInSeconds = try values.decode(UInt64.self, forKey: .expiresInSeconds)
+        guard !factorID.isEmpty,
+              !secretBase32.isEmpty,
+              otpauthURI.hasPrefix("otpauth://totp/"),
+              expiresInSeconds > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .factorID,
+                in: values,
+                debugDescription: "invalid TOTP enrollment start response"
+            )
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case factorID = "factor_id"
+        case secretBase32 = "secret_base32"
+        case otpauthURI = "otpauth_uri"
+        case expiresInSeconds = "expires_in_seconds"
+    }
+}
+
+public struct TOTPEnrollmentFinishRequest: Encodable, Sendable {
+    public let factorID: String
+    public let code: String
+
+    public init(factorID: String, code: String) throws {
+        guard !factorID.isEmpty, !code.isEmpty else {
+            throw EncodingError.invalidValue(
+                "<redacted>",
+                EncodingError.Context(
+                    codingPath: [],
+                    debugDescription: "factor ID and TOTP code are required"
+                )
+            )
+        }
+        self.factorID = factorID
+        self.code = code
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case factorID = "factor_id"
         case code
+    }
+}
+
+public struct RecoveryCodeDeliveryEnvelope: Decodable, Equatable, Sendable {
+    public static let maximumLifetimeMillis: Int64 = 24 * 60 * 60 * 1_000
+
+    public let deliveryID: String
+    public let serverEphemeralPublicKey: Data
+    public let nonce: Data
+    public let ciphertext: Data
+    public let createdAtEpochMillis: Int64
+    public let expiresAtEpochMillis: Int64
+    public let recoveryCodeCount: UInt16
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        deliveryID = try values.decode(String.self, forKey: .deliveryID)
+        let encodedServerKey = try values.decode(String.self, forKey: .serverEphemeralPublicKey)
+        let encodedNonce = try values.decode(String.self, forKey: .nonce)
+        let encodedCiphertext = try values.decode(String.self, forKey: .ciphertext)
+        guard let serverKey = Data(base64URLEncoded: encodedServerKey), serverKey.count == 32,
+              let decodedNonce = Data(base64URLEncoded: encodedNonce), decodedNonce.count == 12,
+              let decodedCiphertext = Data(base64URLEncoded: encodedCiphertext),
+              decodedCiphertext.count >= 16 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .ciphertext,
+                in: values,
+                debugDescription: "invalid recovery code delivery encoding"
+            )
+        }
+        serverEphemeralPublicKey = serverKey
+        nonce = decodedNonce
+        ciphertext = decodedCiphertext
+        createdAtEpochMillis = try values.decode(Int64.self, forKey: .createdAtEpochMillis)
+        expiresAtEpochMillis = try values.decode(Int64.self, forKey: .expiresAtEpochMillis)
+        recoveryCodeCount = try values.decode(UInt16.self, forKey: .recoveryCodeCount)
+        guard !deliveryID.isEmpty,
+              createdAtEpochMillis > 0,
+              expiresAtEpochMillis > createdAtEpochMillis,
+              expiresAtEpochMillis - createdAtEpochMillis <= Self.maximumLifetimeMillis,
+              recoveryCodeCount > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .deliveryID,
+                in: values,
+                debugDescription: "invalid recovery code delivery contract"
+            )
+        }
+    }
+
+    init(
+        deliveryID: String,
+        serverEphemeralPublicKey: Data,
+        nonce: Data,
+        ciphertext: Data,
+        createdAtEpochMillis: Int64,
+        expiresAtEpochMillis: Int64,
+        recoveryCodeCount: UInt16
+    ) {
+        self.deliveryID = deliveryID
+        self.serverEphemeralPublicKey = serverEphemeralPublicKey
+        self.nonce = nonce
+        self.ciphertext = ciphertext
+        self.createdAtEpochMillis = createdAtEpochMillis
+        self.expiresAtEpochMillis = expiresAtEpochMillis
+        self.recoveryCodeCount = recoveryCodeCount
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case deliveryID = "delivery_id"
+        case serverEphemeralPublicKey = "server_ephemeral_public_key"
+        case nonce
+        case ciphertext
+        case createdAtEpochMillis = "created_at_epoch_millis"
+        case expiresAtEpochMillis = "expires_at_epoch_millis"
+        case recoveryCodeCount = "recovery_code_count"
+    }
+}
+
+public struct RecoveryCodeDelivery: Identifiable, Equatable, Sendable {
+    public let deliveryID: String
+    public let recoveryCodes: [String]
+    public let expiresAtEpochMillis: Int64
+
+    public var id: String { deliveryID }
+
+    public init(deliveryID: String, recoveryCodes: [String], expiresAtEpochMillis: Int64) {
+        self.deliveryID = deliveryID
+        self.recoveryCodes = recoveryCodes
+        self.expiresAtEpochMillis = expiresAtEpochMillis
+    }
+}
+
+public struct LoginResponse: Decodable, Sendable {
+    public let accountID: String
+    public let accessToken: String
+    public let refreshToken: String
+    public let accessTokenExpiresAtEpochMillis: Int64
+    public let refreshTokenExpiresAtEpochMillis: Int64
+    public let deviceEnrollmentGrant: String?
+    public let deviceEnrollmentGrantExpiresAtEpochMillis: Int64?
+
+    private enum CodingKeys: String, CodingKey {
         case accountID = "account_id"
         case accessToken = "access_token"
         case refreshToken = "refresh_token"
         case accessTokenExpiresAtEpochMillis = "access_token_expires_at_epoch_millis"
         case refreshTokenExpiresAtEpochMillis = "refresh_token_expires_at_epoch_millis"
-        case mfaRequired = "mfa_required"
-        case mfaChallengeID = "mfa_challenge_id"
-        case factors
-        case allowedFactors = "allowed_factors"
-        case expiresAtEpochMillis = "expires_at_epoch_millis"
-        case attemptsRemaining = "attempts_remaining"
+        case deviceEnrollmentGrant = "device_enrollment_grant"
+        case deviceEnrollmentGrantExpiresAtEpochMillis = "device_enrollment_grant_expires_at_epoch_millis"
     }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        let responseCode = try values.decodeIfPresent(String.self, forKey: .code)
-        accountID = try values.decodeIfPresent(String.self, forKey: .accountID)
-        accessToken = try values.decodeIfPresent(String.self, forKey: .accessToken)
-        refreshToken = try values.decodeIfPresent(String.self, forKey: .refreshToken)
-        accessTokenExpiresAtEpochMillis = try values.decodeIfPresent(
+        accountID = try values.decode(String.self, forKey: .accountID)
+        accessToken = try values.decode(String.self, forKey: .accessToken)
+        refreshToken = try values.decode(String.self, forKey: .refreshToken)
+        accessTokenExpiresAtEpochMillis = try values.decode(
             Int64.self,
             forKey: .accessTokenExpiresAtEpochMillis
         )
-        refreshTokenExpiresAtEpochMillis = try values.decodeIfPresent(
+        refreshTokenExpiresAtEpochMillis = try values.decode(
             Int64.self,
             forKey: .refreshTokenExpiresAtEpochMillis
         )
-        mfaRequired = try values.decodeIfPresent(Bool.self, forKey: .mfaRequired)
-            ?? (responseCode == "mfa_required")
-        mfaChallengeID = try values.decodeIfPresent(String.self, forKey: .mfaChallengeID)
-        allowedFactors = try values.decodeIfPresent([String].self, forKey: .allowedFactors)
-            ?? values.decodeIfPresent([String].self, forKey: .factors)
-        expiresAtEpochMillis = try values.decodeIfPresent(Int64.self, forKey: .expiresAtEpochMillis)
-        attemptsRemaining = try values.decodeIfPresent(Int.self, forKey: .attemptsRemaining)
+        deviceEnrollmentGrant = try values.decodeIfPresent(
+            String.self,
+            forKey: .deviceEnrollmentGrant
+        )
+        deviceEnrollmentGrantExpiresAtEpochMillis = try values.decodeIfPresent(
+            Int64.self,
+            forKey: .deviceEnrollmentGrantExpiresAtEpochMillis
+        )
+        guard !accountID.isEmpty,
+              !accessToken.isEmpty,
+              !refreshToken.isEmpty,
+              accessTokenExpiresAtEpochMillis > 0,
+              refreshTokenExpiresAtEpochMillis > 0,
+              (deviceEnrollmentGrant == nil) == (deviceEnrollmentGrantExpiresAtEpochMillis == nil),
+              deviceEnrollmentGrant?.isEmpty != true else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .accountID,
+                in: values,
+                debugDescription: "invalid login token or enrollment grant response"
+            )
+        }
     }
 
-    public var tokenSet: TokenSet? {
-        guard let accountID,
-              let accessToken,
-              let refreshToken,
-              let accessTokenExpiresAtEpochMillis,
-              let refreshTokenExpiresAtEpochMillis else {
-            return nil
-        }
-        return TokenSet(
+    public var tokenSet: TokenSet {
+        TokenSet(
             accountID: accountID,
             accessToken: accessToken,
             refreshToken: refreshToken,
@@ -265,41 +568,59 @@ public struct LoginResponse: Decodable, Sendable {
             refreshTokenExpiresAtEpochMillis: refreshTokenExpiresAtEpochMillis
         )
     }
-
-    public var challenge: MFAChallenge? {
-        guard mfaRequired == true,
-              let mfaChallengeID,
-              let expiresAtEpochMillis else {
-            return nil
-        }
-        return MFAChallenge(
-            mfaChallengeID: mfaChallengeID,
-            allowedFactors: allowedFactors ?? ["totp", "recovery_code"],
-            expiresAtEpochMillis: expiresAtEpochMillis,
-            attemptsRemaining: attemptsRemaining
-        )
-    }
 }
 
-public struct MFAVerifyRequest: Encodable, Sendable {
-    public let mfaChallengeID: String
-    public let factor: String
-    public let code: String
+public struct LoginFinishRequest: Encodable, Sendable {
+    public let loginChallengeID: String
+    public let loginRequestBindingHash: String
+    public let loginChallengeBindingHash: String
+    public let clientNonce: String
+    public let serverNonce: String
+    public let factor: String?
+    public let code: String?
+    public let protocolVersion: UInt16
 
-    public init(challengeID: String, factor: String, code: String) {
-        mfaChallengeID = challengeID
+    public init(challenge: LoginChallenge, factor: String?, code: String?) throws {
+        let validProof: Bool
+        if challenge.requiredFactors.isEmpty {
+            validProof = factor == nil && code == nil
+        } else {
+            validProof = factor.map { challenge.requiredFactors.contains($0) } == true
+                && code?.isEmpty == false
+        }
+        guard validProof else {
+            throw EncodingError.invalidValue(
+                "<redacted>",
+                EncodingError.Context(
+                    codingPath: [],
+                    debugDescription: "factor and code do not satisfy the login challenge"
+                )
+            )
+        }
+        loginChallengeID = challenge.loginChallengeID
+        loginRequestBindingHash = challenge.loginRequestBindingHash
+        loginChallengeBindingHash = challenge.loginChallengeBindingHash
+        clientNonce = challenge.clientNonce
+        serverNonce = challenge.serverNonce
         self.factor = factor
         self.code = code
+        protocolVersion = ProtocolConstants.version
     }
 
     private enum CodingKeys: String, CodingKey {
-        case mfaChallengeID = "mfa_challenge_id"
+        case loginChallengeID = "login_challenge_id"
+        case loginRequestBindingHash = "login_request_binding_hash"
+        case loginChallengeBindingHash = "login_challenge_binding_hash"
+        case clientNonce = "client_nonce"
+        case serverNonce = "server_nonce"
         case factor
         case code
+        case protocolVersion = "protocol_version"
     }
 }
 
 public struct DeviceRegistrationRequest: Encodable, Sendable {
+    public let deviceEnrollmentGrant: String
     public let deviceID: String
     public let platform: PlatformKind
     public let displayName: String
@@ -315,7 +636,8 @@ public struct DeviceRegistrationRequest: Encodable, Sendable {
         osVersion: String,
         arch: String,
         publicKey: String,
-        roleCapabilities: RoleCapabilities
+        roleCapabilities: RoleCapabilities,
+        deviceEnrollmentGrant: String
     ) {
         self.deviceID = deviceID
         self.platform = platform
@@ -324,6 +646,7 @@ public struct DeviceRegistrationRequest: Encodable, Sendable {
         self.arch = arch
         self.publicKey = publicKey
         self.roleCapabilities = roleCapabilities
+        self.deviceEnrollmentGrant = deviceEnrollmentGrant
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -334,6 +657,7 @@ public struct DeviceRegistrationRequest: Encodable, Sendable {
         case arch
         case publicKey = "public_key"
         case roleCapabilities = "role_capabilities"
+        case deviceEnrollmentGrant = "device_enrollment_grant"
     }
 }
 

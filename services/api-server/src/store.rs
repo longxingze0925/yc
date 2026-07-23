@@ -2,19 +2,20 @@ use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 pub use crate::model::Database;
 use crate::model::{
-    Account, AccountSession, AccountStatus, AuditEntry, Device, DeviceEnrollmentGrant,
-    DeviceLifecycleStatus, DevicePublicKeyRecord, IdempotencyRecord, LoginChallengeContext,
-    LoginDeviceState, MfaFactor, PolicyEvaluation, RecoveryCode, RecoveryCodeDelivery,
-    RiskChallenge, RiskChallengeStatus, Session, SessionEvent, SessionStatus,
+    Account, AccountSession, AccountStatus, Architecture, AuditEntry, Device, DeviceCapabilities,
+    DeviceEnrollmentGrant, DeviceLifecycleStatus, DevicePublicKeyRecord, IdempotencyRecord,
+    LoginChallengeContext, LoginDeviceState, MfaFactor, Platform, PolicyEvaluation, RecoveryCode,
+    RecoveryCodeDelivery, RiskChallenge, RiskChallengeStatus, Session, SessionEvent, SessionStatus,
     TrustedControllerDevice, TrustedDeviceStatus,
 };
 use crate::security::{
-    constant_time_sha256_eq, sha256, sha256_hex, verify_device_signature, verify_password,
-    verify_totp,
+    canonical_fields, constant_time_sha256_eq, device_registration_binding_hash, hex_encode,
+    sha256, sha256_hex, verify_device_signature, verify_password, verify_totp,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +98,8 @@ pub struct TotpEnrollmentReplayLookup {
     pub account_session_id: String,
     pub factor_id: String,
     pub idempotency_key_hash: [u8; 32],
-    pub finish_request_binding_hash: [u8; 32],
+    pub finish_request_binding_hash: Option<[u8; 32]>,
+    pub client_ephemeral_public_key: Option<[u8; 32]>,
     pub access_token_expires_at_epoch_millis: u64,
     pub now_epoch_millis: u64,
 }
@@ -207,6 +209,29 @@ pub enum DeviceRegistrationOutcome {
     Created(Device),
     Replayed(Device),
     InvalidGrant,
+}
+
+pub(crate) const DEVICE_REGISTRATION_RESULT_METADATA_KEY: &str = "device_registration_result_v1";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DeviceRegistrationResultSnapshot {
+    grant_id: String,
+    registration_request_binding_hash: String,
+    device_id: String,
+    account_id: String,
+    display_name: String,
+    platform: Platform,
+    os_version: String,
+    arch: Architecture,
+    capabilities: DeviceCapabilities,
+    public_key_id: String,
+    public_key_fingerprint: String,
+    public_key_version: u32,
+    public_key_revoked_at_epoch_millis: Option<u64>,
+    status: String,
+    last_seen_epoch_millis: Option<u64>,
+    created_at_epoch_millis: u64,
+    updated_at_epoch_millis: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -679,6 +704,13 @@ impl Repository for MemoryRepository {
             else {
                 return Ok(LoginFinishOutcome::InvalidChallenge);
             };
+            let Some(context) = candidate
+                .login_challenge_contexts
+                .get(&command.challenge_id)
+                .cloned()
+            else {
+                return Ok(LoginFinishOutcome::InvalidChallenge);
+            };
             if challenge.account_id != command.account_id
                 || challenge.device_id != command.persistent_device_id
                 || challenge.purpose != "login_mfa"
@@ -688,6 +720,9 @@ impl Repository for MemoryRepository {
                 )
                 || challenge.required_methods != command.required_factors
             {
+                return Ok(LoginFinishOutcome::InvalidChallenge);
+            }
+            if validate_login_finish_authority_binding(command, &challenge, &context).is_err() {
                 return Ok(LoginFinishOutcome::InvalidChallenge);
             }
             if candidate
@@ -771,7 +806,19 @@ impl Repository for MemoryRepository {
                 && command.public_key_version == 0
                 && !candidate.devices.contains_key(&command.device_id);
             if !registered_device_valid && !pending_device_valid {
-                return Ok(LoginFinishOutcome::InvalidChallenge);
+                let current = candidate
+                    .risk_challenges
+                    .get_mut(&command.challenge_id)
+                    .ok_or(StoreError::Unavailable)?;
+                current.attempts_remaining = current.attempts_remaining.saturating_sub(1);
+                if current.attempts_remaining == 0 {
+                    current.status = RiskChallengeStatus::Failed;
+                }
+                let mut audit = command.failure_audit_entry.clone();
+                audit.reason = Some("device_authority_changed".to_owned());
+                candidate.audit_logs.push(audit);
+                *database = candidate;
+                return Ok(LoginFinishOutcome::Rejected);
             }
 
             let mfa_enabled = candidate
@@ -887,6 +934,9 @@ impl Repository for MemoryRepository {
             if let Some(trusted) = &command.trusted_device_to_create {
                 if command.enrollment_grant.is_some()
                     || command.factor_kind.is_none()
+                    || candidate
+                        .trusted_controller_devices
+                        .contains_key(&trusted.trusted_device_id)
                     || trusted.account_id != command.account_id
                     || trusted.controller_device_id != command.device_id
                     || !constant_time_sha256_eq(
@@ -894,6 +944,37 @@ impl Repository for MemoryRepository {
                         &command.device_public_key_fingerprint,
                     )
                 {
+                    return Err(StoreError::Conflict);
+                }
+                let trust_added_audit = command
+                    .audit_entries
+                    .iter()
+                    .find(|audit| audit.action == "trusted_device_added")
+                    .ok_or(StoreError::Conflict)?;
+                let revocation_audits = candidate
+                    .trusted_controller_devices
+                    .values()
+                    .filter(|current| {
+                        current.account_id == command.account_id
+                            && current.controller_device_id == command.device_id
+                            && current.status == TrustedDeviceStatus::Active
+                    })
+                    .map(|current| {
+                        trusted_device_revocation_audit(
+                            trust_added_audit,
+                            &current.trusted_device_id,
+                            &current.controller_device_id,
+                            "refreshed",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if revocation_audits.iter().any(|audit| {
+                    candidate
+                        .audit_logs
+                        .iter()
+                        .chain(command.audit_entries.iter())
+                        .any(|existing| existing.audit_id == audit.audit_id)
+                }) {
                     return Err(StoreError::Conflict);
                 }
                 for current in candidate.trusted_controller_devices.values_mut() {
@@ -905,6 +986,7 @@ impl Repository for MemoryRepository {
                         current.revoked_at_epoch_millis = Some(command.now_epoch_millis);
                     }
                 }
+                candidate.audit_logs.extend(revocation_audits);
                 candidate
                     .trusted_controller_devices
                     .insert(trusted.trusted_device_id.clone(), trusted.clone());
@@ -1241,25 +1323,26 @@ impl Repository for MemoryRepository {
     ) -> RepositoryFuture<'a, Result<bool, StoreError>> {
         Box::pin(async move {
             let mut database = self.database.write().await;
+            let mut candidate = database.clone();
             if replacement.revoked_at_epoch_millis.is_some()
                 || replacement.revoked_reason.is_some()
                 || replacement.expires_at_epoch_millis <= now_epoch_millis
-                || database
+                || candidate
                     .account_sessions
                     .contains_key(&replacement.account_session_id)
-                || database
+                || candidate
                     .audit_logs
                     .iter()
                     .any(|entry| entry.audit_id == audit_entry.audit_id)
                 || audit_entry.actor_account_id.as_deref() != Some(replacement.account_id.as_str())
-                || !database
+                || !candidate
                     .accounts
                     .get(&replacement.account_id)
                     .is_some_and(|account| account.status == crate::model::AccountStatus::Active)
             {
                 return Err(StoreError::Conflict);
             }
-            let old_session_id = database
+            let old_session_id = candidate
                 .account_sessions
                 .iter()
                 .find(|(_, session)| {
@@ -1274,16 +1357,28 @@ impl Repository for MemoryRepository {
             let Some(old_session_id) = old_session_id else {
                 return Ok(false);
             };
-            let old_session = database
+            let revocation_audit =
+                account_session_revocation_audit(audit_entry, &old_session_id, "refresh_replay");
+            if candidate
+                .audit_logs
+                .iter()
+                .any(|entry| entry.audit_id == revocation_audit.audit_id)
+                || revocation_audit.audit_id == audit_entry.audit_id
+            {
+                return Err(StoreError::Conflict);
+            }
+            let old_session = candidate
                 .account_sessions
                 .get_mut(&old_session_id)
                 .ok_or(StoreError::Unavailable)?;
             old_session.revoked_at_epoch_millis = Some(now_epoch_millis);
             old_session.revoked_reason = Some("refresh_replay".to_owned());
-            database
+            candidate
                 .account_sessions
                 .insert(replacement.account_session_id.clone(), replacement.clone());
-            database.audit_logs.push(audit_entry.clone());
+            candidate.audit_logs.push(revocation_audit);
+            candidate.audit_logs.push(audit_entry.clone());
+            *database = candidate;
             Ok(true)
         })
     }
@@ -1515,6 +1610,7 @@ impl Repository for MemoryRepository {
                         .created_at_epoch_millis
                         .saturating_add(24 * 60 * 60 * 1_000)
                 || delivery.acknowledged_at_epoch_millis.is_some()
+                || !recovery_delivery_binding_is_valid(delivery)
                 || !active_account_session(
                     candidate.account_sessions.get(&delivery.account_session_id),
                     &factor.account_id,
@@ -1525,8 +1621,6 @@ impl Repository for MemoryRepository {
                     .contains_key(&delivery.delivery_id)
                 || candidate.recovery_code_deliveries.values().any(|current| {
                     current.account_id == delivery.account_id
-                        && current.account_session_id == delivery.account_session_id
-                        && current.factor_id == delivery.factor_id
                         && constant_time_sha256_eq(
                             &current.idempotency_key_hash,
                             &delivery.idempotency_key_hash,
@@ -1600,20 +1694,8 @@ impl Repository for MemoryRepository {
     ) -> RepositoryFuture<'a, Result<TotpEnrollmentReplayOutcome, StoreError>> {
         Box::pin(async move {
             let database = self.database.read().await;
-            let Some(session) = database.account_sessions.get(&lookup.account_session_id) else {
-                return Ok(TotpEnrollmentReplayOutcome::NotAuthorized);
-            };
-            if session.account_id != lookup.account_id
-                || session.revoked_reason.as_deref() != Some("mfa_enabled")
-                || session.revoked_at_epoch_millis.is_none()
-                || lookup.now_epoch_millis >= lookup.access_token_expires_at_epoch_millis
-            {
-                return Ok(TotpEnrollmentReplayOutcome::NotAuthorized);
-            }
             let delivery = database.recovery_code_deliveries.values().find(|delivery| {
                 delivery.account_id == lookup.account_id
-                    && delivery.account_session_id == lookup.account_session_id
-                    && delivery.factor_id == lookup.factor_id
                     && constant_time_sha256_eq(
                         &delivery.idempotency_key_hash,
                         &lookup.idempotency_key_hash,
@@ -1622,11 +1704,35 @@ impl Repository for MemoryRepository {
             let Some(delivery) = delivery else {
                 return Ok(TotpEnrollmentReplayOutcome::NotFound);
             };
-            if !constant_time_sha256_eq(
-                &delivery.finish_request_binding_hash,
-                &lookup.finish_request_binding_hash,
-            ) {
+            if delivery.account_session_id != lookup.account_session_id
+                || delivery.factor_id != lookup.factor_id
+                || lookup
+                    .finish_request_binding_hash
+                    .as_ref()
+                    .is_some_and(|binding| {
+                        !constant_time_sha256_eq(&delivery.finish_request_binding_hash, binding)
+                    })
+                || lookup
+                    .client_ephemeral_public_key
+                    .as_ref()
+                    .is_some_and(|public_key| {
+                        !constant_time_sha256_eq(&delivery.client_ephemeral_public_key, public_key)
+                    })
+            {
                 return Ok(TotpEnrollmentReplayOutcome::BindingMismatch);
+            }
+            if !recovery_delivery_binding_is_valid(delivery) {
+                return Err(StoreError::Unavailable);
+            }
+            let Some(session) = database.account_sessions.get(&delivery.account_session_id) else {
+                return Ok(TotpEnrollmentReplayOutcome::NotAuthorized);
+            };
+            if session.account_id != lookup.account_id
+                || session.revoked_reason.as_deref() != Some("mfa_enabled")
+                || session.revoked_at_epoch_millis.is_none()
+                || lookup.now_epoch_millis >= lookup.access_token_expires_at_epoch_millis
+            {
+                return Ok(TotpEnrollmentReplayOutcome::NotAuthorized);
             }
             if delivery.acknowledged_at_epoch_millis.is_some()
                 || delivery.expires_at_epoch_millis <= lookup.now_epoch_millis
@@ -1800,12 +1906,15 @@ impl Repository for MemoryRepository {
             else {
                 return Ok(DeviceRegistrationOutcome::InvalidGrant);
             };
+            validate_device_registration_authority(&candidate, command, &grant)?;
             let challenge_matches = candidate
                 .risk_challenges
                 .get(&grant.login_challenge_id)
                 .is_some_and(|challenge| {
                     challenge.account_id == grant.account_id
+                        && challenge.purpose == "login_mfa"
                         && challenge.status == RiskChallengeStatus::Consumed
+                        && challenge.consumed_at_epoch_millis.is_some()
                         && constant_time_sha256_eq(
                             &challenge.operation_binding_hash,
                             &grant.login_challenge_binding_hash,
@@ -1842,21 +1951,31 @@ impl Repository for MemoryRepository {
                 if grant.establish_trust != grant.registered_trusted_device_id.is_some() {
                     return Err(StoreError::Unavailable);
                 }
-                return Ok(candidate
-                    .devices
-                    .get(&command.device.device_id)
-                    .filter(|existing| {
-                        existing.account_id == command.account_id
-                            && existing.public_key_id == registered_public_key_id
-                            && constant_time_sha256_eq(
-                                &sha256(&existing.public_key),
-                                &grant.device_public_key_fingerprint,
-                            )
-                            && replayed_trust_matches(&candidate, &grant)
-                    })
-                    .cloned()
-                    .map(DeviceRegistrationOutcome::Replayed)
-                    .unwrap_or(DeviceRegistrationOutcome::InvalidGrant));
+                if !replayed_trust_matches(&candidate, &grant) {
+                    return Err(StoreError::Unavailable);
+                }
+                let mut registration_audits = candidate.audit_logs.iter().filter(|audit| {
+                    audit.action == "device_registered"
+                        && audit.result == "success"
+                        && audit.actor_account_id.as_deref() == Some(command.account_id.as_str())
+                        && audit.target_device_id.as_deref()
+                            == Some(command.device.device_id.as_str())
+                        && registration_result_grant_id(&audit.metadata)
+                            == Some(command.grant_id.as_str())
+                });
+                let registration_audit = registration_audits
+                    .next()
+                    .filter(|_| registration_audits.next().is_none())
+                    .ok_or(StoreError::Unavailable)?;
+                let historical_public_key =
+                    candidate.device_public_keys.get(registered_public_key_id);
+                let replayed = replayed_device_registration_result(
+                    &registration_audit.metadata,
+                    command,
+                    &grant,
+                    historical_public_key,
+                )?;
+                return Ok(DeviceRegistrationOutcome::Replayed(replayed));
             }
             if grant.expires_at_epoch_millis <= command.now_epoch_millis
                 || !active_account_session(
@@ -1864,6 +1983,11 @@ impl Repository for MemoryRepository {
                     &command.account_id,
                     command.now_epoch_millis,
                 )
+                || (grant.establish_trust
+                    && !candidate
+                        .account_sessions
+                        .get(&command.account_session_id)
+                        .is_some_and(|session| session.mfa_verified))
             {
                 return Ok(DeviceRegistrationOutcome::InvalidGrant);
             }
@@ -1891,6 +2015,12 @@ impl Repository for MemoryRepository {
             } else {
                 None
             };
+            if registered_trusted_device_id
+                .as_ref()
+                .is_some_and(|id| candidate.trusted_controller_devices.contains_key(id))
+            {
+                return Err(StoreError::Conflict);
+            }
             let grant_record = candidate
                 .device_enrollment_grants
                 .get_mut(&command.grant_id)
@@ -1951,7 +2081,7 @@ impl Repository for MemoryRepository {
             }
             candidate
                 .audit_logs
-                .push(command.registration_audit_entry.clone());
+                .push(device_registration_result_audit(command)?);
             candidate.audit_logs.push(command.grant_audit_entry.clone());
             *database = candidate;
             Ok(DeviceRegistrationOutcome::Created(command.device.clone()))
@@ -1964,7 +2094,10 @@ impl Repository for MemoryRepository {
     ) -> RepositoryFuture<'a, Result<DeviceAuthorityChange, StoreError>> {
         Box::pin(async move {
             let mut database = self.database.write().await;
-            apply_device_key_rotation(&mut database, rotation)
+            let mut candidate = database.clone();
+            let change = apply_device_key_rotation(&mut candidate, rotation)?;
+            *database = candidate;
+            Ok(change)
         })
     }
 
@@ -2027,6 +2160,61 @@ impl Repository for MemoryRepository {
                 .and_then(device_management_session_close_reason);
             let mut session_events = Vec::with_capacity(affected_session_ids.len());
             let mut session_audits = Vec::with_capacity(affected_session_ids.len());
+            let target_snapshot = target.clone();
+            let authority_audits = device_management_authority_audits(
+                command,
+                &target_snapshot,
+                &affected_session_ids,
+            )?;
+            let authority_audit = authority_audits.first().ok_or(StoreError::Unavailable)?;
+            let trust_revocation_reason = command.action.and_then(|action| match action {
+                DeviceManagementAction::Disable => Some("device_disabled"),
+                DeviceManagementAction::Unbind => Some("device_unbound"),
+                DeviceManagementAction::RevokePublicKey => Some("device_public_key_revoked"),
+                DeviceManagementAction::Restore => None,
+            });
+            let trust_revocation_audits = trust_revocation_reason
+                .map(|reason| {
+                    candidate
+                        .trusted_controller_devices
+                        .values()
+                        .filter(|trusted| {
+                            trusted.account_id == command.account_id
+                                && trusted.controller_device_id == command.target_device_id
+                                && trusted.status == TrustedDeviceStatus::Active
+                        })
+                        .map(|trusted| {
+                            trusted_device_revocation_audit(
+                                authority_audit,
+                                &trusted.trusted_device_id,
+                                &trusted.controller_device_id,
+                                reason,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let account_session_revocation_audits = command
+                .action
+                .filter(|action| device_management_revokes_account_sessions(*action))
+                .map(|_| {
+                    candidate
+                        .account_sessions
+                        .values()
+                        .filter(|session| {
+                            session.account_id == command.account_id
+                                && session.revoked_at_epoch_millis.is_none()
+                        })
+                        .map(|session| {
+                            account_session_revocation_audit(
+                                authority_audit,
+                                &session.account_session_id,
+                                "device_unbound",
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             for session_id in &affected_session_ids {
                 let session = candidate
                     .sessions
@@ -2095,10 +2283,23 @@ impl Repository for MemoryRepository {
             candidate
                 .session_events
                 .extend(session_events.iter().cloned());
-            candidate.audit_logs.extend(session_audits);
-            candidate
-                .audit_logs
-                .push(device_management_audit(command, &affected_session_ids)?);
+            let new_audits = session_audits
+                .into_iter()
+                .chain(trust_revocation_audits)
+                .chain(account_session_revocation_audits)
+                .chain(authority_audits)
+                .collect::<Vec<_>>();
+            let mut new_audit_ids = HashSet::new();
+            if new_audits.iter().any(|audit| {
+                !new_audit_ids.insert(audit.audit_id.as_str())
+                    || database
+                        .audit_logs
+                        .iter()
+                        .any(|current| current.audit_id == audit.audit_id)
+            }) {
+                return Err(StoreError::Conflict);
+            }
+            candidate.audit_logs.extend(new_audits);
             *database = candidate;
             Ok(DeviceManagementOutcome::Updated(DeviceAuthorityChange {
                 device: Box::new(updated),
@@ -2135,6 +2336,136 @@ pub(crate) fn verify_registration_signature(command: &DeviceRegistrationCommand)
         &proof.nonce,
         &proof.signature,
     )
+}
+
+pub(crate) fn device_registration_result_audit(
+    command: &DeviceRegistrationCommand,
+) -> Result<AuditEntry, StoreError> {
+    let device = &command.device;
+    let snapshot = DeviceRegistrationResultSnapshot {
+        grant_id: command.grant_id.clone(),
+        registration_request_binding_hash: hex_encode(&command.registration_request_binding_hash),
+        device_id: device.device_id.clone(),
+        account_id: device.account_id.clone(),
+        display_name: device.display_name.clone(),
+        platform: device.platform.clone(),
+        os_version: device.os_version.clone(),
+        arch: device.arch.clone(),
+        capabilities: device.capabilities.clone(),
+        public_key_id: device.public_key_id.clone(),
+        public_key_fingerprint: hex_encode(&sha256(&device.public_key)),
+        public_key_version: device.public_key_version,
+        public_key_revoked_at_epoch_millis: device.public_key_revoked_at_epoch_millis,
+        status: device_lifecycle_status_snapshot_name(device.status).to_owned(),
+        last_seen_epoch_millis: device.last_seen_epoch_millis,
+        created_at_epoch_millis: device.created_at_epoch_millis,
+        updated_at_epoch_millis: device.updated_at_epoch_millis,
+    };
+    let mut audit = command.registration_audit_entry.clone();
+    audit.metadata.insert(
+        DEVICE_REGISTRATION_RESULT_METADATA_KEY.to_owned(),
+        serde_json::to_value(snapshot).map_err(|_| StoreError::Unavailable)?,
+    );
+    Ok(audit)
+}
+
+pub(crate) fn replayed_device_registration_result(
+    metadata: &BTreeMap<String, serde_json::Value>,
+    command: &DeviceRegistrationCommand,
+    grant: &DeviceEnrollmentGrant,
+    historical_public_key: Option<&DevicePublicKeyRecord>,
+) -> Result<Device, StoreError> {
+    let snapshot = metadata
+        .get(DEVICE_REGISTRATION_RESULT_METADATA_KEY)
+        .cloned()
+        .ok_or(StoreError::Unavailable)
+        .and_then(|value| {
+            serde_json::from_value::<DeviceRegistrationResultSnapshot>(value)
+                .map_err(|_| StoreError::Unavailable)
+        })?;
+    let device = &command.device;
+    if snapshot.grant_id != command.grant_id
+        || snapshot.grant_id != grant.grant_id
+        || snapshot.registration_request_binding_hash
+            != hex_encode(&command.registration_request_binding_hash)
+        || snapshot.device_id != device.device_id
+        || snapshot.device_id != grant.device_id
+        || snapshot.account_id != command.account_id
+        || snapshot.account_id != device.account_id
+        || snapshot.account_id != grant.account_id
+        || snapshot.display_name != device.display_name
+        || snapshot.platform != device.platform
+        || snapshot.os_version != device.os_version
+        || snapshot.arch != device.arch
+        || snapshot.capabilities != device.capabilities
+        || snapshot.public_key_id.as_str()
+            != grant.registered_public_key_id.as_deref().unwrap_or("")
+        || snapshot.public_key_fingerprint != hex_encode(&grant.device_public_key_fingerprint)
+        || snapshot.public_key_version != 1
+        || snapshot.public_key_revoked_at_epoch_millis.is_some()
+        || snapshot.status != "offline"
+        || snapshot.last_seen_epoch_millis.is_some()
+        || snapshot.updated_at_epoch_millis < snapshot.created_at_epoch_millis
+    {
+        return Err(StoreError::Unavailable);
+    }
+
+    let public_key = match historical_public_key {
+        Some(record)
+            if record.public_key_id == snapshot.public_key_id
+                && record.device_id == snapshot.device_id
+                && record.version == snapshot.public_key_version
+                && constant_time_sha256_eq(
+                    &sha256(&record.public_key),
+                    &grant.device_public_key_fingerprint,
+                ) =>
+        {
+            record.public_key
+        }
+        Some(_) => return Err(StoreError::Unavailable),
+        None => device.public_key,
+    };
+    if !constant_time_sha256_eq(&sha256(&public_key), &grant.device_public_key_fingerprint) {
+        return Err(StoreError::Unavailable);
+    }
+
+    Ok(Device {
+        device_id: snapshot.device_id,
+        account_id: snapshot.account_id,
+        display_name: snapshot.display_name,
+        platform: snapshot.platform,
+        os_version: snapshot.os_version,
+        arch: snapshot.arch,
+        capabilities: snapshot.capabilities,
+        public_key_id: snapshot.public_key_id,
+        public_key,
+        public_key_version: snapshot.public_key_version,
+        public_key_revoked_at_epoch_millis: snapshot.public_key_revoked_at_epoch_millis,
+        status: DeviceLifecycleStatus::Offline,
+        last_seen_epoch_millis: snapshot.last_seen_epoch_millis,
+        created_at_epoch_millis: snapshot.created_at_epoch_millis,
+        updated_at_epoch_millis: snapshot.updated_at_epoch_millis,
+    })
+}
+
+pub(crate) fn registration_result_grant_id(
+    metadata: &BTreeMap<String, serde_json::Value>,
+) -> Option<&str> {
+    metadata
+        .get(DEVICE_REGISTRATION_RESULT_METADATA_KEY)?
+        .get("grant_id")?
+        .as_str()
+}
+
+const fn device_lifecycle_status_snapshot_name(status: DeviceLifecycleStatus) -> &'static str {
+    match status {
+        DeviceLifecycleStatus::Online => "online",
+        DeviceLifecycleStatus::Offline => "offline",
+        DeviceLifecycleStatus::Busy => "busy",
+        DeviceLifecycleStatus::Suspended => "suspended",
+        DeviceLifecycleStatus::Disabled => "disabled",
+        DeviceLifecycleStatus::Unbound => "unbound",
+    }
 }
 
 pub(crate) fn device_management_transition_allowed(
@@ -2205,6 +2536,271 @@ pub(crate) fn device_management_audit(
         );
     }
     Ok(audit)
+}
+
+pub(crate) fn device_management_authority_audits(
+    command: &DeviceManagementCommand,
+    target: &Device,
+    affected_session_ids: &[String],
+) -> Result<Vec<AuditEntry>, StoreError> {
+    let expected_action = match command.action {
+        None | Some(DeviceManagementAction::Disable | DeviceManagementAction::Restore) => {
+            "device_status_changed"
+        }
+        Some(DeviceManagementAction::Unbind) => "device_unregistered",
+        Some(DeviceManagementAction::RevokePublicKey) => "device_public_key_revoked",
+    };
+    let audit_shape_valid = !command.audit_entry.audit_id.trim().is_empty()
+        && command.audit_entry.actor_type == "device"
+        && command.audit_entry.actor_account_id.as_deref() == Some(command.account_id.as_str())
+        && command.audit_entry.actor_device_id.as_deref() == Some(command.actor_device_id.as_str())
+        && command.audit_entry.target_device_id.as_deref()
+            == Some(command.target_device_id.as_str())
+        && command.audit_entry.action == expected_action
+        && command.audit_entry.result == "success"
+        && command.audit_entry.created_at_epoch_millis == command.now_epoch_millis;
+    if !audit_shape_valid
+        || target.account_id != command.account_id
+        || target.device_id != command.target_device_id
+        || target.public_key_id != command.expected_target_public_key_id
+        || target.public_key_version != command.expected_target_public_key_version
+    {
+        return Err(StoreError::Conflict);
+    }
+
+    let mut primary = device_management_audit(command, affected_session_ids)?;
+    match command.action {
+        Some(DeviceManagementAction::RevokePublicKey) => {
+            primary
+                .metadata
+                .extend(device_public_key_revocation_snapshot(
+                    target,
+                    affected_session_ids,
+                    command.now_epoch_millis,
+                    "user_requested",
+                )?);
+            Ok(vec![primary])
+        }
+        Some(DeviceManagementAction::Unbind) => {
+            let mut key_audit = primary.clone();
+            key_audit.audit_id = format!("{}:public-key", primary.audit_id);
+            key_audit.action = "device_public_key_revoked".to_owned();
+            key_audit.reason = Some("device_unbound".to_owned());
+            key_audit.metadata = device_public_key_revocation_snapshot(
+                target,
+                affected_session_ids,
+                command.now_epoch_millis,
+                "device_unbound",
+            )?;
+            Ok(vec![primary, key_audit])
+        }
+        _ => Ok(vec![primary]),
+    }
+}
+
+fn device_public_key_revocation_snapshot(
+    target: &Device,
+    affected_session_ids: &[String],
+    revoked_at_epoch_millis: u64,
+    revocation_reason: &str,
+) -> Result<BTreeMap<String, serde_json::Value>, StoreError> {
+    let mut session_ids = affected_session_ids.to_vec();
+    session_ids.sort();
+    let serialized = serde_json::to_vec(&session_ids).map_err(|_| StoreError::Unavailable)?;
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "old_public_key_id".to_owned(),
+        serde_json::Value::String(target.public_key_id.clone()),
+    );
+    metadata.insert(
+        "old_public_key_version".to_owned(),
+        serde_json::Value::from(target.public_key_version),
+    );
+    metadata.insert(
+        "old_public_key_fingerprint".to_owned(),
+        serde_json::Value::String(sha256_hex(&target.public_key)),
+    );
+    metadata.insert(
+        "revoked_at_epoch_millis".to_owned(),
+        serde_json::Value::from(revoked_at_epoch_millis),
+    );
+    metadata.insert(
+        "revocation_reason".to_owned(),
+        serde_json::Value::String(revocation_reason.to_owned()),
+    );
+    metadata.insert(
+        "affected_session_ids_hash".to_owned(),
+        serde_json::Value::String(sha256_hex(&serialized)),
+    );
+    Ok(metadata)
+}
+
+pub(crate) fn validate_device_registration_authority(
+    database: &Database,
+    command: &DeviceRegistrationCommand,
+    grant: &DeviceEnrollmentGrant,
+) -> Result<(), StoreError> {
+    let device = &command.device;
+    let capability_shape_valid = device.capabilities.controller
+        && !device.capabilities.file_transfer
+        && !device.capabilities.unattended
+        && (!matches!(device.platform, Platform::Ios) || !device.capabilities.controlled);
+    let platform_architecture_valid =
+        device.platform != Platform::Ubuntu || device.arch == Architecture::X86_64;
+    let expected_binding = device_registration_binding_hash(
+        &command.account_id,
+        &command.account_session_id,
+        &command.grant_id,
+        &device.device_id,
+        &device.display_name,
+        registration_platform_name(&device.platform),
+        &device.os_version,
+        registration_architecture_name(&device.arch),
+        device.capabilities.controller,
+        device.capabilities.controlled,
+        device.capabilities.file_transfer,
+        device.capabilities.unattended,
+        &sha256(&device.public_key),
+        command.protocol_version,
+    );
+    if command.grant_id.trim().is_empty()
+        || command.account_id.trim().is_empty()
+        || command.account_session_id.trim().is_empty()
+        || command.protocol_version == 0
+        || device.account_id != command.account_id
+        || device.device_id.trim().is_empty()
+        || device.display_name.trim().is_empty()
+        || device.os_version.trim().is_empty()
+        || device.public_key_id.trim().is_empty()
+        || device.public_key_version != 1
+        || device.public_key_revoked_at_epoch_millis.is_some()
+        || device.status != DeviceLifecycleStatus::Offline
+        || device.last_seen_epoch_millis.is_some()
+        || device.created_at_epoch_millis > command.now_epoch_millis
+        || device.updated_at_epoch_millis < device.created_at_epoch_millis
+        || !capability_shape_valid
+        || !platform_architecture_valid
+        || !constant_time_sha256_eq(
+            &expected_binding,
+            &command.registration_request_binding_hash,
+        )
+    {
+        return Err(StoreError::Conflict);
+    }
+
+    let grant_ttl_valid = grant
+        .expires_at_epoch_millis
+        .checked_sub(grant.issued_at_epoch_millis)
+        .is_some_and(|ttl| ttl > 0 && ttl <= 300_000);
+    let grant_result_shape_valid = match grant.consumed_at_epoch_millis {
+        None => {
+            grant.registration_request_binding_hash.is_none()
+                && grant.registered_public_key_id.is_none()
+                && grant.registered_trusted_device_id.is_none()
+        }
+        Some(consumed_at) => {
+            consumed_at >= grant.issued_at_epoch_millis
+                && consumed_at <= grant.expires_at_epoch_millis
+                && grant.registration_request_binding_hash.is_some()
+                && grant
+                    .registered_public_key_id
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                && grant.establish_trust == grant.registered_trusted_device_id.is_some()
+        }
+    };
+    let trust_shape_valid = matches!(
+        (
+            grant.establish_trust,
+            grant.trust_proof_type.as_deref(),
+            grant.trust_level.as_deref(),
+        ),
+        (false, None, None)
+            | (true, Some("device_signature_and_mfa"), Some("standard"))
+            | (
+                true,
+                Some("device_signature_and_recovery_code"),
+                Some("high_risk_step_up_required")
+            )
+    );
+    if grant.grant_id != command.grant_id
+        || grant.account_id.trim().is_empty()
+        || grant.device_id.trim().is_empty()
+        || grant.login_challenge_id.trim().is_empty()
+        || grant.issued_account_session_id.trim().is_empty()
+        || grant.protocol_version == 0
+        || !grant_ttl_valid
+        || !grant_result_shape_valid
+        || !trust_shape_valid
+    {
+        return Err(StoreError::Unavailable);
+    }
+
+    let registration_audit = &command.registration_audit_entry;
+    let grant_audit = &command.grant_audit_entry;
+    let mut audits = vec![registration_audit, grant_audit];
+    if grant.establish_trust {
+        audits.push(
+            command
+                .trusted_device_audit_entry
+                .as_ref()
+                .ok_or(StoreError::Conflict)?,
+        );
+        if command
+            .trusted_device_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(StoreError::Conflict);
+        }
+    }
+    if registration_audit.action != "device_registered"
+        || grant_audit.action != "device_enrollment_grant_consumed"
+        || (grant.establish_trust
+            && command
+                .trusted_device_audit_entry
+                .as_ref()
+                .is_none_or(|audit| audit.action != "trusted_device_added"))
+    {
+        return Err(StoreError::Conflict);
+    }
+    let mut audit_ids = HashSet::new();
+    if audits.iter().any(|audit| {
+        !audit_ids.insert(audit.audit_id.as_str())
+            || database
+                .audit_logs
+                .iter()
+                .any(|current| current.audit_id == audit.audit_id)
+            || audit.actor_type != "device"
+            || audit.actor_account_id.as_deref() != Some(command.account_id.as_str())
+            || audit.actor_device_id.as_deref() != Some(device.device_id.as_str())
+            || audit.actor_role.as_deref() != Some("none")
+            || audit.actor_service.is_some()
+            || audit.target_device_id.as_deref() != Some(device.device_id.as_str())
+            || audit.session_id.is_some()
+            || audit.result != "success"
+            || audit.reason.is_some()
+            || audit.request_id != command.signature_proof.request_id
+            || audit.created_at_epoch_millis != command.now_epoch_millis
+    }) {
+        return Err(StoreError::Conflict);
+    }
+    Ok(())
+}
+
+const fn registration_platform_name(platform: &Platform) -> &'static str {
+    match platform {
+        Platform::Windows => "windows",
+        Platform::Ubuntu => "ubuntu",
+        Platform::Ios => "ios",
+    }
+}
+
+const fn registration_architecture_name(architecture: &Architecture) -> &'static str {
+    match architecture {
+        Architecture::X86_64 => "x86_64",
+        Architecture::Aarch64 => "aarch64",
+    }
 }
 
 fn replayed_trust_matches(database: &Database, grant: &DeviceEnrollmentGrant) -> bool {
@@ -2660,8 +3256,9 @@ fn apply_device_key_rotation(
     {
         return Err(StoreError::Conflict);
     }
+    let current = current.clone();
     let old_fingerprint = sha256(&current.public_key);
-    let affected_epochs = database
+    let mut affected_epochs = database
         .sessions
         .values()
         .filter(|session| {
@@ -2677,6 +3274,26 @@ fn apply_device_key_rotation(
                 .ok_or(StoreError::Conflict)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    affected_epochs.sort_by(|left, right| left.0.cmp(&right.0));
+    let rotation_audit = device_key_rotation_authority_audit(rotation, &current)?;
+    let trust_revocation_audits = database
+        .trusted_controller_devices
+        .values()
+        .filter(|trusted| {
+            trusted.account_id == rotation.step_up.account_id
+                && trusted.controller_device_id == rotation.step_up.device_id
+                && trusted.status == TrustedDeviceStatus::Active
+                && constant_time_sha256_eq(&trusted.device_fingerprint_hash, &old_fingerprint)
+        })
+        .map(|trusted| {
+            trusted_device_revocation_audit(
+                &rotation_audit,
+                &trusted.trusted_device_id,
+                &trusted.controller_device_id,
+                "device_key_rotated",
+            )
+        })
+        .collect::<Vec<_>>();
 
     consume_step_up_in_database(database, &rotation.step_up)?;
     if let Some(old_key) = database
@@ -2733,7 +3350,7 @@ fn apply_device_key_rotation(
             let (event, audit) = forced_session_close_records(
                 session,
                 from_status,
-                &rotation.audit_entry,
+                &rotation_audit,
                 "device_key_rotated",
             );
             session_events.push(event);
@@ -2743,12 +3360,86 @@ fn apply_device_key_rotation(
     database
         .session_events
         .extend(session_events.iter().cloned());
-    database.audit_logs.extend(session_audits);
-    database.audit_logs.push(rotation.audit_entry.clone());
+    let new_audits = session_audits
+        .into_iter()
+        .chain(trust_revocation_audits)
+        .chain([rotation_audit])
+        .collect::<Vec<_>>();
+    let mut new_audit_ids = HashSet::new();
+    if new_audits.iter().any(|audit| {
+        !new_audit_ids.insert(audit.audit_id.as_str())
+            || database
+                .audit_logs
+                .iter()
+                .any(|current| current.audit_id == audit.audit_id)
+    }) {
+        return Err(StoreError::Conflict);
+    }
+    database.audit_logs.extend(new_audits);
     Ok(DeviceAuthorityChange {
         device: Box::new(updated),
         closed_session_events: session_events,
     })
+}
+
+pub(crate) fn device_key_rotation_authority_audit(
+    rotation: &DeviceKeyRotation,
+    current: &Device,
+) -> Result<AuditEntry, StoreError> {
+    let source = &rotation.audit_entry;
+    if source.audit_id.trim().is_empty()
+        || source.actor_type != "device"
+        || source.actor_account_id.as_deref() != Some(rotation.step_up.account_id.as_str())
+        || source.actor_device_id.as_deref() != Some(rotation.step_up.device_id.as_str())
+        || source.target_device_id.as_deref() != Some(rotation.step_up.device_id.as_str())
+        || source.action != "device_public_key_rotated"
+        || source.result != "success"
+        || source.created_at_epoch_millis != rotation.step_up.now_epoch_millis
+        || current.account_id != rotation.step_up.account_id
+        || current.device_id != rotation.step_up.device_id
+        || current.public_key_id != rotation.current_public_key_id
+        || current.public_key_version != rotation.current_public_key_version
+    {
+        return Err(StoreError::Conflict);
+    }
+    let mut audit = source.clone();
+    audit.metadata.insert(
+        "old_public_key_id".to_owned(),
+        serde_json::Value::String(current.public_key_id.clone()),
+    );
+    audit.metadata.insert(
+        "old_public_key_version".to_owned(),
+        serde_json::Value::from(current.public_key_version),
+    );
+    audit.metadata.insert(
+        "old_public_key_fingerprint".to_owned(),
+        serde_json::Value::String(sha256_hex(&current.public_key)),
+    );
+    audit.metadata.insert(
+        "new_public_key_id".to_owned(),
+        serde_json::Value::String(rotation.new_public_key_id.clone()),
+    );
+    audit.metadata.insert(
+        "new_public_key_version".to_owned(),
+        serde_json::Value::from(rotation.new_public_key_version),
+    );
+    audit.metadata.insert(
+        "new_public_key_fingerprint".to_owned(),
+        serde_json::Value::String(sha256_hex(&rotation.new_public_key)),
+    );
+    audit.metadata.insert(
+        "revoked_at_epoch_millis".to_owned(),
+        serde_json::Value::from(rotation.step_up.now_epoch_millis),
+    );
+    audit.metadata.insert(
+        "rotation_reason".to_owned(),
+        serde_json::Value::String("user_requested".to_owned()),
+    );
+    audit.metadata.insert(
+        "step_up_challenge_id".to_owned(),
+        serde_json::Value::String(rotation.step_up.challenge_id.clone()),
+    );
+    Ok(audit)
 }
 
 pub(crate) fn device_management_session_close_reason(
@@ -2923,18 +3614,39 @@ pub(crate) fn validate_login_finish_artifacts(
     challenge: &RiskChallenge,
 ) -> Result<(), StoreError> {
     let mut audit_ids = HashSet::new();
-    if command.audit_entries.is_empty()
+    let mut expected_actions = HashSet::from(["mfa_challenge_succeeded", "login_succeeded"]);
+    if command.trusted_device_to_create.is_some() {
+        expected_actions.insert("trusted_device_added");
+    }
+    if command.factor_kind.as_deref() == Some("recovery_code") {
+        expected_actions.insert("mfa_recovery_code_used");
+    }
+    let actual_actions = command
+        .audit_entries
+        .iter()
+        .map(|audit| audit.action.as_str())
+        .collect::<HashSet<_>>();
+    if actual_actions != expected_actions
+        || command.audit_entries.len() != expected_actions.len()
         || command.audit_entries.iter().any(|audit| {
             audit.audit_id.trim().is_empty()
-                || audit.action.trim().is_empty()
+                || audit.actor_type != "account"
                 || audit.result != "success"
                 || audit.actor_account_id.as_deref() != Some(command.account_id.as_str())
+                || audit.actor_device_id.is_some()
+                || audit.actor_role.is_some()
+                || audit.actor_service.is_some()
                 || audit.created_at_epoch_millis != command.now_epoch_millis
                 || !audit_ids.insert(audit.audit_id.as_str())
         })
         || command.failure_audit_entry.audit_id.trim().is_empty()
+        || command.failure_audit_entry.actor_type != "account"
         || command.failure_audit_entry.actor_account_id.as_deref()
             != Some(command.account_id.as_str())
+        || command.failure_audit_entry.actor_device_id.is_some()
+        || command.failure_audit_entry.actor_role.is_some()
+        || command.failure_audit_entry.actor_service.is_some()
+        || command.failure_audit_entry.action != "mfa_challenge_failed"
         || command.failure_audit_entry.result != "failure"
         || command.failure_audit_entry.created_at_epoch_millis != command.now_epoch_millis
         || !audit_ids.insert(command.failure_audit_entry.audit_id.as_str())
@@ -3038,6 +3750,41 @@ pub(crate) fn validate_login_finish_artifacts(
     Ok(())
 }
 
+pub(crate) fn validate_login_finish_authority_binding(
+    command: &LoginFinishCommand,
+    challenge: &RiskChallenge,
+    context: &LoginChallengeContext,
+) -> Result<(), StoreError> {
+    let expected_persistent_device_id =
+        (context.device_state == LoginDeviceState::Registered).then(|| context.device_id.clone());
+    if command.challenge_id != challenge.risk_challenge_id
+        || command.account_id != challenge.account_id
+        || command.persistent_device_id != challenge.device_id
+        || command.persistent_device_id != expected_persistent_device_id
+        || command.account_updated_at_epoch_millis != context.account_updated_at_epoch_millis
+        || command.device_id != context.device_id
+        || command.public_key_id != context.public_key_id
+        || command.public_key_version != context.public_key_version
+        || !constant_time_sha256_eq(
+            &command.device_public_key_fingerprint,
+            &context.device_public_key_fingerprint,
+        )
+        || !constant_time_sha256_eq(
+            &command.challenge_binding_hash,
+            &context.login_challenge_binding_hash,
+        )
+        || command.required_factors != context.required_factors
+        || command.trusted_device_id_to_use != context.trusted_device_id
+        || command
+            .enrollment_grant
+            .as_ref()
+            .is_some_and(|grant| grant.protocol_version != context.protocol_version)
+    {
+        return Err(StoreError::Conflict);
+    }
+    Ok(())
+}
+
 pub(crate) fn risk_challenge_required_methods_are_valid(
     purpose: &str,
     required_methods: &[String],
@@ -3048,6 +3795,38 @@ pub(crate) fn risk_challenge_required_methods_are_valid(
         "password_change" => required_methods == ["password"] || required_methods == mfa_methods,
         _ => required_methods == mfa_methods,
     }
+}
+
+pub(crate) fn totp_enrollment_finish_binding_hash(
+    account_id: &str,
+    account_session_id: &str,
+    factor_id: &str,
+    idempotency_key_hash: &[u8; 32],
+    client_ephemeral_public_key: &[u8; 32],
+) -> [u8; 32] {
+    sha256(&canonical_fields(
+        "rctl-totp-enrollment-finish-v1",
+        &[
+            ("account_id", account_id.as_bytes()),
+            ("account_session_id", account_session_id.as_bytes()),
+            ("factor_id", factor_id.as_bytes()),
+            ("idempotency_key_hash", idempotency_key_hash),
+            ("client_ephemeral_public_key", client_ephemeral_public_key),
+        ],
+    ))
+}
+
+pub(crate) fn recovery_delivery_binding_is_valid(delivery: &RecoveryCodeDelivery) -> bool {
+    constant_time_sha256_eq(
+        &delivery.finish_request_binding_hash,
+        &totp_enrollment_finish_binding_hash(
+            &delivery.account_id,
+            &delivery.account_session_id,
+            &delivery.factor_id,
+            &delivery.idempotency_key_hash,
+            &delivery.client_ephemeral_public_key,
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -3114,7 +3893,7 @@ mod tests {
             audit_id: id.to_owned(),
             actor_type: "account".into(),
             actor_account_id: Some("account-1".into()),
-            actor_device_id: Some("device-1".into()),
+            actor_device_id: None,
             actor_role: None,
             actor_service: None,
             target_device_id: Some("device-1".into()),
@@ -3155,6 +3934,7 @@ mod tests {
     fn pending_login_finish_command(now: u64) -> LoginFinishCommand {
         let challenge_id = "login-challenge-1".to_owned();
         let session = active_account_session("login-session-1", now);
+        let device_public_key_fingerprint = sha256(&[1; 32]);
         LoginFinishCommand {
             challenge_id: challenge_id.clone(),
             account_id: "account-1".into(),
@@ -3163,7 +3943,7 @@ mod tests {
             device_id: "pending-device-1".into(),
             public_key_id: None,
             public_key_version: 0,
-            device_public_key_fingerprint: [3; 32],
+            device_public_key_fingerprint,
             challenge_binding_hash: [7; 32],
             required_factors: Vec::new(),
             factor_kind: None,
@@ -3175,7 +3955,7 @@ mod tests {
                 grant_secret_hash: [4; 32],
                 account_id: "account-1".into(),
                 device_id: "pending-device-1".into(),
-                device_public_key_fingerprint: [3; 32],
+                device_public_key_fingerprint,
                 login_challenge_id: challenge_id,
                 login_challenge_binding_hash: [7; 32],
                 trust_proof_type: None,
@@ -3191,12 +3971,15 @@ mod tests {
                 registered_trusted_device_id: None,
             }),
             trusted_device_to_create: None,
-            audit_entries: vec![account_security_audit(
-                "login-success",
-                "login_succeeded",
-                "success",
-                now,
-            )],
+            audit_entries: vec![
+                account_security_audit(
+                    "login-mfa-success",
+                    "mfa_challenge_succeeded",
+                    "success",
+                    now,
+                ),
+                account_security_audit("login-success", "login_succeeded", "success", now),
+            ],
             failure_audit_entry: account_security_audit(
                 "login-failure",
                 "mfa_challenge_failed",
@@ -3204,6 +3987,32 @@ mod tests {
                 now,
             ),
             now_epoch_millis: now,
+        }
+    }
+
+    fn pending_login_context(
+        command: &LoginFinishCommand,
+        challenge: &RiskChallenge,
+    ) -> LoginChallengeContext {
+        LoginChallengeContext {
+            device_state: LoginDeviceState::PendingEnrollment,
+            device_id: command.device_id.clone(),
+            account_updated_at_epoch_millis: command.account_updated_at_epoch_millis,
+            device_public_key: [1; 32],
+            device_public_key_fingerprint: command.device_public_key_fingerprint,
+            public_key_id: None,
+            public_key_version: 0,
+            client_nonce: [2; 32],
+            server_nonce: [3; 32],
+            login_request_binding_hash: [4; 32],
+            login_challenge_binding_hash: command.challenge_binding_hash,
+            ip_address_hash: [5; 32],
+            user_agent_hash: [6; 32],
+            required_factors: command.required_factors.clone(),
+            trusted_device_id: None,
+            protocol_version: 1,
+            issued_at_epoch_millis: challenge.created_at_epoch_millis,
+            attempts_limit: 5,
         }
     }
 
@@ -3302,6 +4111,28 @@ mod tests {
             validate_login_finish_artifacts(&trust_escalation, &challenge),
             Err(StoreError::Conflict)
         );
+
+        let context = pending_login_context(&command, &challenge);
+        assert_eq!(
+            validate_login_finish_authority_binding(&command, &challenge, &context),
+            Ok(())
+        );
+        let mut stale_snapshot = command.clone();
+        stale_snapshot.account_updated_at_epoch_millis = stale_snapshot
+            .account_updated_at_epoch_millis
+            .saturating_add(1);
+        assert_eq!(
+            validate_login_finish_authority_binding(&stale_snapshot, &challenge, &context),
+            Err(StoreError::Conflict)
+        );
+        let mut missing_success_audit = command;
+        missing_success_audit
+            .audit_entries
+            .retain(|audit| audit.action != "mfa_challenge_succeeded");
+        assert_eq!(
+            validate_login_finish_artifacts(&missing_success_audit, &challenge),
+            Err(StoreError::Conflict)
+        );
     }
 
     fn authorizable_device(id: &str, account_id: &str, now: u64) -> Device {
@@ -3356,14 +4187,25 @@ mod tests {
         recovery_code_count: u16,
         now: u64,
     ) -> RecoveryCodeDelivery {
+        let account_id = "account-1".to_owned();
+        let account_session_id = session_id.to_owned();
+        let factor_id = factor_id.to_owned();
+        let idempotency_key_hash = sha256(delivery_id.as_bytes());
+        let client_ephemeral_public_key = [3; 32];
         RecoveryCodeDelivery {
             delivery_id: delivery_id.to_owned(),
-            account_id: "account-1".into(),
-            account_session_id: session_id.to_owned(),
-            factor_id: factor_id.to_owned(),
-            idempotency_key_hash: sha256(delivery_id.as_bytes()),
-            finish_request_binding_hash: sha256(factor_id.as_bytes()),
-            client_ephemeral_public_key: [3; 32],
+            finish_request_binding_hash: totp_enrollment_finish_binding_hash(
+                &account_id,
+                &account_session_id,
+                &factor_id,
+                &idempotency_key_hash,
+                &client_ephemeral_public_key,
+            ),
+            account_id,
+            account_session_id,
+            factor_id,
+            idempotency_key_hash,
+            client_ephemeral_public_key,
             server_ephemeral_public_key: [4; 32],
             nonce: [5; 12],
             ciphertext: vec![6; 32],
@@ -4001,6 +4843,7 @@ mod tests {
             verified_at_epoch_millis: None,
             consumed_at_epoch_millis: None,
         };
+        let context = pending_login_context(&command, &challenge);
         repository
             .transact(&mut |database| {
                 database
@@ -4009,6 +4852,9 @@ mod tests {
                 database
                     .risk_challenges
                     .insert(challenge.risk_challenge_id.clone(), challenge.clone());
+                database
+                    .login_challenge_contexts
+                    .insert(challenge.risk_challenge_id.clone(), context.clone());
                 Ok(())
             })
             .await
@@ -4029,6 +4875,406 @@ mod tests {
                 assert_eq!(
                     database.audit_logs[0].reason.as_deref(),
                     Some("account_security_changed")
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn memory_login_finish_rejects_changed_device_authority_inside_repository() {
+        let repository = MemoryRepository::default();
+        let now = 1_700_000_000_000;
+        let command = pending_login_finish_command(now);
+        let challenge = RiskChallenge {
+            risk_challenge_id: command.challenge_id.clone(),
+            account_id: command.account_id.clone(),
+            device_id: None,
+            purpose: "login_mfa".into(),
+            operation_binding_hash: command.challenge_binding_hash,
+            risk_level: "low".into(),
+            required_methods: Vec::new(),
+            status: RiskChallengeStatus::Issued,
+            attempts_remaining: 5,
+            ip_address: None,
+            user_agent: None,
+            expires_at_epoch_millis: now + 300_000,
+            created_at_epoch_millis: now.saturating_sub(100),
+            verified_at_epoch_millis: None,
+            consumed_at_epoch_millis: None,
+        };
+        let context = pending_login_context(&command, &challenge);
+        repository
+            .transact(&mut |database| {
+                database
+                    .accounts
+                    .insert(command.account_id.clone(), active_account(now));
+                database.devices.insert(
+                    command.device_id.clone(),
+                    authorizable_device(&command.device_id, &command.account_id, now),
+                );
+                database
+                    .risk_challenges
+                    .insert(challenge.risk_challenge_id.clone(), challenge.clone());
+                database
+                    .login_challenge_contexts
+                    .insert(challenge.risk_challenge_id.clone(), context.clone());
+                Ok(())
+            })
+            .await
+            .expect("seed changed pending device authority");
+
+        assert_eq!(
+            repository.finish_login(&command).await,
+            Ok(LoginFinishOutcome::Rejected)
+        );
+        repository
+            .read(&mut |database| {
+                let challenge = &database.risk_challenges[&command.challenge_id];
+                assert_eq!(challenge.status, RiskChallengeStatus::Issued);
+                assert_eq!(challenge.attempts_remaining, 4);
+                assert!(database.account_sessions.is_empty());
+                assert_eq!(database.audit_logs.len(), 1);
+                assert_eq!(
+                    database.audit_logs[0].reason.as_deref(),
+                    Some("device_authority_changed")
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn memory_login_finish_audits_replaced_trust_and_rolls_back_audit_conflict() {
+        fn fixture(
+            now: u64,
+        ) -> (
+            LoginFinishCommand,
+            RiskChallenge,
+            LoginChallengeContext,
+            Device,
+            MfaFactor,
+            TrustedControllerDevice,
+        ) {
+            let secret = generate_totp_secret();
+            let (code, _) = totp_code(&secret, now).expect("TOTP code");
+            let device = authorizable_device("device-1", "account-1", now);
+            let mut command = pending_login_finish_command(now);
+            command.persistent_device_id = Some(device.device_id.clone());
+            command.device_id = device.device_id.clone();
+            command.public_key_id = Some(device.public_key_id.clone());
+            command.public_key_version = device.public_key_version;
+            command.device_public_key_fingerprint = sha256(&device.public_key);
+            command.required_factors = vec!["totp".into(), "recovery_code".into()];
+            command.factor_kind = Some("totp".into());
+            command.factor_code = Some(code);
+            command.account_session.mfa_verified = true;
+            command.enrollment_grant = None;
+            command.trusted_device_to_create = Some(TrustedControllerDevice {
+                trusted_device_id: "new-trust".into(),
+                account_id: command.account_id.clone(),
+                controller_device_id: device.device_id.clone(),
+                device_fingerprint_hash: command.device_public_key_fingerprint,
+                trust_level: "standard".into(),
+                status: TrustedDeviceStatus::Active,
+                trust_proof_type: "device_signature_and_mfa".into(),
+                created_at_epoch_millis: now,
+                last_used_at_epoch_millis: None,
+                expires_at_epoch_millis: now + 2_592_000_000,
+                revoked_at_epoch_millis: None,
+            });
+            command.audit_entries.push(account_security_audit(
+                "trusted-device-added",
+                "trusted_device_added",
+                "success",
+                now,
+            ));
+            let challenge = RiskChallenge {
+                risk_challenge_id: command.challenge_id.clone(),
+                account_id: command.account_id.clone(),
+                device_id: Some(device.device_id.clone()),
+                purpose: "login_mfa".into(),
+                operation_binding_hash: command.challenge_binding_hash,
+                risk_level: "low".into(),
+                required_methods: command.required_factors.clone(),
+                status: RiskChallengeStatus::Issued,
+                attempts_remaining: 5,
+                ip_address: None,
+                user_agent: None,
+                expires_at_epoch_millis: now + 300_000,
+                created_at_epoch_millis: now,
+                verified_at_epoch_millis: None,
+                consumed_at_epoch_millis: None,
+            };
+            let context = LoginChallengeContext {
+                device_state: LoginDeviceState::Registered,
+                device_id: device.device_id.clone(),
+                account_updated_at_epoch_millis: command.account_updated_at_epoch_millis,
+                device_public_key: device.public_key,
+                device_public_key_fingerprint: command.device_public_key_fingerprint,
+                public_key_id: Some(device.public_key_id.clone()),
+                public_key_version: device.public_key_version,
+                client_nonce: [2; 32],
+                server_nonce: [3; 32],
+                login_request_binding_hash: [4; 32],
+                login_challenge_binding_hash: command.challenge_binding_hash,
+                ip_address_hash: [5; 32],
+                user_agent_hash: [6; 32],
+                required_factors: command.required_factors.clone(),
+                trusted_device_id: None,
+                protocol_version: 1,
+                issued_at_epoch_millis: now,
+                attempts_limit: 5,
+            };
+            let factor = MfaFactor {
+                factor_id: "factor-1".into(),
+                account_id: command.account_id.clone(),
+                secret_base32: secret,
+                active: true,
+                last_used_counter: None,
+                created_at_epoch_millis: now.saturating_sub(1),
+            };
+            let old_trust = TrustedControllerDevice {
+                trusted_device_id: "old-trust".into(),
+                account_id: command.account_id.clone(),
+                controller_device_id: device.device_id.clone(),
+                device_fingerprint_hash: command.device_public_key_fingerprint,
+                trust_level: "standard".into(),
+                status: TrustedDeviceStatus::Active,
+                trust_proof_type: "device_signature_and_mfa".into(),
+                created_at_epoch_millis: now.saturating_sub(1),
+                last_used_at_epoch_millis: None,
+                expires_at_epoch_millis: now + 60_000,
+                revoked_at_epoch_millis: None,
+            };
+            (command, challenge, context, device, factor, old_trust)
+        }
+
+        let now = 1_700_000_000_000;
+        let (command, challenge, context, device, factor, old_trust) = fixture(now);
+        let repository = MemoryRepository::default();
+        repository
+            .transact(&mut |database| {
+                database
+                    .accounts
+                    .insert(command.account_id.clone(), active_account(now));
+                database
+                    .devices
+                    .insert(device.device_id.clone(), device.clone());
+                database
+                    .mfa_factors
+                    .insert(factor.factor_id.clone(), factor.clone());
+                database
+                    .risk_challenges
+                    .insert(challenge.risk_challenge_id.clone(), challenge.clone());
+                database
+                    .login_challenge_contexts
+                    .insert(challenge.risk_challenge_id.clone(), context.clone());
+                database
+                    .trusted_controller_devices
+                    .insert(old_trust.trusted_device_id.clone(), old_trust.clone());
+                Ok(())
+            })
+            .await
+            .expect("seed login trust refresh");
+
+        assert_eq!(
+            repository.finish_login(&command).await,
+            Ok(LoginFinishOutcome::Completed)
+        );
+        repository
+            .read(&mut |database| {
+                let old = &database.trusted_controller_devices["old-trust"];
+                assert_eq!(old.status, TrustedDeviceStatus::Revoked);
+                assert_eq!(old.revoked_at_epoch_millis, Some(now));
+                assert_eq!(
+                    database.trusted_controller_devices["new-trust"].status,
+                    TrustedDeviceStatus::Active
+                );
+                let audit = database
+                    .audit_logs
+                    .iter()
+                    .find(|entry| {
+                        entry.action == "trusted_device_revoked"
+                            && entry.metadata["trusted_device_id"] == "old-trust"
+                    })
+                    .expect("old trust revocation audit");
+                assert_eq!(audit.reason.as_deref(), Some("refreshed"));
+            })
+            .await;
+
+        let (command, challenge, context, device, factor, old_trust) = fixture(now);
+        let repository = MemoryRepository::default();
+        let trust_added_audit = command
+            .audit_entries
+            .iter()
+            .find(|entry| entry.action == "trusted_device_added")
+            .expect("trusted-device added audit");
+        let conflicting_audit = trusted_device_revocation_audit(
+            trust_added_audit,
+            &old_trust.trusted_device_id,
+            &old_trust.controller_device_id,
+            "refreshed",
+        );
+        repository
+            .transact(&mut |database| {
+                database
+                    .accounts
+                    .insert(command.account_id.clone(), active_account(now));
+                database
+                    .devices
+                    .insert(device.device_id.clone(), device.clone());
+                database
+                    .mfa_factors
+                    .insert(factor.factor_id.clone(), factor.clone());
+                database
+                    .risk_challenges
+                    .insert(challenge.risk_challenge_id.clone(), challenge.clone());
+                database
+                    .login_challenge_contexts
+                    .insert(challenge.risk_challenge_id.clone(), context.clone());
+                database
+                    .trusted_controller_devices
+                    .insert(old_trust.trusted_device_id.clone(), old_trust.clone());
+                database.audit_logs.push(conflicting_audit.clone());
+                Ok(())
+            })
+            .await
+            .expect("seed trust audit conflict");
+        assert_eq!(
+            repository.finish_login(&command).await,
+            Err(StoreError::Conflict)
+        );
+        repository
+            .read(&mut |database| {
+                assert_eq!(
+                    database.trusted_controller_devices["old-trust"].status,
+                    TrustedDeviceStatus::Active
+                );
+                assert!(!database
+                    .trusted_controller_devices
+                    .contains_key("new-trust"));
+                assert!(!database
+                    .account_sessions
+                    .contains_key(&command.account_session.account_session_id));
+                assert_eq!(
+                    database.risk_challenges[&command.challenge_id].status,
+                    RiskChallengeStatus::Issued
+                );
+                assert!(database.mfa_factors["factor-1"].last_used_counter.is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn memory_login_finish_trusted_device_use_does_not_extend_fixed_ttl() {
+        let repository = MemoryRepository::default();
+        let now = 1_700_000_000_000;
+        let device = authorizable_device("device-1", "account-1", now);
+        let mut command = pending_login_finish_command(now);
+        command.persistent_device_id = Some(device.device_id.clone());
+        command.device_id = device.device_id.clone();
+        command.public_key_id = Some(device.public_key_id.clone());
+        command.public_key_version = device.public_key_version;
+        command.device_public_key_fingerprint = sha256(&device.public_key);
+        command.trusted_device_id_to_use = Some("fixed-trust".into());
+        command.account_session.mfa_verified = true;
+        command.enrollment_grant = None;
+        let fixed_expiry = now + 60_000;
+        let trusted = TrustedControllerDevice {
+            trusted_device_id: "fixed-trust".into(),
+            account_id: command.account_id.clone(),
+            controller_device_id: device.device_id.clone(),
+            device_fingerprint_hash: command.device_public_key_fingerprint,
+            trust_level: "standard".into(),
+            status: TrustedDeviceStatus::Active,
+            trust_proof_type: "device_signature_and_mfa".into(),
+            created_at_epoch_millis: now.saturating_sub(1),
+            last_used_at_epoch_millis: None,
+            expires_at_epoch_millis: fixed_expiry,
+            revoked_at_epoch_millis: None,
+        };
+        let challenge = RiskChallenge {
+            risk_challenge_id: command.challenge_id.clone(),
+            account_id: command.account_id.clone(),
+            device_id: Some(device.device_id.clone()),
+            purpose: "login_mfa".into(),
+            operation_binding_hash: command.challenge_binding_hash,
+            risk_level: "low".into(),
+            required_methods: Vec::new(),
+            status: RiskChallengeStatus::Issued,
+            attempts_remaining: 5,
+            ip_address: None,
+            user_agent: None,
+            expires_at_epoch_millis: now + 300_000,
+            created_at_epoch_millis: now,
+            verified_at_epoch_millis: None,
+            consumed_at_epoch_millis: None,
+        };
+        let context = LoginChallengeContext {
+            device_state: LoginDeviceState::Registered,
+            device_id: device.device_id.clone(),
+            account_updated_at_epoch_millis: command.account_updated_at_epoch_millis,
+            device_public_key: device.public_key,
+            device_public_key_fingerprint: command.device_public_key_fingerprint,
+            public_key_id: Some(device.public_key_id.clone()),
+            public_key_version: device.public_key_version,
+            client_nonce: [2; 32],
+            server_nonce: [3; 32],
+            login_request_binding_hash: [4; 32],
+            login_challenge_binding_hash: command.challenge_binding_hash,
+            ip_address_hash: [5; 32],
+            user_agent_hash: [6; 32],
+            required_factors: Vec::new(),
+            trusted_device_id: Some(trusted.trusted_device_id.clone()),
+            protocol_version: 1,
+            issued_at_epoch_millis: now,
+            attempts_limit: 5,
+        };
+        repository
+            .transact(&mut |database| {
+                database
+                    .accounts
+                    .insert(command.account_id.clone(), active_account(now));
+                database
+                    .devices
+                    .insert(device.device_id.clone(), device.clone());
+                database.mfa_factors.insert(
+                    "factor-1".into(),
+                    MfaFactor {
+                        factor_id: "factor-1".into(),
+                        account_id: command.account_id.clone(),
+                        secret_base32: generate_totp_secret(),
+                        active: true,
+                        last_used_counter: None,
+                        created_at_epoch_millis: now.saturating_sub(1),
+                    },
+                );
+                database
+                    .risk_challenges
+                    .insert(challenge.risk_challenge_id.clone(), challenge.clone());
+                database
+                    .login_challenge_contexts
+                    .insert(challenge.risk_challenge_id.clone(), context.clone());
+                database
+                    .trusted_controller_devices
+                    .insert(trusted.trusted_device_id.clone(), trusted.clone());
+                Ok(())
+            })
+            .await
+            .expect("seed fixed trust login");
+
+        assert_eq!(
+            repository.finish_login(&command).await,
+            Ok(LoginFinishOutcome::Completed)
+        );
+        repository
+            .read(&mut |database| {
+                let trusted = &database.trusted_controller_devices["fixed-trust"];
+                assert_eq!(trusted.last_used_at_epoch_millis, Some(now));
+                assert_eq!(trusted.expires_at_epoch_millis, fixed_expiry);
+                assert_eq!(trusted.status, TrustedDeviceStatus::Active);
+                assert!(
+                    database.account_sessions[&command.account_session.account_session_id]
+                        .mfa_verified
                 );
             })
             .await;
@@ -4125,13 +5371,32 @@ mod tests {
             })
             .await
             .expect("seed registration authority");
+        let registration_binding_for = |device: &Device| {
+            device_registration_binding_hash(
+                "account-1",
+                &session.account_session_id,
+                &grant.grant_id,
+                &device.device_id,
+                &device.display_name,
+                registration_platform_name(&device.platform),
+                &device.os_version,
+                registration_architecture_name(&device.arch),
+                device.capabilities.controller,
+                device.capabilities.controlled,
+                device.capabilities.file_transfer,
+                device.capabilities.unattended,
+                &sha256(&device.public_key),
+                1,
+            )
+        };
+        let registration_request_binding_hash = registration_binding_for(&device);
         let command = DeviceRegistrationCommand {
             grant_id: grant.grant_id.clone(),
             grant_secret_hash: grant.grant_secret_hash,
             account_id: "account-1".into(),
             account_session_id: session.account_session_id.clone(),
             protocol_version: 1,
-            registration_request_binding_hash: [8; 32],
+            registration_request_binding_hash,
             device: device.clone(),
             trusted_device_id: Some("ignored-trust-candidate".into()),
             registration_audit_entry: registration_audit_entry.clone(),
@@ -4159,6 +5424,91 @@ mod tests {
             now_epoch_millis: now,
         };
 
+        let mut desktop_without_controlled = command.clone();
+        desktop_without_controlled.device.capabilities.controlled = false;
+        desktop_without_controlled.registration_request_binding_hash =
+            registration_binding_for(&desktop_without_controlled.device);
+        assert_eq!(
+            validate_device_registration_authority(
+                &Database::default(),
+                &desktop_without_controlled,
+                &grant,
+            ),
+            Ok(())
+        );
+        let mut ubuntu_aarch64 = desktop_without_controlled.clone();
+        ubuntu_aarch64.device.platform = Platform::Ubuntu;
+        ubuntu_aarch64.device.arch = Architecture::Aarch64;
+        ubuntu_aarch64.registration_request_binding_hash =
+            registration_binding_for(&ubuntu_aarch64.device);
+        assert_eq!(
+            validate_device_registration_authority(&Database::default(), &ubuntu_aarch64, &grant),
+            Err(StoreError::Conflict)
+        );
+
+        let mut cross_account_device = command.clone();
+        cross_account_device.device.account_id = "account-2".into();
+        assert_eq!(
+            repository.register_device(&cross_account_device).await,
+            Err(StoreError::Conflict)
+        );
+
+        repository
+            .transact(&mut |database| {
+                let grant = database
+                    .device_enrollment_grants
+                    .get_mut("grant-1")
+                    .ok_or(StoreError::Unavailable)?;
+                grant.establish_trust = true;
+                grant.trust_proof_type = Some("device_signature_and_mfa".into());
+                grant.trust_level = Some("standard".into());
+                Ok(())
+            })
+            .await
+            .expect("enable trust on non-MFA grant");
+        assert_eq!(
+            repository.register_device(&command).await,
+            Ok(DeviceRegistrationOutcome::InvalidGrant)
+        );
+        repository
+            .transact(&mut |database| {
+                let grant = database
+                    .device_enrollment_grants
+                    .get_mut("grant-1")
+                    .ok_or(StoreError::Unavailable)?;
+                grant.establish_trust = false;
+                grant.trust_proof_type = None;
+                grant.trust_level = None;
+                database.audit_logs.push(registration_audit_entry.clone());
+                Ok(())
+            })
+            .await
+            .expect("seed registration audit conflict");
+        assert_eq!(
+            repository.register_device(&command).await,
+            Err(StoreError::Conflict)
+        );
+        repository
+            .transact(&mut |database| {
+                database
+                    .audit_logs
+                    .retain(|audit| audit.audit_id != registration_audit_entry.audit_id);
+                Ok(())
+            })
+            .await
+            .expect("remove registration audit conflict");
+        repository
+            .read(&mut |database| {
+                assert!(database.devices.is_empty());
+                assert!(database.device_public_keys.is_empty());
+                assert!(database.trusted_controller_devices.is_empty());
+                assert!(database.audit_logs.is_empty());
+                assert!(database.device_enrollment_grants["grant-1"]
+                    .consumed_at_epoch_millis
+                    .is_none());
+            })
+            .await;
+
         assert_eq!(
             repository.register_device(&command).await,
             Ok(DeviceRegistrationOutcome::Created(device.clone()))
@@ -4170,6 +5520,26 @@ mod tests {
         let replay_command = DeviceRegistrationCommand {
             device: replay_device,
             trusted_device_id: Some("retry-generated-trust-id".into()),
+            registration_audit_entry: AuditEntry {
+                audit_id: "audit-retry".into(),
+                request_id: "request-retry".into(),
+                created_at_epoch_millis: now + 1,
+                ..command.registration_audit_entry.clone()
+            },
+            grant_audit_entry: AuditEntry {
+                audit_id: "audit-grant-retry".into(),
+                request_id: "request-retry".into(),
+                created_at_epoch_millis: now + 1,
+                ..command.grant_audit_entry.clone()
+            },
+            trusted_device_audit_entry: command.trusted_device_audit_entry.as_ref().map(|audit| {
+                AuditEntry {
+                    audit_id: "audit-trust-retry".into(),
+                    request_id: "request-retry".into(),
+                    created_at_epoch_millis: now + 1,
+                    ..audit.clone()
+                }
+            }),
             signature_proof: InitialDeviceSignatureProof {
                 target: "/v1/devices".into(),
                 content_type: Some("application/json".into()),
@@ -4196,6 +5566,113 @@ mod tests {
             repository.register_device(&replay_command).await,
             Ok(DeviceRegistrationOutcome::Replayed(device.clone()))
         );
+        repository
+            .transact(&mut |database| {
+                let old_key = database
+                    .device_public_keys
+                    .get_mut("key-1")
+                    .ok_or(StoreError::Unavailable)?;
+                old_key.revoked_at_epoch_millis = Some(now + 2);
+                let current = database
+                    .devices
+                    .get_mut("device-1")
+                    .ok_or(StoreError::Unavailable)?;
+                current.display_name = "Renamed after registration".into();
+                current.capabilities.controlled = false;
+                current.public_key_id = "key-rotated".into();
+                current.public_key = [2; 32];
+                current.public_key_version = 2;
+                current.public_key_revoked_at_epoch_millis = Some(now + 3);
+                current.status = DeviceLifecycleStatus::Unbound;
+                current.updated_at_epoch_millis = now + 3;
+                database.device_public_keys.insert(
+                    "key-rotated".into(),
+                    DevicePublicKeyRecord {
+                        public_key_id: "key-rotated".into(),
+                        device_id: "device-1".into(),
+                        public_key: [2; 32],
+                        version: 2,
+                        created_at_epoch_millis: now + 2,
+                        revoked_at_epoch_millis: Some(now + 3),
+                    },
+                );
+                Ok(())
+            })
+            .await
+            .expect("mutate registered device authority");
+        let immutable_replay = DeviceRegistrationCommand {
+            registration_audit_entry: AuditEntry {
+                audit_id: "audit-immutable-retry".into(),
+                request_id: "request-immutable-retry".into(),
+                created_at_epoch_millis: now + 4,
+                ..replay_command.registration_audit_entry.clone()
+            },
+            grant_audit_entry: AuditEntry {
+                audit_id: "audit-grant-immutable-retry".into(),
+                request_id: "request-immutable-retry".into(),
+                created_at_epoch_millis: now + 4,
+                ..replay_command.grant_audit_entry.clone()
+            },
+            trusted_device_audit_entry: replay_command.trusted_device_audit_entry.as_ref().map(
+                |audit| AuditEntry {
+                    audit_id: "audit-trust-immutable-retry".into(),
+                    request_id: "request-immutable-retry".into(),
+                    created_at_epoch_millis: now + 4,
+                    ..audit.clone()
+                },
+            ),
+            signature_proof: InitialDeviceSignatureProof {
+                target: "/v1/devices".into(),
+                content_type: Some("application/json".into()),
+                request_id: "request-immutable-retry".into(),
+                timestamp_epoch_millis: now + 4,
+                nonce: "nonce-immutable-retry".into(),
+                signature: sign_device_request_for_test(
+                    &signing_key,
+                    "POST",
+                    "/v1/devices",
+                    b"{}",
+                    "request-immutable-retry",
+                    "device-1",
+                    "account-1",
+                    now + 4,
+                    "nonce-immutable-retry",
+                ),
+                canonical_body: b"{}".to_vec(),
+            },
+            now_epoch_millis: now + 4,
+            ..replay_command.clone()
+        };
+        assert_eq!(
+            repository.register_device(&immutable_replay).await,
+            Ok(DeviceRegistrationOutcome::Replayed(device.clone()))
+        );
+        repository
+            .read(&mut |database| {
+                let current = &database.devices["device-1"];
+                assert_eq!(current.display_name, "Renamed after registration");
+                assert_eq!(current.status, DeviceLifecycleStatus::Unbound);
+                assert_eq!(current.public_key_id, "key-rotated");
+                assert_eq!(database.audit_logs.len(), 2);
+                let result = database.audit_logs[0]
+                    .metadata
+                    .get(DEVICE_REGISTRATION_RESULT_METADATA_KEY)
+                    .and_then(serde_json::Value::as_object)
+                    .expect("registration result snapshot");
+                assert!(!result.contains_key("public_key"));
+                assert!(!result.contains_key("grant_secret"));
+                assert!(!result.contains_key("signature"));
+                assert!(!result.contains_key("nonce"));
+            })
+            .await;
+        let mut changed_business_fields = immutable_replay.clone();
+        changed_business_fields.device.display_name = "Different registration".into();
+        changed_business_fields.registration_request_binding_hash =
+            registration_binding_for(&changed_business_fields.device);
+        assert_eq!(
+            repository.register_device(&changed_business_fields).await,
+            Err(StoreError::Conflict)
+        );
         assert_eq!(
             repository
                 .register_device(&DeviceRegistrationCommand {
@@ -4206,12 +5683,30 @@ mod tests {
             Err(StoreError::Conflict)
         );
         repository
+            .transact(&mut |database| {
+                database
+                    .devices
+                    .insert(device.device_id.clone(), device.clone());
+                database.device_public_keys.remove("key-rotated");
+                database
+                    .device_public_keys
+                    .get_mut("key-1")
+                    .ok_or(StoreError::Unavailable)?
+                    .revoked_at_epoch_millis = None;
+                Ok(())
+            })
+            .await
+            .expect("restore duplicate identity test authority");
+        repository
             .read(&mut |database| {
                 assert!(database.trusted_controller_devices.is_empty());
                 let consumed = &database.device_enrollment_grants["grant-1"];
                 assert_eq!(consumed.registered_public_key_id.as_deref(), Some("key-1"));
                 assert!(consumed.registered_trusted_device_id.is_none());
-                assert_eq!(consumed.registration_request_binding_hash, Some([8; 32]));
+                assert_eq!(
+                    consumed.registration_request_binding_hash,
+                    Some(registration_request_binding_hash)
+                );
             })
             .await;
 
@@ -4452,6 +5947,116 @@ mod tests {
                 .await,
             Err(StoreError::Conflict)
         );
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_rotation_writes_object_audit_and_preserves_mfa_snapshot() {
+        let repository = MemoryRepository::default();
+        let now = 1_700_000_000_000;
+        let old_hash = sha256(b"old-refresh");
+        let mut old_session = active_account_session("old-session", now);
+        old_session.refresh_token_hash = old_hash;
+        old_session.mfa_verified = true;
+        repository
+            .transact(&mut |database| {
+                database
+                    .accounts
+                    .insert("account-1".into(), active_account(now));
+                database
+                    .account_sessions
+                    .insert(old_session.account_session_id.clone(), old_session.clone());
+                Ok(())
+            })
+            .await
+            .expect("seed refresh authority");
+        let mut replacement = active_account_session("replacement-session", now);
+        replacement.refresh_token_hash = sha256(b"replacement-refresh");
+        replacement.mfa_verified = true;
+        let refresh_audit =
+            account_security_audit("refresh-audit", "token_refreshed", "success", now);
+
+        assert!(repository
+            .rotate_refresh_session(&old_hash, &replacement, &refresh_audit, now)
+            .await
+            .expect("rotate refresh session"));
+        repository
+            .read(&mut |database| {
+                let old = &database.account_sessions["old-session"];
+                assert_eq!(old.revoked_at_epoch_millis, Some(now));
+                assert_eq!(old.revoked_reason.as_deref(), Some("refresh_replay"));
+                assert!(database.account_sessions["replacement-session"].mfa_verified);
+                let object_audits = database
+                    .audit_logs
+                    .iter()
+                    .filter(|entry| entry.action == "account_session_revoked")
+                    .collect::<Vec<_>>();
+                assert_eq!(object_audits.len(), 1);
+                assert_eq!(object_audits[0].reason.as_deref(), Some("refresh_replay"));
+                assert_eq!(
+                    object_audits[0].metadata["account_session_id"],
+                    serde_json::Value::String("old-session".into())
+                );
+                assert_eq!(
+                    database
+                        .audit_logs
+                        .iter()
+                        .filter(|entry| entry.action == "token_refreshed")
+                        .count(),
+                    1
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_rotation_rolls_back_when_object_audit_conflicts() {
+        let repository = MemoryRepository::default();
+        let now = 1_700_000_000_000;
+        let old_hash = sha256(b"old-refresh");
+        let mut old_session = active_account_session("old-session", now);
+        old_session.refresh_token_hash = old_hash;
+        let replacement = active_account_session("replacement-session", now);
+        let refresh_audit =
+            account_security_audit("refresh-audit", "token_refreshed", "success", now);
+        let conflicting_audit = account_session_revocation_audit(
+            &refresh_audit,
+            &old_session.account_session_id,
+            "refresh_replay",
+        );
+        repository
+            .transact(&mut |database| {
+                database
+                    .accounts
+                    .insert("account-1".into(), active_account(now));
+                database
+                    .account_sessions
+                    .insert(old_session.account_session_id.clone(), old_session.clone());
+                database.audit_logs.push(conflicting_audit.clone());
+                Ok(())
+            })
+            .await
+            .expect("seed conflicting refresh audit");
+
+        assert_eq!(
+            repository
+                .rotate_refresh_session(&old_hash, &replacement, &refresh_audit, now)
+                .await,
+            Err(StoreError::Conflict)
+        );
+        repository
+            .read(&mut |database| {
+                let old = &database.account_sessions["old-session"];
+                assert!(old.revoked_at_epoch_millis.is_none());
+                assert!(old.revoked_reason.is_none());
+                assert!(!database
+                    .account_sessions
+                    .contains_key("replacement-session"));
+                assert!(!database
+                    .audit_logs
+                    .iter()
+                    .any(|entry| entry.action == "token_refreshed"));
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -4702,6 +6307,46 @@ mod tests {
             repository.finish_totp_enrollment(&completion).await,
             Err(StoreError::Conflict)
         );
+        let replay_lookup = TotpEnrollmentReplayLookup {
+            account_id: completion.delivery.account_id.clone(),
+            account_session_id: completion.delivery.account_session_id.clone(),
+            factor_id: completion.delivery.factor_id.clone(),
+            idempotency_key_hash: completion.delivery.idempotency_key_hash,
+            finish_request_binding_hash: Some(completion.delivery.finish_request_binding_hash),
+            client_ephemeral_public_key: Some(completion.delivery.client_ephemeral_public_key),
+            access_token_expires_at_epoch_millis: now + 300_000,
+            now_epoch_millis: now + 1,
+        };
+        assert_eq!(
+            repository
+                .replay_totp_enrollment(&replay_lookup)
+                .await
+                .expect("replay exact enrollment delivery"),
+            TotpEnrollmentReplayOutcome::Replayed(Box::new(completion.delivery.clone()))
+        );
+
+        let mut mismatched_lookups = Vec::new();
+        let mut different_session = replay_lookup.clone();
+        different_session.account_session_id = "different-session".into();
+        mismatched_lookups.push(different_session);
+        let mut different_factor = replay_lookup.clone();
+        different_factor.factor_id = "different-factor".into();
+        mismatched_lookups.push(different_factor);
+        let mut different_binding = replay_lookup.clone();
+        different_binding.finish_request_binding_hash = Some([7; 32]);
+        mismatched_lookups.push(different_binding);
+        let mut different_client_key = replay_lookup;
+        different_client_key.client_ephemeral_public_key = Some([8; 32]);
+        mismatched_lookups.push(different_client_key);
+        for lookup in mismatched_lookups {
+            assert_eq!(
+                repository
+                    .replay_totp_enrollment(&lookup)
+                    .await
+                    .expect("reject changed enrollment replay binding"),
+                TotpEnrollmentReplayOutcome::BindingMismatch
+            );
+        }
         repository
             .read(&mut |database| {
                 assert_eq!(database.mfa_factors.len(), 1);
@@ -5224,6 +6869,10 @@ mod tests {
                 database
                     .devices
                     .insert(device.device_id.clone(), device.clone());
+                database.account_sessions.insert(
+                    "account-session-1".into(),
+                    active_account_session("account-session-1", now),
+                );
                 database.device_public_keys.insert(
                     "key-1".into(),
                     DevicePublicKeyRecord {
@@ -5356,11 +7005,41 @@ mod tests {
                 assert_eq!(database.session_events.len(), 1);
                 assert_eq!(database.session_events[0].event_type, "closed");
                 assert_eq!(database.session_events[0].actor_type, "system");
-                assert_eq!(database.audit_logs.len(), 2);
+                assert_eq!(database.audit_logs.len(), 3);
                 assert!(database
                     .audit_logs
                     .iter()
                     .any(|audit| audit.action == "session_ended"));
+                let trust_audit = database
+                    .audit_logs
+                    .iter()
+                    .find(|audit| audit.action == "trusted_device_revoked")
+                    .expect("rotation trust revocation audit");
+                assert_eq!(trust_audit.reason.as_deref(), Some("device_key_rotated"));
+                let rotation_audit = database
+                    .audit_logs
+                    .iter()
+                    .find(|audit| audit.action == "device_public_key_rotated")
+                    .expect("device key rotation audit");
+                for field in [
+                    "old_public_key_id",
+                    "old_public_key_version",
+                    "old_public_key_fingerprint",
+                    "new_public_key_id",
+                    "new_public_key_version",
+                    "new_public_key_fingerprint",
+                    "revoked_at_epoch_millis",
+                    "rotation_reason",
+                    "step_up_challenge_id",
+                ] {
+                    assert!(
+                        rotation_audit.metadata.contains_key(field),
+                        "missing {field}"
+                    );
+                }
+                assert!(database.account_sessions["account-session-1"]
+                    .revoked_at_epoch_millis
+                    .is_none());
             })
             .await;
     }
@@ -5503,6 +7182,11 @@ mod tests {
                 assert!(database.account_sessions["account-session-1"]
                     .revoked_at_epoch_millis
                     .is_none());
+                assert!(database.audit_logs.iter().any(|audit| {
+                    audit.action == "trusted_device_revoked"
+                        && audit.reason.as_deref() == Some("device_disabled")
+                        && audit.metadata["trusted_device_id"] == "trusted-target"
+                }));
             })
             .await;
 
@@ -5566,7 +7250,16 @@ mod tests {
             .read(&mut |database| {
                 assert!(database.audit_logs.iter().any(|audit| {
                     audit.action == "device_public_key_revoked"
-                        && audit.metadata.contains_key("affected_session_ids_hash")
+                        && [
+                            "old_public_key_id",
+                            "old_public_key_version",
+                            "old_public_key_fingerprint",
+                            "revoked_at_epoch_millis",
+                            "revocation_reason",
+                            "affected_session_ids_hash",
+                        ]
+                        .iter()
+                        .all(|field| audit.metadata.contains_key(*field))
                 }));
                 assert_eq!(
                     database.account_sessions["account-session-1"].revoked_at_epoch_millis,
@@ -5578,6 +7271,224 @@ mod tests {
                         .as_deref(),
                     Some("device_unbound")
                 );
+                assert!(database.audit_logs.iter().any(|audit| {
+                    audit.action == "account_session_revoked"
+                        && audit.reason.as_deref() == Some("device_unbound")
+                        && audit.metadata["account_session_id"] == "account-session-1"
+                }));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn memory_device_unbind_audits_every_revocation_and_rolls_back_conflicts() {
+        fn seed_unbind_state(database: &mut Database, now: u64) {
+            let actor = authorizable_device("actor-1", "account-1", now);
+            let target = authorizable_device("target-1", "account-1", now);
+            database.devices.insert(actor.device_id.clone(), actor);
+            database
+                .devices
+                .insert(target.device_id.clone(), target.clone());
+            database.device_public_keys.insert(
+                target.public_key_id.clone(),
+                DevicePublicKeyRecord {
+                    public_key_id: target.public_key_id.clone(),
+                    device_id: target.device_id.clone(),
+                    public_key: target.public_key,
+                    version: target.public_key_version,
+                    created_at_epoch_millis: now.saturating_sub(1),
+                    revoked_at_epoch_millis: None,
+                },
+            );
+            for id in ["account-session-1", "account-session-2"] {
+                database
+                    .account_sessions
+                    .insert(id.into(), active_account_session(id, now));
+            }
+            for id in ["trust-1", "trust-2"] {
+                database.trusted_controller_devices.insert(
+                    id.into(),
+                    TrustedControllerDevice {
+                        trusted_device_id: id.into(),
+                        account_id: "account-1".into(),
+                        controller_device_id: "target-1".into(),
+                        device_fingerprint_hash: sha256(&target.public_key),
+                        trust_level: "standard".into(),
+                        status: TrustedDeviceStatus::Active,
+                        trust_proof_type: "device_signature_and_mfa".into(),
+                        created_at_epoch_millis: now.saturating_sub(1),
+                        last_used_at_epoch_millis: None,
+                        expires_at_epoch_millis: now + 60_000,
+                        revoked_at_epoch_millis: None,
+                    },
+                );
+            }
+            database.sessions.insert(
+                "remote-session-1".into(),
+                Session {
+                    session_id: "remote-session-1".into(),
+                    controller_account_id: "account-1".into(),
+                    controller_device_id: "actor-1".into(),
+                    controlled_device_id: "target-1".into(),
+                    auth_method: AuthMethod::AccountPrompt,
+                    status: SessionStatus::Connected,
+                    permissions: SessionPermissions::default(),
+                    permissions_digest: "digest".into(),
+                    policy_evaluation_id: "policy-1".into(),
+                    relay_token_epoch: 2,
+                    session_expires_at_epoch_millis: now + 60_000,
+                    created_at_epoch_millis: now.saturating_sub(1),
+                    updated_at_epoch_millis: now.saturating_sub(1),
+                    ended_at_epoch_millis: None,
+                },
+            );
+        }
+
+        let now = 1_700_000_000_000;
+        let command = DeviceManagementCommand {
+            account_id: "account-1".into(),
+            actor_device_id: "actor-1".into(),
+            actor_public_key_id: "key-actor-1".into(),
+            actor_public_key_version: 1,
+            target_device_id: "target-1".into(),
+            expected_target_public_key_id: "key-target-1".into(),
+            expected_target_public_key_version: 1,
+            display_name: None,
+            action: Some(DeviceManagementAction::Unbind),
+            audit_entry: AuditEntry {
+                audit_id: "audit-unbind".into(),
+                actor_type: "device".into(),
+                actor_account_id: Some("account-1".into()),
+                actor_device_id: Some("actor-1".into()),
+                actor_role: Some("none".into()),
+                actor_service: None,
+                target_device_id: Some("target-1".into()),
+                session_id: None,
+                action: "device_unregistered".into(),
+                result: "success".into(),
+                reason: None,
+                metadata: BTreeMap::new(),
+                request_id: "request-unbind".into(),
+                created_at_epoch_millis: now,
+            },
+            now_epoch_millis: now,
+        };
+
+        let repository = MemoryRepository::default();
+        repository
+            .transact(&mut |database| {
+                seed_unbind_state(database, now);
+                Ok(())
+            })
+            .await
+            .expect("seed unbind state");
+        let DeviceManagementOutcome::Updated(change) = repository
+            .manage_device(&command)
+            .await
+            .expect("unbind target")
+        else {
+            panic!("expected unbound device");
+        };
+        assert_eq!(change.device.status, DeviceLifecycleStatus::Unbound);
+        repository
+            .read(&mut |database| {
+                assert_eq!(
+                    database.devices["target-1"].public_key_revoked_at_epoch_millis,
+                    Some(now)
+                );
+                assert!(database.account_sessions.values().all(|session| {
+                    session.revoked_at_epoch_millis == Some(now)
+                        && session.revoked_reason.as_deref() == Some("device_unbound")
+                }));
+                assert!(database
+                    .trusted_controller_devices
+                    .values()
+                    .all(|trusted| trusted.status == TrustedDeviceStatus::Revoked));
+                assert_eq!(
+                    database.sessions["remote-session-1"].status,
+                    SessionStatus::Closed
+                );
+                assert_eq!(
+                    database
+                        .audit_logs
+                        .iter()
+                        .filter(|audit| audit.action == "account_session_revoked")
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    database
+                        .audit_logs
+                        .iter()
+                        .filter(|audit| audit.action == "trusted_device_revoked")
+                        .count(),
+                    2
+                );
+                let key_audit = database
+                    .audit_logs
+                    .iter()
+                    .find(|audit| {
+                        audit.action == "device_public_key_revoked"
+                            && audit.reason.as_deref() == Some("device_unbound")
+                    })
+                    .expect("unbind key revocation audit");
+                assert_eq!(
+                    key_audit.metadata["revocation_reason"],
+                    serde_json::Value::String("device_unbound".into())
+                );
+                for field in [
+                    "old_public_key_id",
+                    "old_public_key_version",
+                    "old_public_key_fingerprint",
+                    "revoked_at_epoch_millis",
+                    "affected_session_ids_hash",
+                ] {
+                    assert!(key_audit.metadata.contains_key(field), "missing {field}");
+                }
+            })
+            .await;
+
+        let repository = MemoryRepository::default();
+        let conflicting_audit = account_session_revocation_audit(
+            &command.audit_entry,
+            "account-session-1",
+            "device_unbound",
+        );
+        repository
+            .transact(&mut |database| {
+                seed_unbind_state(database, now);
+                database.audit_logs.push(conflicting_audit.clone());
+                Ok(())
+            })
+            .await
+            .expect("seed unbind audit conflict");
+        assert_eq!(
+            repository.manage_device(&command).await,
+            Err(StoreError::Conflict)
+        );
+        repository
+            .read(&mut |database| {
+                assert_eq!(
+                    database.devices["target-1"].status,
+                    DeviceLifecycleStatus::Offline
+                );
+                assert!(database.devices["target-1"]
+                    .public_key_revoked_at_epoch_millis
+                    .is_none());
+                assert!(database
+                    .account_sessions
+                    .values()
+                    .all(|session| session.revoked_at_epoch_millis.is_none()));
+                assert!(database
+                    .trusted_controller_devices
+                    .values()
+                    .all(|trusted| trusted.status == TrustedDeviceStatus::Active));
+                assert_eq!(
+                    database.sessions["remote-session-1"].status,
+                    SessionStatus::Connected
+                );
+                assert!(database.session_events.is_empty());
+                assert_eq!(database.audit_logs, vec![conflicting_audit.clone()]);
             })
             .await;
     }

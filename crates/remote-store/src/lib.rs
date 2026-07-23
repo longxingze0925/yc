@@ -334,7 +334,7 @@ mod tests {
             "CONSTRAINT ck_device_enrollment_grants_registration_result CHECK",
             "CONSTRAINT fk_device_enrollment_grants_registered_trusted_device FOREIGN KEY (registered_trusted_device_id, device_id, account_id) REFERENCES trusted_controller_devices(trusted_device_id, controller_device_id, account_id) ON DELETE RESTRICT",
             "CONSTRAINT ck_trusted_controller_devices_trust_policy CHECK",
-            "CONSTRAINT uq_mfa_recovery_code_deliveries_idempotency UNIQUE (account_id, account_session_id, factor_id, idempotency_key_hash)",
+            "CONSTRAINT uq_mfa_recovery_code_deliveries_idempotency UNIQUE (account_id, idempotency_key_hash)",
             "CONSTRAINT fk_mfa_recovery_code_deliveries_session_account FOREIGN KEY (account_session_id, account_id) REFERENCES account_sessions(account_session_id, account_id) ON DELETE RESTRICT",
             "CONSTRAINT fk_mfa_recovery_code_deliveries_factor_account FOREIGN KEY (factor_id, account_id) REFERENCES account_mfa_factors(factor_id, account_id) ON DELETE RESTRICT",
             "nonce BYTEA NOT NULL CHECK (octet_length(nonce) = 12)",

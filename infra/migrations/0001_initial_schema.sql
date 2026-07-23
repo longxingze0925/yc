@@ -395,7 +395,7 @@ CREATE TABLE mfa_recovery_code_deliveries (
     expires_at_epoch_millis BIGINT NOT NULL,
     acknowledged_at_epoch_millis BIGINT,
     CONSTRAINT uq_mfa_recovery_code_deliveries_idempotency
-        UNIQUE (account_id, account_session_id, factor_id, idempotency_key_hash),
+        UNIQUE (account_id, idempotency_key_hash),
     CONSTRAINT fk_mfa_recovery_code_deliveries_session_account
         FOREIGN KEY (account_session_id, account_id)
         REFERENCES account_sessions(account_session_id, account_id) ON DELETE RESTRICT,

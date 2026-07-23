@@ -4,6 +4,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rand::RngCore;
@@ -512,6 +515,179 @@ pub trait EphemeralState: Send + Sync {
         binding: &'a StepUpConsumption<'a>,
         now_epoch_millis: u64,
     ) -> EphemeralFuture<'a, bool>;
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EphemeralFailureCalls {
+    pub put_challenge: usize,
+    pub begin_challenge_attempt: usize,
+    pub finish_challenge_attempt: usize,
+    pub consume_step_up: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct FailingEphemeralState {
+    put_challenge_calls: AtomicUsize,
+    begin_challenge_attempt_calls: AtomicUsize,
+    finish_challenge_attempt_calls: AtomicUsize,
+    consume_step_up_calls: AtomicUsize,
+}
+
+#[cfg(test)]
+impl FailingEphemeralState {
+    pub(crate) fn calls(&self) -> EphemeralFailureCalls {
+        EphemeralFailureCalls {
+            put_challenge: self.put_challenge_calls.load(Ordering::SeqCst),
+            begin_challenge_attempt: self.begin_challenge_attempt_calls.load(Ordering::SeqCst),
+            finish_challenge_attempt: self.finish_challenge_attempt_calls.load(Ordering::SeqCst),
+            consume_step_up: self.consume_step_up_calls.load(Ordering::SeqCst),
+        }
+    }
+
+    fn fail<'a, T: Send + 'a>(operation: &'static str) -> EphemeralFuture<'a, T> {
+        Box::pin(async move {
+            Err(EphemeralError::invalid_data(format!(
+                "injected ephemeral {operation} failure"
+            )))
+        })
+    }
+}
+
+#[cfg(test)]
+impl EphemeralState for FailingEphemeralState {
+    fn backend_name(&self) -> &'static str {
+        "failure-injected"
+    }
+
+    fn health(&self) -> EphemeralFuture<'_, ()> {
+        Self::fail("health")
+    }
+
+    fn put_pending_totp_enrollment<'a>(
+        &'a self,
+        _enrollment: &'a PendingTotpEnrollment,
+        _now_epoch_millis: u64,
+    ) -> EphemeralFuture<'a, bool> {
+        Self::fail("put_pending_totp_enrollment")
+    }
+
+    fn begin_pending_totp_enrollment_attempt<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _factor_id: &'a str,
+        _now_epoch_millis: u64,
+    ) -> EphemeralFuture<'a, Option<PendingTotpEnrollmentAttempt>> {
+        Self::fail("begin_pending_totp_enrollment_attempt")
+    }
+
+    fn finish_pending_totp_enrollment_attempt<'a>(
+        &'a self,
+        _attempt: &'a PendingTotpEnrollmentAttempt,
+        _accepted: bool,
+        _now_epoch_millis: u64,
+    ) -> EphemeralFuture<'a, Option<PendingTotpEnrollment>> {
+        Self::fail("finish_pending_totp_enrollment_attempt")
+    }
+
+    fn abort_pending_totp_enrollment_attempt<'a>(
+        &'a self,
+        _attempt: &'a PendingTotpEnrollmentAttempt,
+    ) -> EphemeralFuture<'a, bool> {
+        Self::fail("abort_pending_totp_enrollment_attempt")
+    }
+
+    fn remove_pending_totp_enrollment<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _factor_id: &'a str,
+    ) -> EphemeralFuture<'a, bool> {
+        Self::fail("remove_pending_totp_enrollment")
+    }
+
+    fn list_device_presence<'a>(
+        &'a self,
+        _account_id: &'a str,
+    ) -> EphemeralFuture<'a, Vec<DevicePresence>> {
+        Self::fail("list_device_presence")
+    }
+
+    fn record_nonce<'a>(
+        &'a self,
+        _nonce_binding: &'a str,
+        _now_epoch_millis: u64,
+        _ttl_millis: u64,
+    ) -> EphemeralFuture<'a, bool> {
+        Self::fail("record_nonce")
+    }
+
+    fn login_failure_state<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _now_epoch_millis: u64,
+    ) -> EphemeralFuture<'a, LoginFailureState> {
+        Self::fail("login_failure_state")
+    }
+
+    fn record_login_failure<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _now_epoch_millis: u64,
+        _max_attempts: u8,
+        _lock_millis: u64,
+        _state_ttl_millis: u64,
+    ) -> EphemeralFuture<'a, LoginFailureState> {
+        Self::fail("record_login_failure")
+    }
+
+    fn clear_login_failures<'a>(&'a self, _account_id: &'a str) -> EphemeralFuture<'a, ()> {
+        Self::fail("clear_login_failures")
+    }
+
+    fn put_challenge<'a>(&'a self, _challenge: &'a AuthChallenge) -> EphemeralFuture<'a, bool> {
+        self.put_challenge_calls.fetch_add(1, Ordering::SeqCst);
+        Self::fail("put_challenge")
+    }
+
+    fn begin_challenge_attempt<'a>(
+        &'a self,
+        _challenge_id: &'a str,
+        _expected_kind: ExpectedChallengeKind,
+        _now_epoch_millis: u64,
+    ) -> EphemeralFuture<'a, ChallengeAttemptStart> {
+        self.begin_challenge_attempt_calls
+            .fetch_add(1, Ordering::SeqCst);
+        Self::fail("begin_challenge_attempt")
+    }
+
+    fn finish_challenge_attempt<'a>(
+        &'a self,
+        _attempt: &'a ChallengeAttempt,
+        _accepted: bool,
+        _consume_on_success: bool,
+        _now_epoch_millis: u64,
+    ) -> EphemeralFuture<'a, Option<AuthChallenge>> {
+        self.finish_challenge_attempt_calls
+            .fetch_add(1, Ordering::SeqCst);
+        Self::fail("finish_challenge_attempt")
+    }
+
+    fn abort_challenge_attempt<'a>(
+        &'a self,
+        _attempt: &'a ChallengeAttempt,
+    ) -> EphemeralFuture<'a, ()> {
+        Self::fail("abort_challenge_attempt")
+    }
+
+    fn consume_step_up<'a>(
+        &'a self,
+        _binding: &'a StepUpConsumption<'a>,
+        _now_epoch_millis: u64,
+    ) -> EphemeralFuture<'a, bool> {
+        self.consume_step_up_calls.fetch_add(1, Ordering::SeqCst);
+        Self::fail("consume_step_up")
+    }
 }
 
 #[derive(Debug, Default)]

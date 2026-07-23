@@ -5,7 +5,7 @@ import UIKit
 
 public struct DeviceIdentity: Equatable, Sendable {
     public let deviceID: String
-    public let publicKeyID: String
+    public let publicKeyID: String?
     public let publicKeyVersion: UInt32
     public let publicKey: Data
 }
@@ -38,18 +38,34 @@ public final class DeviceIdentityStore: @unchecked Sendable {
         if values.allSatisfy({ $0 == nil }) {
             return try createIdentity()
         }
-        guard values.allSatisfy({ $0 != nil }),
-              let deviceIDData,
-              let publicKeyIDData,
-              let versionData,
+        guard let deviceIDData,
               let privateKeyData,
-              let deviceID = String(data: deviceIDData, encoding: .utf8),
-              let publicKeyID = String(data: publicKeyIDData, encoding: .utf8),
-              versionData.count == MemoryLayout<UInt32>.size else {
+              let deviceID = String(data: deviceIDData, encoding: .utf8) else {
             throw KeychainError.corruptValue("device identity")
         }
-
-        let version = versionData.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).bigEndian }
+        let publicKeyID: String?
+        let version: UInt32
+        switch (publicKeyIDData, versionData) {
+        case (nil, nil):
+            publicKeyID = nil
+            version = 0
+        case let (.some(publicKeyIDData), .some(versionData)):
+            guard let value = String(data: publicKeyIDData, encoding: .utf8),
+                  !value.isEmpty,
+                  versionData.count == MemoryLayout<UInt32>.size else {
+                throw KeychainError.corruptValue("device registration")
+            }
+            let decodedVersion = versionData.withUnsafeBytes {
+                $0.loadUnaligned(as: UInt32.self).bigEndian
+            }
+            guard decodedVersion > 0 else {
+                throw KeychainError.corruptValue("device registration")
+            }
+            publicKeyID = value
+            version = decodedVersion
+        default:
+            throw KeychainError.corruptValue("device registration")
+        }
         let privateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: privateKeyData)
         return DeviceIdentity(
             deviceID: deviceID,
@@ -70,7 +86,28 @@ public final class DeviceIdentityStore: @unchecked Sendable {
         return try privateKey.signature(for: digest)
     }
 
-    public func registration(displayName: String? = nil) throws -> DeviceRegistrationRequest {
+    public func loginRequest(email: String, password: String) throws -> LoginRequest {
+        let identity = try loadOrCreate()
+        var nonce = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, nonce.count, &nonce) == errSecSuccess else {
+            throw KeychainError.corruptValue("login nonce")
+        }
+        return LoginRequest(
+            email: email,
+            password: password,
+            identity: identity,
+            clientNonce: Data(nonce)
+        )
+    }
+
+    @MainActor
+    public func registration(
+        enrollmentGrant: String,
+        displayName: String? = nil
+    ) throws -> DeviceRegistrationRequest {
+        guard !enrollmentGrant.isEmpty else {
+            throw KeychainError.corruptValue("device enrollment grant")
+        }
         let identity = try loadOrCreate()
         return DeviceRegistrationRequest(
             deviceID: identity.deviceID,
@@ -78,8 +115,9 @@ public final class DeviceIdentityStore: @unchecked Sendable {
             displayName: displayName ?? UIDevice.current.name,
             osVersion: UIDevice.current.systemVersion,
             arch: Self.currentArchitecture,
-            publicKey: identity.publicKey.base64EncodedString(),
-            roleCapabilities: .iosControllerOnly
+            publicKey: identity.publicKey.base64URLEncodedString(),
+            roleCapabilities: .iosControllerOnly,
+            deviceEnrollmentGrant: enrollmentGrant
         )
     }
 
@@ -122,33 +160,28 @@ public final class DeviceIdentityStore: @unchecked Sendable {
 #endif
     }
 
+    @MainActor
     public static var currentOSVersion: String {
         UIDevice.current.systemVersion
     }
 
     private func createIdentity() throws -> DeviceIdentity {
         let deviceID = UUID().uuidString.lowercased()
-        let publicKeyID = UUID().uuidString.lowercased()
-        let version = UInt32(1)
-        var bigEndianVersion = version.bigEndian
-        let versionData = Data(bytes: &bigEndianVersion, count: MemoryLayout<UInt32>.size)
         let privateKey = Curve25519.Signing.PrivateKey()
 
         try store.set(Data(deviceID.utf8), for: Key.deviceID, accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
-        try store.set(Data(publicKeyID.utf8), for: Key.publicKeyID, accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
-        try store.set(versionData, for: Key.publicKeyVersion, accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
         try store.set(privateKey.rawRepresentation, for: Key.privateKey, accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
 
         return DeviceIdentity(
             deviceID: deviceID,
-            publicKeyID: publicKeyID,
-            publicKeyVersion: version,
+            publicKeyID: nil,
+            publicKeyVersion: 0,
             publicKey: privateKey.publicKey.rawRepresentation
         )
     }
 }
 
-public enum DeviceIdentityError: LocalizedError, Equatable {
+public enum DeviceIdentityError: LocalizedError, Equatable, Sendable {
     case invalidDigestLength
 
     public var errorDescription: String? {

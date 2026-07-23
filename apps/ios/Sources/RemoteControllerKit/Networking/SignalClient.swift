@@ -146,8 +146,14 @@ public actor SignalClient {
         identityStore: DeviceIdentityStore,
         capabilities: ClientCapabilities,
         accessTokenProvider: @escaping @Sendable () async throws -> String
-    ) {
+    ) throws {
         stop()
+        let identity = try identityStore.loadOrCreate()
+        guard !accountID.isEmpty,
+              identity.publicKeyID != nil,
+              identity.publicKeyVersion > 0 else {
+            throw APIClientError.authenticationRequired
+        }
         stopped = false
         connectionLoop = Task {
             await runConnectionLoop(
@@ -307,6 +313,9 @@ public actor SignalClient {
         capabilities: ClientCapabilities
     ) async throws {
         let identity = try identityStore.loadOrCreate()
+        guard let publicKeyID = identity.publicKeyID, identity.publicKeyVersion > 0 else {
+            throw APIClientError.authenticationRequired
+        }
         let clientNonce = try Self.randomBytes(count: 32)
         guard let timestamp = UInt64(exactly: Date.now.epochMillis) else {
             throw APIClientError.transport("系统时间无效")
@@ -342,7 +351,7 @@ public actor SignalClient {
             timestamp: timestamp,
             clientSupportedProtocolVersions: supportedVersions,
             clientMinProtocolVersion: ProtocolConstants.minimumVersion,
-            publicKeyID: identity.publicKeyID,
+            publicKeyID: publicKeyID,
             publicKeyVersion: identity.publicKeyVersion,
             clientSupportedProtocolVersionsHash: versionsHash.lowercaseHexString,
             clientCapabilities: capabilities,

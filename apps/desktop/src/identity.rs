@@ -14,6 +14,8 @@ const IDENTITY_STORE_KEY: &str = "device.identity.v1";
 pub struct DeviceIdentity {
     device_id: String,
     key_pair: DeviceKeyPair,
+    public_key_id: Option<String>,
+    public_key_version: u32,
 }
 
 impl DeviceIdentity {
@@ -21,6 +23,8 @@ impl DeviceIdentity {
         Self {
             device_id: format!("desktop-{}", Uuid::new_v4().simple()),
             key_pair: DeviceKeyPair::generate(),
+            public_key_id: None,
+            public_key_version: 0,
         }
     }
 
@@ -34,6 +38,14 @@ impl DeviceIdentity {
 
     pub fn encoded_public_key(&self) -> String {
         URL_SAFE_NO_PAD.encode(self.public_key())
+    }
+
+    pub fn public_key_id(&self) -> Option<&str> {
+        self.public_key_id.as_deref()
+    }
+
+    pub const fn public_key_version(&self) -> u32 {
+        self.public_key_version
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -74,6 +86,8 @@ impl fmt::Debug for DeviceIdentity {
             .debug_struct("DeviceIdentity")
             .field("device_id", &self.device_id)
             .field("public_key", &self.encoded_public_key())
+            .field("public_key_id", &self.public_key_id)
+            .field("public_key_version", &self.public_key_version)
             .field("private_key", &"<redacted>")
             .finish()
     }
@@ -143,6 +157,8 @@ impl DeviceIdentityManager {
             let identity = DeviceIdentity {
                 device_id: record.device_id,
                 key_pair: DeviceKeyPair::from_private_key(private_key),
+                public_key_id: record.public_key_id,
+                public_key_version: record.public_key_version,
             };
             private_key.zeroize();
             self.current = Some(Arc::new(identity));
@@ -158,6 +174,8 @@ impl DeviceIdentityManager {
             device_id: identity.device_id.clone(),
             private_key: URL_SAFE_NO_PAD
                 .encode(identity.key_pair.private_key_for_platform_crypto()),
+            public_key_id: None,
+            public_key_version: 0,
         };
         let mut bytes = serde_json::to_vec(&record).map_err(|_| IdentityError::InvalidRecord)?;
         let result = self.store.store(IDENTITY_STORE_KEY, &bytes);
@@ -178,6 +196,39 @@ impl DeviceIdentityManager {
     pub fn shared_current(&self) -> Option<Arc<DeviceIdentity>> {
         self.current.clone()
     }
+
+    pub fn update_registration(
+        &mut self,
+        public_key_id: impl Into<String>,
+        public_key_version: u32,
+    ) -> Result<(), IdentityError> {
+        let current = self.current.as_ref().ok_or(IdentityError::InvalidRecord)?;
+        let public_key_id = public_key_id.into();
+        if public_key_id.trim().is_empty() || public_key_version == 0 {
+            return Err(IdentityError::InvalidRecord);
+        }
+        let mut private_key = *current.key_pair.private_key_for_platform_crypto();
+        let mut record = IdentityRecord {
+            version: 1,
+            device_id: current.device_id.clone(),
+            private_key: URL_SAFE_NO_PAD.encode(private_key),
+            public_key_id: Some(public_key_id.clone()),
+            public_key_version,
+        };
+        let mut bytes = serde_json::to_vec(&record).map_err(|_| IdentityError::InvalidRecord)?;
+        let result = self.store.store(IDENTITY_STORE_KEY, &bytes);
+        bytes.zeroize();
+        record.private_key.zeroize();
+        result?;
+        self.current = Some(Arc::new(DeviceIdentity {
+            device_id: record.device_id,
+            key_pair: DeviceKeyPair::from_private_key(private_key),
+            public_key_id: Some(public_key_id),
+            public_key_version,
+        }));
+        private_key.zeroize();
+        Ok(())
+    }
 }
 
 impl fmt::Debug for DeviceIdentityManager {
@@ -196,6 +247,10 @@ struct IdentityRecord {
     version: u16,
     device_id: String,
     private_key: String,
+    #[serde(default)]
+    public_key_id: Option<String>,
+    #[serde(default)]
+    public_key_version: u32,
 }
 
 #[cfg(test)]
@@ -221,6 +276,13 @@ mod tests {
         assert!(!report.created);
         assert_eq!(second.current().expect("identity").device_id(), device_id);
         assert_eq!(second.current().expect("identity").public_key(), public_key);
+        second
+            .update_registration("key-1", 1)
+            .expect("persist registration");
+        assert_eq!(
+            second.current().expect("identity").public_key_id(),
+            Some("key-1")
+        );
     }
 
     #[test]
@@ -228,6 +290,8 @@ mod tests {
         let identity = DeviceIdentity {
             device_id: "desktop-test".into(),
             key_pair: DeviceKeyPair::from_private_key([7; 32]),
+            public_key_id: None,
+            public_key_version: 0,
         };
         let body = json!({"z": 1.0, "a": "value"});
         let signature = identity
@@ -275,6 +339,8 @@ mod tests {
         let identity = DeviceIdentity {
             device_id: "desktop-test".into(),
             key_pair: DeviceKeyPair::from_private_key([7; 32]),
+            public_key_id: None,
+            public_key_version: 0,
         };
         let debug = format!("{identity:?}");
         assert!(debug.contains("<redacted>"));

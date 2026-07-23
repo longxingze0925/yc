@@ -25,6 +25,9 @@ public final class ControllerAppModel: ObservableObject {
     @Published public private(set) var controllerDeviceID: String?
     @Published public private(set) var signalStatus = "未连接"
     @Published public private(set) var activeSession: SessionLaunch?
+    @Published public private(set) var totpEnrollment: TOTPEnrollmentStartResponse?
+    @Published public private(set) var pendingTOTPEnrollmentFactorID: String?
+    @Published public private(set) var recoveryCodeDelivery: RecoveryCodeDelivery?
     @Published public var errorMessage: String?
 
     public var serviceConfiguration: ServiceConfiguration? { configurationStore.current }
@@ -32,10 +35,13 @@ public final class ControllerAppModel: ObservableObject {
     private let configurationStore: ServiceConfigurationStore
     private let tokenVault: TokenVault
     private let identityStore: DeviceIdentityStore
+    private let recoveryCodeDeliveryVault: RecoveryCodeDeliveryVault
     private let proofClient: any CredentialProofClient
     private var api: (any RemoteAPI)?
     private var signal: SignalClient?
     private var signalEventsTask: Task<Void, Never>?
+    private var pendingLoginChallenge: LoginChallenge?
+    private var authenticationFlowID = UUID()
     private var bootstrapped = false
 
     public init(
@@ -46,7 +52,9 @@ public final class ControllerAppModel: ObservableObject {
         self.configurationStore = configurationStore
         tokenVault = TokenVault(store: secureStore)
         identityStore = DeviceIdentityStore(store: secureStore)
+        recoveryCodeDeliveryVault = RecoveryCodeDeliveryVault(store: secureStore)
         self.proofClient = proofClient
+        pendingTOTPEnrollmentFactorID = try? recoveryCodeDeliveryVault.pendingFactorID()
     }
 
     deinit {
@@ -64,6 +72,7 @@ public final class ControllerAppModel: ObservableObject {
             return
         }
         rebuildAPI()
+        let authenticationFlowID = beginAuthenticationFlow()
         do {
             guard let api else { throw APIClientError.serviceNotConfigured }
             guard var tokens = try tokenVault.load() else {
@@ -71,14 +80,22 @@ public final class ControllerAppModel: ObservableObject {
                 return
             }
             if !tokens.accessTokenIsValid {
-                guard let refreshed = try await api.refresh(using: tokens.refreshToken).tokenSet else {
-                    throw APIClientError.authenticationRequired
+                let refreshed = try await api.refresh(using: tokens.refreshToken)
+                try requireAuthenticationFlow(authenticationFlowID)
+                guard refreshed.accountID == tokens.accountID else {
+                    throw APIClientError.invalidResponse
                 }
-                tokens = refreshed
+                tokens = refreshed.tokenSet
                 try tokenVault.save(tokens)
             }
-            try await enterSignedIn(tokens: tokens)
+            try await enterSignedIn(
+                tokens: tokens,
+                challenge: nil,
+                enrollmentGrant: nil,
+                authenticationFlowID: authenticationFlowID
+            )
         } catch {
+            guard self.authenticationFlowID == authenticationFlowID else { return }
             try? tokenVault.clear()
             phase = .signedOut
             errorMessage = error.localizedDescription
@@ -86,7 +103,13 @@ public final class ControllerAppModel: ObservableObject {
     }
 
     public func saveServiceConfiguration(_ configuration: ServiceConfiguration) async {
+        if (try? recoveryCodeDeliveryVault.hasPendingEnrollment()) == true {
+            errorMessage = "请先完成并确认保存 MFA 恢复码"
+            return
+        }
+        let authenticationFlowID = invalidateAuthenticationFlow()
         await stopSignal()
+        guard self.authenticationFlowID == authenticationFlowID else { return }
         try? tokenVault.clear()
         do {
             try configurationStore.save(configuration)
@@ -95,6 +118,7 @@ public final class ControllerAppModel: ObservableObject {
             accountID = nil
             controllerDeviceID = nil
             activeSession = nil
+            pendingLoginChallenge = nil
             phase = .signedOut
         } catch {
             errorMessage = error.localizedDescription
@@ -106,24 +130,40 @@ public final class ControllerAppModel: ObservableObject {
             phase = .needsServiceConfiguration
             return
         }
+        let authenticationFlowID = beginAuthenticationFlow()
         phase = .authenticating
         errorMessage = nil
         do {
-            let response = try await api.login(LoginRequest(email: email, password: password))
-            if let challenge = response.challenge {
-                phase = .mfa(challenge)
+            let challenge = try await api.login(
+                identityStore.loginRequest(email: email, password: password)
+            )
+            try requireAuthenticationFlow(authenticationFlowID)
+            guard challenge.expiresAtEpochMillis > Date.now.epochMillis else {
+                throw APIClientError.invalidResponse
+            }
+            pendingLoginChallenge = challenge
+            if !challenge.requiredFactors.isEmpty {
+                phase = .mfa(challenge.mfaChallenge)
                 return
             }
-            guard let tokens = response.tokenSet else { throw APIClientError.invalidResponse }
-            try await enterSignedIn(tokens: tokens)
+            try await finishLogin(
+                challenge: challenge,
+                factor: nil,
+                code: nil,
+                authenticationFlowID: authenticationFlowID
+            )
         } catch {
+            guard self.authenticationFlowID == authenticationFlowID else { return }
+            try? tokenVault.clear()
+            pendingLoginChallenge = nil
             phase = .signedOut
             errorMessage = error.localizedDescription
         }
     }
 
     public func verifyMFA(challengeID: String, factor: String, code: String) async {
-        guard let api else { return }
+        guard api != nil else { return }
+        let authenticationFlowID = self.authenticationFlowID
         let pendingChallenge: MFAChallenge?
         if case let .mfa(challenge) = phase {
             pendingChallenge = challenge
@@ -133,15 +173,24 @@ public final class ControllerAppModel: ObservableObject {
         phase = .authenticating
         errorMessage = nil
         do {
-            let response = try await api.verifyMFA(
-                MFAVerifyRequest(challengeID: challengeID, factor: factor, code: code)
+            guard let challenge = pendingLoginChallenge,
+                  challenge.loginChallengeID == challengeID,
+                  challenge.requiredFactors.contains(factor) else {
+                throw APIClientError.invalidResponse
+            }
+            try await finishLogin(
+                challenge: challenge,
+                factor: factor,
+                code: code,
+                authenticationFlowID: authenticationFlowID
             )
-            guard let tokens = response.tokenSet else { throw APIClientError.invalidResponse }
-            try await enterSignedIn(tokens: tokens)
         } catch {
+            guard self.authenticationFlowID == authenticationFlowID else { return }
+            try? tokenVault.clear()
             if let pendingChallenge, pendingChallenge.expiresAtEpochMillis > Date.now.epochMillis {
                 phase = .mfa(pendingChallenge)
             } else {
+                pendingLoginChallenge = nil
                 phase = .signedOut
             }
             errorMessage = error.localizedDescription
@@ -152,6 +201,80 @@ public final class ControllerAppModel: ObservableObject {
         guard let api else { return }
         do {
             devices = try await api.listDevices()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func startTOTPEnrollment() async {
+        guard let api else {
+            errorMessage = APIClientError.serviceNotConfigured.localizedDescription
+            return
+        }
+        errorMessage = nil
+        do {
+            guard let tokens = try tokenVault.load() else {
+                throw APIClientError.authenticationRequired
+            }
+            let material = try recoveryCodeDeliveryVault.prepareStart(tokens: tokens)
+            if let factorID = material.existingFactorID {
+                pendingTOTPEnrollmentFactorID = factorID
+                errorMessage = "TOTP enrollment 已开始，请继续验证"
+                return
+            }
+            let response = try await api.startTOTPEnrollment(
+                try TOTPEnrollmentStartRequest(
+                    recoveryDeliveryPublicKey: material.recoveryDeliveryPublicKey
+                ),
+                authorizationToken: material.authorizationToken
+            )
+            try recoveryCodeDeliveryVault.recordStart(response)
+            totpEnrollment = response
+            pendingTOTPEnrollmentFactorID = response.factorID
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func finishTOTPEnrollment(code: String) async {
+        guard let api else {
+            errorMessage = APIClientError.serviceNotConfigured.localizedDescription
+            return
+        }
+        errorMessage = nil
+        do {
+            let material = try recoveryCodeDeliveryVault.finishMaterial()
+            let envelope = try await api.finishTOTPEnrollment(
+                try TOTPEnrollmentFinishRequest(factorID: material.factorID, code: code),
+                idempotencyKey: material.idempotencyKey,
+                authorizationToken: material.authorizationToken
+            )
+            let delivery = try recoveryCodeDeliveryVault.decrypt(envelope)
+            await stopSignal()
+            try? tokenVault.clear()
+            accountID = nil
+            controllerDeviceID = nil
+            devices = []
+            activeSession = nil
+            phase = .signedOut
+
+            recoveryCodeDelivery = delivery
+            totpEnrollment = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func confirmRecoveryCodesSaved() {
+        guard let delivery = recoveryCodeDelivery else {
+            errorMessage = RecoveryCodeDeliveryError.missingPendingEnrollment.localizedDescription
+            return
+        }
+        do {
+            try recoveryCodeDeliveryVault.confirmSaved(deliveryID: delivery.deliveryID)
+            recoveryCodeDelivery = nil
+            pendingTOTPEnrollmentFactorID = nil
+            totpEnrollment = nil
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -193,13 +316,21 @@ public final class ControllerAppModel: ObservableObject {
     }
 
     public func logout() async {
+        if (try? recoveryCodeDeliveryVault.hasPendingEnrollment()) == true {
+            errorMessage = "请先完成并确认保存 MFA 恢复码"
+            return
+        }
+        let authenticationFlowID = invalidateAuthenticationFlow()
         if let api { try? await api.logout() }
+        guard self.authenticationFlowID == authenticationFlowID else { return }
         await stopSignal()
+        guard self.authenticationFlowID == authenticationFlowID else { return }
         try? tokenVault.clear()
         accountID = nil
         controllerDeviceID = nil
         devices = []
         activeSession = nil
+        pendingLoginChallenge = nil
         phase = .signedOut
     }
 
@@ -216,35 +347,105 @@ public final class ControllerAppModel: ObservableObject {
         }
     }
 
-    private func enterSignedIn(tokens: TokenSet) async throws {
+    private func finishLogin(
+        challenge: LoginChallenge,
+        factor: String?,
+        code: String?,
+        authenticationFlowID: UUID
+    ) async throws {
+        guard let api else { throw APIClientError.serviceNotConfigured }
+        let response = try await api.finishLogin(
+            challenge: challenge,
+            factor: factor,
+            code: code
+        )
+        try requireAuthenticationFlow(authenticationFlowID)
+        guard response.accountID == challenge.accountID else {
+            throw APIClientError.invalidResponse
+        }
+        switch challenge.deviceState {
+        case .pendingEnrollment:
+            guard response.deviceEnrollmentGrant?.isEmpty == false,
+                  let expiresAt = response.deviceEnrollmentGrantExpiresAtEpochMillis,
+                  expiresAt > Date.now.epochMillis else {
+                throw APIClientError.invalidResponse
+            }
+        case .registered:
+            guard response.deviceEnrollmentGrant == nil,
+                  response.deviceEnrollmentGrantExpiresAtEpochMillis == nil else {
+                throw APIClientError.invalidResponse
+            }
+        }
+        try await enterSignedIn(
+            tokens: response.tokenSet,
+            challenge: challenge,
+            enrollmentGrant: response.deviceEnrollmentGrant,
+            authenticationFlowID: authenticationFlowID
+        )
+    }
+
+    private func enterSignedIn(
+        tokens: TokenSet,
+        challenge: LoginChallenge?,
+        enrollmentGrant: String?,
+        authenticationFlowID: UUID
+    ) async throws {
+        try requireAuthenticationFlow(authenticationFlowID)
         guard let api else { throw APIClientError.serviceNotConfigured }
         try tokenVault.save(tokens)
         let identity = try identityStore.loadOrCreate()
-        var listedDevices = try await api.listDevices()
-        if let registered = listedDevices.first(where: { $0.deviceID == identity.deviceID }) {
-            if let publicKeyID = registered.publicKeyID,
-               let publicKeyVersion = registered.publicKeyVersion {
-                try identityStore.updateRegistration(
-                    publicKeyID: publicKeyID,
-                    publicKeyVersion: publicKeyVersion
-                )
+        let registrationBinding: (publicKeyID: String, publicKeyVersion: UInt32)?
+        switch challenge?.deviceState {
+        case .some(.pendingEnrollment):
+            guard let enrollmentGrant, !enrollmentGrant.isEmpty else {
+                throw APIClientError.invalidResponse
             }
-        } else {
-            let registered = try await api.registerControllerDevice(identityStore.registration())
+            let registered = try await api.registerControllerDevice(
+                identityStore.registration(enrollmentGrant: enrollmentGrant)
+            )
             guard registered.deviceID == identity.deviceID else {
                 throw APIClientError.invalidResponse
             }
+            registrationBinding = (
+                publicKeyID: registered.publicKeyID,
+                publicKeyVersion: registered.publicKeyVersion
+            )
             try identityStore.updateRegistration(
                 publicKeyID: registered.publicKeyID,
                 publicKeyVersion: registered.publicKeyVersion
             )
-            listedDevices = try await api.listDevices()
+        case .some(.registered):
+            guard enrollmentGrant == nil else { throw APIClientError.invalidResponse }
+            registrationBinding = nil
+        case .none:
+            guard enrollmentGrant == nil else { throw APIClientError.invalidResponse }
+            registrationBinding = nil
         }
+        let listedDevices = try await api.listDevices()
+        let localDevice = listedDevices.first(where: { $0.deviceID == identity.deviceID })
+        guard let binding = registrationBinding ?? localDevice.flatMap({ device in
+            guard let publicKeyID = device.publicKeyID,
+                  let publicKeyVersion = device.publicKeyVersion else { return nil }
+            return (publicKeyID: publicKeyID, publicKeyVersion: publicKeyVersion)
+        }) else {
+            throw APIClientError.invalidResponse
+        }
+        if registrationBinding == nil {
+            try identityStore.updateRegistration(
+                publicKeyID: binding.publicKeyID,
+                publicKeyVersion: binding.publicKeyVersion
+            )
+        }
+        try requireAuthenticationFlow(authenticationFlowID)
         accountID = tokens.accountID
         controllerDeviceID = identity.deviceID
+        pendingLoginChallenge = nil
         phase = .signedIn
         devices = listedDevices
-        await startSignal(accountID: tokens.accountID)
+        await startSignal(
+            accountID: tokens.accountID,
+            authenticationFlowID: authenticationFlowID
+        )
     }
 
     private func rebuildAPI() {
@@ -259,14 +460,19 @@ public final class ControllerAppModel: ObservableObject {
         )
     }
 
-    private func startSignal(accountID: String) async {
+    private func startSignal(accountID: String, authenticationFlowID: UUID) async {
         guard let configuration = configurationStore.current, let api else { return }
         await stopSignal()
+        guard self.authenticationFlowID == authenticationFlowID else { return }
         let client = SignalClient(configuration: configuration)
         signal = client
         signalEventsTask = Task { [weak self] in
             for await event in client.events {
                 guard let self else { return }
+                guard self.authenticationFlowID == authenticationFlowID else {
+                    await client.stop()
+                    return
+                }
                 switch event {
                 case .connecting:
                     signalStatus = "连接中"
@@ -293,6 +499,7 @@ public final class ControllerAppModel: ObservableObject {
                     controllerDeviceID = nil
                     devices = []
                     activeSession = nil
+                    invalidateAuthenticationFlow()
                     phase = .signedOut
                     errorMessage = reason
                     return
@@ -301,28 +508,59 @@ public final class ControllerAppModel: ObservableObject {
                 }
             }
         }
-        await client.start(
-            accountID: accountID,
-            identityStore: identityStore,
-            capabilities: .ios(
-                appVersion: Self.appVersion,
-                osVersion: DeviceIdentityStore.currentOSVersion,
-                arch: DeviceIdentityStore.currentArchitecture
-            ),
-            accessTokenProvider: { [tokenVault, api] in
-                guard let tokens = try tokenVault.load() else {
-                    throw APIClientError.authenticationRequired
+        do {
+            try await client.start(
+                accountID: accountID,
+                identityStore: identityStore,
+                capabilities: .ios(
+                    appVersion: Self.appVersion,
+                    osVersion: DeviceIdentityStore.currentOSVersion,
+                    arch: DeviceIdentityStore.currentArchitecture
+                ),
+                accessTokenProvider: { [tokenVault, api] in
+                    guard let tokens = try tokenVault.load() else {
+                        throw APIClientError.authenticationRequired
+                    }
+                    if tokens.accessTokenIsValid {
+                        return tokens.accessToken
+                    }
+                    let response = try await api.refresh(using: tokens.refreshToken)
+                    guard response.accountID == tokens.accountID else {
+                        throw APIClientError.invalidResponse
+                    }
+                    let refreshed = response.tokenSet
+                    try tokenVault.save(refreshed)
+                    return refreshed.accessToken
                 }
-                if tokens.accessTokenIsValid {
-                    return tokens.accessToken
-                }
-                guard let refreshed = try await api.refresh(using: tokens.refreshToken).tokenSet else {
-                    throw APIClientError.authenticationRequired
-                }
-                try tokenVault.save(refreshed)
-                return refreshed.accessToken
-            }
-        )
+            )
+        } catch {
+            guard self.authenticationFlowID == authenticationFlowID else { return }
+            signalEventsTask?.cancel()
+            signalEventsTask = nil
+            signal = nil
+            signalStatus = "未连接"
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    private func beginAuthenticationFlow() -> UUID {
+        let flowID = UUID()
+        authenticationFlowID = flowID
+        pendingLoginChallenge = nil
+        return flowID
+    }
+
+    @discardableResult
+    private func invalidateAuthenticationFlow() -> UUID {
+        let flowID = UUID()
+        authenticationFlowID = flowID
+        pendingLoginChallenge = nil
+        return flowID
+    }
+
+    private func requireAuthenticationFlow(_ flowID: UUID) throws {
+        guard authenticationFlowID == flowID else { throw CancellationError() }
     }
 
     private func stopSignal() async {

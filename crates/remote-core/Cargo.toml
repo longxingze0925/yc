@@ -8,6 +8,8 @@ authors.workspace = true
 [dependencies]
 remote-crypto = { path = "../remote-crypto" }
 remote-protocol = { path = "../remote-protocol" }
+sha2 = "0.10"
+subtle = "2"
 
 [lints]
 workspace = true

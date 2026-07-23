@@ -96,12 +96,13 @@ psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 \
 
 ## 验证记录
 
-2026-07-22 按任务禁令未连接或迁移任何 PostgreSQL，只完成静态验证：
+2026-07-22 已在全新隔离数据库 `remote_gate_clean_20260722` 完成真实验证，未连接或迁移既有 `remote-control-local` 数据库：
 
-- `CARGO_TARGET_DIR=/tmp/remote-integration-target cargo test -p remote-store`：13 个测试通过，覆盖 43 张 V1 表、账号身份表及 `account_risk_challenges` 精确列集、敏感明文禁列、登录上下文 CHECK、TTL/CHECK、同账号复合 FK、关键索引和原有防误跑规则。
-- `sh -n infra/migrations/run-0001.sh infra/migrations/ensure-local-compose-schema.sh`：shell 语法检查通过。
-- 纯文本静态检查确认 `0001` 首行为 final 标记、末行为 `COMMIT;`，runner 仍要求双确认、空 `public` schema，并在 dry-run 时替换为 `ROLLBACK;`。
-- `verify-0001.sql` 已更新为 43 表，并增加新表列集、禁用明文字段、冻结 CHECK、复合 FK 和关键索引检查；在获准使用全新一次性 PostgreSQL 前，其运行结果保持未验证，不能以 2026-07-21 的 41 表实跑记录替代。
+- `run-0001.sh --apply` 在空 `public` schema 成功执行，随后 `verify-0001.sql` 全部通过。
+- `make fmt-check`、`make lint`、`make test`、`make check` 全部通过。
+- PostgreSQL/Redis ignored 集成测试 `8 passed; 0 failed`，覆盖并发设备注册、设备密钥轮换撤销、完整会话与 MFA 密文、跨实例事务、Redis challenge/登录锁/在线状态和 TOTP lease。
+- 静态检查确认 `0001` 首行为 final 标记、末行为 `COMMIT;`，runner 仍要求双确认和空 `public` schema，并在 dry-run 时替换为 `ROLLBACK;`。
+- 完整环境、命令类别、结果和回滚边界见 `docs/report/schema-freeze/20260722172626679_T002P账号身份Schema验证报告.md`。
 
 ## 回滚
 

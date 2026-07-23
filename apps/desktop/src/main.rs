@@ -1,7 +1,7 @@
 use remote_desktop::api::{
     now_epoch_millis, ApiClient, Architecture, CreateSessionRequest, DeviceCapabilities,
-    DeviceRegistrationMetadata, LoginOutcome, LoginRequest, MfaFactor, MfaVerifyRequest, Platform,
-    ReqwestHttpTransport,
+    DeviceRegistrationMetadata, LoginChallenge, LoginFinishOutcome, LoginRequest, MfaFactor,
+    Platform, ReqwestHttpTransport,
 };
 use remote_desktop::app::MfaFlowError;
 use remote_desktop::signal::SignalConnectContext;
@@ -29,6 +29,7 @@ struct DesktopController {
     signal: SignalWebSocketClient,
     last_signal_state: SignalConnectionState,
     session: Option<SessionResources<Box<dyn remote_desktop::input::InputBackend>>>,
+    pending_login: Option<LoginChallenge>,
 }
 
 impl DesktopController {
@@ -61,6 +62,7 @@ impl DesktopController {
             signal: SignalWebSocketClient::default(),
             last_signal_state: SignalConnectionState::Disconnected,
             session: None,
+            pending_login: None,
         }
     }
 
@@ -89,14 +91,29 @@ impl DesktopController {
                 return;
             }
         };
-        let request = LoginRequest::new(account.trim(), password);
+        if let Err(error) = self.identity.load_or_create() {
+            self.model
+                .set_login_status(format!("设备身份初始化失败：{error}"));
+            return;
+        }
+        let identity = self.identity.shared_current().expect("identity loaded");
+        let request = LoginRequest::new(account.trim(), password, identity.as_ref());
         match client.login(&request) {
-            Ok(LoginOutcome::Authenticated(tokens)) => {
-                self.finish_authenticated_login(account.trim(), &config, &client, tokens)
-            }
-            Ok(LoginOutcome::MfaRequired(challenge)) => {
-                self.model
-                    .begin_mfa(account.trim(), challenge, now_epoch_millis());
+            Ok(challenge) if challenge.required_factors.is_empty() => self.finish_login_challenge(
+                account.trim(),
+                &config,
+                &client,
+                challenge,
+                None,
+                None,
+            ),
+            Ok(challenge) => {
+                self.model.begin_mfa(
+                    account.trim(),
+                    challenge.mfa_challenge(),
+                    now_epoch_millis(),
+                );
+                self.pending_login = Some(challenge);
             }
             Err(error) => self.model.set_login_status(format!("登录失败：{error}")),
         }
@@ -138,13 +155,21 @@ impl DesktopController {
                 return;
             }
         };
-        let request = MfaVerifyRequest::new(attempt.challenge_id, attempt.factor, code.trim());
-        match client.verify_mfa(&request) {
-            Ok(tokens) => {
+        let Some(challenge) = self.pending_login.clone() else {
+            self.model.set_login_status("登录挑战已丢失，请重新登录");
+            return;
+        };
+        if challenge.login_challenge_id != attempt.challenge_id {
+            self.model.set_login_status("MFA 挑战不匹配，请重新登录");
+            return;
+        }
+        match client.finish_login(&challenge, self.identity.current().expect("identity loaded"), Some(attempt.factor), Some(code.trim())) {
+            Ok(outcome) => {
                 self.model.complete_mfa();
-                self.finish_authenticated_login(&attempt.account, &config, &client, tokens);
+                self.pending_login = None;
+                self.finish_authenticated_login(&attempt.account, &config, &client, outcome);
             }
-            Err(error) if error.code() == Some("mfa_verification_failed") => {
+            Err(error) if error.code() == Some("login_verification_failed") => {
                 self.model.record_mfa_rejection(now_epoch_millis());
             }
             Err(error) if error.code() == Some("unsupported_version") => self
@@ -158,6 +183,26 @@ impl DesktopController {
 
     fn cancel_mfa(&mut self) {
         self.model.cancel_mfa();
+        self.pending_login = None;
+    }
+
+    fn finish_login_challenge(
+        &mut self,
+        account: &str,
+        config: &ServiceConfig,
+        client: &ApiClient,
+        challenge: LoginChallenge,
+        factor: Option<MfaFactor>,
+        code: Option<&str>,
+    ) {
+        let Some(identity) = self.identity.current() else {
+            self.model.set_login_status("设备私钥未加载");
+            return;
+        };
+        match client.finish_login(&challenge, identity, factor, code) {
+            Ok(outcome) => self.finish_authenticated_login(account, config, client, outcome),
+            Err(error) => self.model.set_login_status(format!("登录完成验证失败：{error}")),
+        }
     }
 
     fn finish_authenticated_login(
@@ -165,8 +210,9 @@ impl DesktopController {
         account: &str,
         config: &ServiceConfig,
         client: &ApiClient,
-        tokens: remote_desktop::secret_store::AccountTokens,
+        outcome: LoginFinishOutcome,
     ) {
+        let tokens = outcome.tokens;
         let account_id = tokens.account_id.clone();
         let token_report = match self.tokens.install(tokens) {
             Ok(report) => report,
@@ -179,8 +225,7 @@ impl DesktopController {
         let identity_report = match self.identity.load_or_create() {
             Ok(report) => report,
             Err(error) => {
-                self.model
-                    .set_login_status(format!("设备身份初始化失败：{error}"));
+                self.fail_authenticated_login(format!("设备身份初始化失败：{error}"));
                 return;
             }
         };
@@ -189,43 +234,59 @@ impl DesktopController {
             .current()
             .and_then(|tokens| tokens.access_token(now_epoch_millis()))
         {
-            Some(token) => token,
+            Some(token) => token.to_owned(),
             None => {
-                self.model
-                    .set_login_status("服务端返回的 access token 已过期");
+                self.fail_authenticated_login("服务端返回的 access token 已过期");
                 return;
             }
         };
         let identity = self.identity.shared_current().expect("identity loaded");
         let metadata = registration_metadata(&self.model);
-        let registration_result =
-            client.register_device(access_token, &account_id, identity.as_ref(), metadata);
-        if let Err(error) = &registration_result {
-            if error.code() != Some("device_exists") {
-                self.model
-                    .set_login_status(format!("登录成功，但签名设备注册失败：{error}"));
-                return;
-            }
-        }
-        let devices = match client.list_devices(access_token) {
-            Ok(devices) => devices,
-            Err(error) => {
-                self.model
-                    .set_login_status(format!("登录成功，但设备列表读取失败：{error}"));
+        let registration_result = match (&outcome.device_enrollment_grant, outcome.device_state.as_str()) {
+            (Some(grant), "pending_enrollment") => client.register_device(
+                &access_token,
+                &account_id,
+                identity.as_ref(),
+                metadata,
+                grant,
+            ).map(Some),
+            (None, "registered") => Ok(None),
+            _ => {
+                self.fail_authenticated_login("登录完成响应的设备注册状态无效");
                 return;
             }
         };
-        let local_view = registration_result.ok().or_else(|| {
+        if let Err(error) = &registration_result {
+            self.fail_authenticated_login(format!("登录成功，但签名设备注册失败：{error}"));
+            return;
+        }
+        let devices = match client.list_devices(&access_token) {
+            Ok(devices) => devices,
+            Err(error) => {
+                self.fail_authenticated_login(format!("登录成功，但设备列表读取失败：{error}"));
+                return;
+            }
+        };
+        let local_view = registration_result.ok().flatten().or_else(|| {
             devices
                 .iter()
                 .find(|device| device.device_id == identity.device_id())
                 .cloned()
         });
         let Some(local_view) = local_view else {
-            self.model
-                .set_login_status("设备注册返回冲突，但账号设备列表中找不到当前设备");
+            self.fail_authenticated_login("账号设备列表中找不到当前设备");
             return;
         };
+        if let Err(error) = self
+            .identity
+            .update_registration(local_view.public_key_id.clone(), local_view.public_key_version)
+        {
+            self.fail_authenticated_login(format!(
+                "设备注册成功，但公钥版本无法安全持久化：{error}"
+            ));
+            return;
+        }
+        let identity = self.identity.shared_current().expect("identity persisted");
         let local = LocalDeviceRegistration {
             display_name: local_view.display_name.clone(),
             device_id: local_view.device_id.clone(),
@@ -241,7 +302,7 @@ impl DesktopController {
 
         let signal_context = SignalConnectContext::new(
             &config.signal_url,
-            access_token,
+            &access_token,
             &account_id,
             &local_view.device_id,
             &local_view.public_key_id,
@@ -260,6 +321,15 @@ impl DesktopController {
                 "服务配置已持久化；token 和设备私钥当前仅进程内，平台安全存储适配器未接入",
             );
         }
+    }
+
+    fn fail_authenticated_login(&mut self, message: impl Into<String>) {
+        let mut message = message.into();
+        if let Err(error) = self.tokens.clear() {
+            message.push_str(&format!("；本地 token 清理失败：{error}"));
+        }
+        self.pending_login = None;
+        self.model.set_login_status(message);
     }
 
     fn save_server_configuration(

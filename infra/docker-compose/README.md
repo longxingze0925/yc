@@ -11,18 +11,20 @@ docker compose -f infra/docker-compose/compose.yml config
 docker compose -f infra/docker-compose/compose.yml up --build
 ```
 
-本地开发可以使用临时 CA 签发的证书，但客户端必须显式信任该 CA，并按证书 SAN 校验 Relay 域名；不得关闭证书校验。
+本地开发可以使用临时自签名证书，但客户端必须显式信任该证书，并按证书 SAN 校验 Relay 域名；不得关闭证书校验。
 
-生成 30 天有效的本地 CA 和 Relay 证书：
+生成 30 天有效的本地自签名 Relay 证书：
 
 ```bash
 infra/docker-compose/generate-local-relay-cert.sh
-export RELAY_TLS_CERT_PATH=/tmp/remote-control-relay-tls/relay-local-fullchain.pem
-export RELAY_TLS_KEY_PATH=/tmp/remote-control-relay-tls/relay-local.key
+export RELAY_TLS_CERT_PATH=/tmp/remote-control-relay-tls/relay.crt
+export RELAY_TLS_KEY_PATH=/tmp/remote-control-relay-tls/relay.key
 docker compose -f infra/docker-compose/compose.yml config
 ```
 
-客户端测试信任根为 `/tmp/remote-control-relay-tls/relay-local-ca.crt`。脚本不会修改系统信任库，默认输出目录位于 `/tmp`，私钥不会写入仓库；共享和生产环境禁止使用该本地 CA。
+客户端测试信任根为 `/tmp/remote-control-relay-tls/relay.crt`。脚本不会修改系统信任库，默认输出目录位于 `/tmp`，私钥不会写入仓库；共享和生产环境禁止使用该本地证书。
+
+宿主机 Relay 私钥必须保持 `0600`，不得为了容器读取而改为 `0644`。Relay 容器以 root 入口只读加载私钥，复制到容器私有目录并设置为 UID/GID `10001:10001`、模式 `0600`，随后以 UID `10001` 启动服务进程。
 
 本地端口：
 
@@ -42,7 +44,7 @@ docker compose -f infra/docker-compose/compose.yml config
 - `RELAY_TLS_CERT_PATH`（必填，PEM 证书链的绝对路径）
 - `RELAY_TLS_KEY_PATH`（必填，PEM 私钥的绝对路径）
 
-默认密钥仅用于本地开发，共享环境必须覆盖。Compose 会先运行 `migrate` 服务：只对 Compose 内部的空 `public` schema 应用已冻结 `0001`，非空 schema 只执行结构验证，不会覆盖或修复已有数据库。
+默认密钥仅用于本地开发，共享环境必须覆盖。Compose 会先运行 `migrate` 服务：迁移入口要求 `DATABASE_URL` 与 `PGHOST/PGPORT/PGDATABASE/PGUSER` 解析到同一 Compose PostgreSQL 实例、数据库、用户和端口；只对空 `public` schema 应用已冻结 `0001`，非空 schema 只执行结构验证，不会覆盖或修复已有数据库。
 
 当前边界：
 

@@ -183,7 +183,8 @@ BEGIN
         'login_user_agent_hash',
         'login_trusted_device_id',
         'login_protocol_version',
-        'login_attempts_limit'
+        'login_attempts_limit',
+        'login_account_updated_at_epoch_millis'
     ]::TEXT[] THEN
         RAISE EXCEPTION 'unexpected account_risk_challenges columns: %', login_challenge_columns;
     END IF;
@@ -525,6 +526,24 @@ BEGIN
        OR to_regclass('public.idx_mfa_recovery_code_deliveries_session') IS NULL
        OR to_regclass('public.idx_mfa_recovery_code_deliveries_expiry') IS NULL THEN
         RAISE EXCEPTION 'required Schema Freeze index is missing';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint AS constraint_record
+        WHERE constraint_record.conname = 'uq_mfa_recovery_code_deliveries_idempotency'
+          AND constraint_record.conrelid = 'public.mfa_recovery_code_deliveries'::regclass
+          AND constraint_record.contype = 'u'
+          AND ARRAY(
+              SELECT attribute.attname::TEXT
+              FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key_column(attnum, position)
+              JOIN pg_attribute AS attribute
+                ON attribute.attrelid = constraint_record.conrelid
+               AND attribute.attnum = key_column.attnum
+              ORDER BY key_column.position
+          ) = ARRAY['account_id', 'idempotency_key_hash']::TEXT[]
+    ) THEN
+        RAISE EXCEPTION 'MFA recovery delivery idempotency constraint has unexpected columns';
     END IF;
 
     IF EXISTS (

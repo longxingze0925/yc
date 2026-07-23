@@ -34,9 +34,9 @@ final class ProtocolModelTests: XCTestCase {
         )
         let response = try JSONDecoder().decode(LoginResponse.self, from: data)
 
-        XCTAssertEqual(response.tokenSet?.accountID, "account-1")
-        XCTAssertEqual(response.tokenSet?.accessTokenExpiresAtEpochMillis, 4_102_444_800_000)
-        XCTAssertNil(response.challenge)
+        XCTAssertEqual(response.tokenSet.accountID, "account-1")
+        XCTAssertEqual(response.tokenSet.accessTokenExpiresAtEpochMillis, 4_102_444_800_000)
+        XCTAssertNil(response.deviceEnrollmentGrant)
     }
 
     func testTokenSetEncodesFrozenExpirationNames() throws {
@@ -62,29 +62,103 @@ final class ProtocolModelTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(TokenSet.self, from: data))
     }
 
-    func testLoginAndMFAVerifyDoNotSendUnknownFields() throws {
-        let login = try jsonObject(LoginRequest(email: "qa@example.test", password: "secret"))
-        XCTAssertEqual(Set(login.keys), ["email", "password", "protocol_version"])
+    func testTwoStageLoginUsesFrozenDeviceBindingFields() throws {
+        let identity = DeviceIdentity(
+            deviceID: "ios-1",
+            publicKeyID: nil,
+            publicKeyVersion: 0,
+            publicKey: Data(repeating: 7, count: 32)
+        )
+        let login = try jsonObject(LoginRequest(
+            email: "qa@example.test",
+            password: "secret",
+            identity: identity,
+            clientNonce: Data(repeating: 9, count: 32)
+        ))
+        XCTAssertEqual(Set(login.keys), [
+            "email", "password", "device_id", "device_public_key", "public_key_version",
+            "client_nonce", "protocol_version"
+        ])
+        XCTAssertNil(login["public_key_id"])
+        XCTAssertEqual(login["public_key_version"] as? Int, 0)
 
-        let verify = try jsonObject(MFAVerifyRequest(
-            challengeID: "challenge-1",
+        let challengeData = Data(
+            #"{"code":"login_challenge_required","account_id":"account-1","login_challenge_id":"challenge-1","login_request_binding_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","login_challenge_binding_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","server_nonce":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","device_state":"pending_enrollment","required_factors":["totp"],"expires_at_epoch_millis":4102444800000,"attempts_remaining":5}"#.utf8
+        )
+        let decoder = JSONDecoder()
+        decoder.userInfo[.loginClientNonce] = Data(repeating: 9, count: 32).base64URLEncodedString()
+        let challenge = try decoder.decode(LoginChallenge.self, from: challengeData)
+        let finish = try jsonObject(try LoginFinishRequest(
+            challenge: challenge,
             factor: "totp",
             code: "123456"
         ))
-        XCTAssertEqual(Set(verify.keys), ["mfa_challenge_id", "factor", "code"])
+        XCTAssertEqual(Set(finish.keys), [
+            "login_challenge_id", "login_request_binding_hash", "login_challenge_binding_hash",
+            "client_nonce", "server_nonce", "factor", "code", "protocol_version"
+        ])
     }
 
-    func testMFAResponseAcceptsCodeAndFactorsShape() throws {
+    func testLoginChallengeMapsRequiredFactorsToMFAUI() throws {
         let data = Data(
-            #"{"code":"mfa_required","mfa_required":true,"mfa_challenge_id":"challenge-1","allowed_factors":["totp","recovery_code"],"expires_at_epoch_millis":4102444800000,"attempts_remaining":5}"#.utf8
+            #"{"code":"login_challenge_required","account_id":"account-1","login_challenge_id":"challenge-1","login_request_binding_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","login_challenge_binding_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","server_nonce":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","device_state":"registered","required_factors":["totp","recovery_code"],"expires_at_epoch_millis":4102444800000,"attempts_remaining":5}"#.utf8
         )
-        let response = try JSONDecoder().decode(LoginResponse.self, from: data)
+        let decoder = JSONDecoder()
+        decoder.userInfo[.loginClientNonce] = Data(repeating: 9, count: 32).base64URLEncodedString()
+        let response = try decoder.decode(LoginChallenge.self, from: data)
 
-        XCTAssertEqual(response.mfaRequired, true)
-        XCTAssertEqual(response.challenge?.mfaChallengeID, "challenge-1")
-        XCTAssertEqual(response.challenge?.allowedFactors, ["totp", "recovery_code"])
-        XCTAssertEqual(response.challenge?.attemptsRemaining, 5)
-        XCTAssertNil(response.tokenSet)
+        XCTAssertEqual(response.deviceState, .registered)
+        XCTAssertEqual(response.mfaChallenge.mfaChallengeID, "challenge-1")
+        XCTAssertEqual(response.mfaChallenge.allowedFactors, ["totp", "recovery_code"])
+        XCTAssertEqual(response.mfaChallenge.attemptsRemaining, 5)
+    }
+
+    func testLoginChallengeRejectsCredentialsAndMissingRequestNonce() throws {
+        let valid = Data(
+            #"{"code":"login_challenge_required","account_id":"account-1","login_challenge_id":"challenge-1","login_request_binding_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","login_challenge_binding_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","server_nonce":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","device_state":"registered","required_factors":[],"expires_at_epoch_millis":4102444800000,"attempts_remaining":5}"#.utf8
+        )
+        XCTAssertThrowsError(try JSONDecoder().decode(LoginChallenge.self, from: valid))
+
+        let withToken = Data(
+            #"{"code":"login_challenge_required","account_id":"account-1","login_challenge_id":"challenge-1","login_request_binding_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","login_challenge_binding_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","server_nonce":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","device_state":"registered","required_factors":[],"expires_at_epoch_millis":4102444800000,"attempts_remaining":5,"access_token":"must-not-exist"}"#.utf8
+        )
+        let decoder = JSONDecoder()
+        decoder.userInfo[.loginClientNonce] = Data(repeating: 9, count: 32).base64URLEncodedString()
+        XCTAssertThrowsError(try decoder.decode(LoginChallenge.self, from: withToken))
+    }
+
+    func testLoginFinishOmitsMFAFieldsWhenChallengeDoesNotRequireThem() throws {
+        let data = Data(
+            #"{"code":"login_challenge_required","account_id":"account-1","login_challenge_id":"challenge-1","login_request_binding_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","login_challenge_binding_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","server_nonce":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","device_state":"registered","required_factors":[],"expires_at_epoch_millis":4102444800000,"attempts_remaining":5}"#.utf8
+        )
+        let decoder = JSONDecoder()
+        decoder.userInfo[.loginClientNonce] = Data(repeating: 9, count: 32).base64URLEncodedString()
+        let challenge = try decoder.decode(LoginChallenge.self, from: data)
+        let finish = try jsonObject(try LoginFinishRequest(
+            challenge: challenge,
+            factor: nil,
+            code: nil
+        ))
+
+        XCTAssertNil(finish["factor"])
+        XCTAssertNil(finish["code"])
+        XCTAssertThrowsError(try LoginFinishRequest(
+            challenge: challenge,
+            factor: "totp",
+            code: "123456"
+        ))
+    }
+
+    func testLoginResponseRequiresCompleteTokenAndGrantPairs() {
+        let partialToken = Data(
+            #"{"account_id":"account-1","access_token":"access","access_token_expires_at_epoch_millis":4102444800000,"refresh_token_expires_at_epoch_millis":4105036800000}"#.utf8
+        )
+        XCTAssertThrowsError(try JSONDecoder().decode(LoginResponse.self, from: partialToken))
+
+        let grantWithoutExpiry = Data(
+            #"{"account_id":"account-1","access_token":"access","refresh_token":"refresh","access_token_expires_at_epoch_millis":4102444800000,"refresh_token_expires_at_epoch_millis":4105036800000,"device_enrollment_grant":"grant.secret"}"#.utf8
+        )
+        XCTAssertThrowsError(try JSONDecoder().decode(LoginResponse.self, from: grantWithoutExpiry))
     }
 
     func testDeviceRegistrationUsesCapabilitiesAndKeepsOSVersionSeparate() throws {
@@ -95,7 +169,8 @@ final class ProtocolModelTests: XCTestCase {
             osVersion: "16.7.12",
             arch: "aarch64",
             publicKey: "cHVibGljLWtleQ==",
-            roleCapabilities: .iosControllerOnly
+            roleCapabilities: .iosControllerOnly,
+            deviceEnrollmentGrant: "grant-id.grant-secret"
         )
         let object = try jsonObject(request)
 
@@ -103,6 +178,7 @@ final class ProtocolModelTests: XCTestCase {
         XCTAssertEqual(object["os_version"] as? String, "16.7.12")
         XCTAssertNil(object["ios_16"])
         XCTAssertNil(object["public_key_id"])
+        XCTAssertEqual(object["device_enrollment_grant"] as? String, "grant-id.grant-secret")
         let capabilities = try XCTUnwrap(object["role_capabilities"] as? [String: Any])
         XCTAssertEqual(Set(capabilities.keys), ["controller", "controlled", "file_transfer", "unattended"])
         XCTAssertEqual(capabilities["controller"] as? Bool, true)

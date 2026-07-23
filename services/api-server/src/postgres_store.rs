@@ -14,14 +14,18 @@ use tracing::error;
 
 use crate::model::*;
 use crate::security::{
-    canonical_fields, constant_time_sha256_eq, sha256, sha256_hex, verify_password, verify_totp,
+    canonical_fields, constant_time_sha256_eq, hex_encode, sha256, sha256_hex, verify_password,
+    verify_totp,
 };
 use crate::store::{
-    account_session_revocation_audit, apply_device_management, device_management_audit,
-    device_management_revokes_account_sessions, device_management_session_close_reason,
-    device_management_transition_allowed, forced_session_close_records,
+    account_session_revocation_audit, apply_device_management, device_key_rotation_authority_audit,
+    device_management_authority_audits, device_management_revokes_account_sessions,
+    device_management_session_close_reason, device_management_transition_allowed,
+    device_registration_result_audit, forced_session_close_records,
+    recovery_delivery_binding_is_valid, replayed_device_registration_result,
     risk_challenge_required_methods_are_valid, trusted_device_revocation_audit,
-    validate_login_challenge_authority, validate_login_finish_artifacts,
+    validate_device_registration_authority, validate_login_challenge_authority,
+    validate_login_finish_artifacts, validate_login_finish_authority_binding,
     validate_login_finish_command_shape, verify_registration_signature, CreateSessionCommand,
     CreateSessionOutcome, DeviceAuthorityChange, DeviceKeyRotation, DeviceManagementAction,
     DeviceManagementCommand, DeviceManagementOutcome, DeviceRegistrationCommand,
@@ -30,7 +34,7 @@ use crate::store::{
     RiskChallengeCreationOutcome, RiskChallengeVerification, RiskChallengeVerificationOutcome,
     SessionDeviceAuthority, StepUpAction, StepUpExpectation, StoreError, TotpEnrollmentCompletion,
     TotpEnrollmentReplayLookup, TotpEnrollmentReplayOutcome, TransitionSessionCommand,
-    TransitionSessionOutcome,
+    TransitionSessionOutcome, DEVICE_REGISTRATION_RESULT_METADATA_KEY,
 };
 
 const MFA_ENVELOPE_VERSION: u8 = 1;
@@ -220,7 +224,7 @@ impl Repository for PostgresRepository {
                 .await
                 .map_err(log_store_error)?;
             let Some(account_row) = account_row else {
-                return Ok(LoginFinishOutcome::Rejected);
+                return Ok(LoginFinishOutcome::InvalidChallenge);
             };
             let account_active = account_row.get::<_, String>("status") == "active";
             let account_updated_at =
@@ -234,7 +238,14 @@ impl Repository for PostgresRepository {
                             operation_binding_hash, risk_level, required_methods, status,
                             attempts_remaining, ip_address::text AS ip_address, user_agent,
                             expires_at_epoch_millis, created_at_epoch_millis,
-                            verified_at_epoch_millis, consumed_at_epoch_millis
+                            verified_at_epoch_millis, consumed_at_epoch_millis,
+                            login_device_state, login_device_id,
+                            login_account_updated_at_epoch_millis, login_device_public_key,
+                            login_device_public_key_fingerprint, login_public_key_id,
+                            login_public_key_version, login_client_nonce, login_server_nonce,
+                            login_request_binding_hash, login_ip_address_hash,
+                            login_user_agent_hash, login_trusted_device_id,
+                            login_protocol_version, login_attempts_limit
                      FROM account_risk_challenges
                      WHERE risk_challenge_id=$1
                      FOR UPDATE",
@@ -243,12 +254,14 @@ impl Repository for PostgresRepository {
                 .await
                 .map_err(log_store_error)?;
             let Some(challenge_row) = challenge_row else {
-                return Ok(LoginFinishOutcome::Rejected);
+                return Ok(LoginFinishOutcome::InvalidChallenge);
             };
-            let mut challenge = risk_challenge_from_row(&challenge_row).map_err(|reason| {
-                error!(%reason, "PostgreSQL locked login challenge row is invalid");
-                StoreError::Unavailable
-            })?;
+            let authority =
+                login_challenge_authority_from_row(&challenge_row).map_err(|reason| {
+                    error!(%reason, "PostgreSQL locked login challenge row is invalid");
+                    StoreError::Unavailable
+                })?;
+            let mut challenge = authority.challenge;
             if challenge.account_id != command.account_id
                 || challenge.device_id != command.persistent_device_id
                 || challenge.purpose != "login_mfa"
@@ -259,6 +272,11 @@ impl Repository for PostgresRepository {
                     &command.challenge_binding_hash,
                 )
                 || challenge.required_methods != command.required_factors
+            {
+                return Ok(LoginFinishOutcome::InvalidChallenge);
+            }
+            if validate_login_finish_authority_binding(command, &challenge, &authority.context)
+                .is_err()
             {
                 return Ok(LoginFinishOutcome::InvalidChallenge);
             }
@@ -663,6 +681,7 @@ impl Repository for PostgresRepository {
                     .map_err(log_conflict_or_store_error)?;
             }
 
+            let mut trusted_device_revocation_audits = Vec::new();
             if let Some(trusted) = &command.trusted_device_to_create {
                 validate_trusted_device(trusted).map_err(|reason| {
                     error!(%reason, "PostgreSQL login finish rejected invalid trusted device");
@@ -680,15 +699,35 @@ impl Repository for PostgresRepository {
                 {
                     return Err(StoreError::Conflict);
                 }
-                transaction
-                    .execute(
+                let source_audit = command
+                    .audit_entries
+                    .iter()
+                    .find(|entry| entry.action == "trusted_device_added")
+                    .ok_or(StoreError::Conflict)?;
+                let revoked_rows = transaction
+                    .query(
                         "UPDATE trusted_controller_devices
                          SET status='revoked', revoked_at_epoch_millis=$3
-                         WHERE account_id=$1 AND controller_device_id=$2 AND status='active'",
+                         WHERE account_id=$1 AND controller_device_id=$2 AND status='active'
+                         RETURNING trusted_device_id, controller_device_id",
                         &[&command.account_id, &command.device_id, &now],
                     )
                     .await
                     .map_err(log_store_error)?;
+                for revoked_row in revoked_rows {
+                    let audit = trusted_device_revocation_audit(
+                        source_audit,
+                        revoked_row.get::<_, String>("trusted_device_id").as_str(),
+                        revoked_row
+                            .get::<_, String>("controller_device_id")
+                            .as_str(),
+                        "refreshed",
+                    );
+                    insert_audit_entry_strict(&transaction, &audit)
+                        .await
+                        .map_err(log_conflict_or_store_error)?;
+                    trusted_device_revocation_audits.push(audit);
+                }
                 insert_trusted_device_strict(&transaction, trusted)
                     .await
                     .map_err(log_conflict_or_persistence_error)?;
@@ -770,11 +809,13 @@ impl Repository for PostgresRepository {
                 command.account_session.clone(),
             );
             published.audit_logs.extend(
-                command
-                    .audit_entries
-                    .iter()
-                    .filter(|entry| entry.action != "device_enrollment_grant_issued")
-                    .cloned(),
+                trusted_device_revocation_audits.into_iter().chain(
+                    command
+                        .audit_entries
+                        .iter()
+                        .filter(|entry| entry.action != "device_enrollment_grant_issued")
+                        .cloned(),
+                ),
             );
             Ok(LoginFinishOutcome::Completed)
         })
@@ -1458,6 +1499,14 @@ impl Repository for PostgresRepository {
                 )
                 .await
                 .map_err(log_conflict_or_store_error)?;
+            let revocation_audit = account_session_revocation_audit(
+                audit_entry,
+                &old_session.account_session_id,
+                "refresh_replay",
+            );
+            insert_audit_entry_strict(&transaction, &revocation_audit)
+                .await
+                .map_err(log_conflict_or_store_error)?;
             insert_audit_entry_strict(&transaction, audit_entry)
                 .await
                 .map_err(log_conflict_or_store_error)?;
@@ -1468,6 +1517,7 @@ impl Repository for PostgresRepository {
             published
                 .account_sessions
                 .insert(replacement.account_session_id.clone(), replacement.clone());
+            published.audit_logs.push(revocation_audit);
             published.audit_logs.push(audit_entry.clone());
             Ok(true)
         })
@@ -2627,6 +2677,18 @@ impl Repository for PostgresRepository {
             if !account_exists {
                 return Err(StoreError::Conflict);
             }
+            let idempotency_claimed = transaction
+                .query_opt(
+                    "SELECT delivery_id FROM mfa_recovery_code_deliveries
+                     WHERE account_id=$1 AND idempotency_key_hash=$2",
+                    &[&delivery.account_id, &&delivery.idempotency_key_hash[..]],
+                )
+                .await
+                .map_err(log_store_error)?
+                .is_some();
+            if idempotency_claimed {
+                return Err(StoreError::Conflict);
+            }
             let session_active: bool = transaction
                 .query_opt(
                     "SELECT revoked_at_epoch_millis IS NULL
@@ -2824,14 +2886,8 @@ impl Repository for PostgresRepository {
                      JOIN account_sessions s
                        ON s.account_session_id=d.account_session_id
                       AND s.account_id=d.account_id
-                     WHERE d.account_id=$1 AND d.account_session_id=$2
-                       AND d.factor_id=$3 AND d.idempotency_key_hash=$4",
-                    &[
-                        &lookup.account_id,
-                        &lookup.account_session_id,
-                        &lookup.factor_id,
-                        &&lookup.idempotency_key_hash[..],
-                    ],
+                     WHERE d.account_id=$1 AND d.idempotency_key_hash=$2",
+                    &[&lookup.account_id, &&lookup.idempotency_key_hash[..]],
                 )
                 .await
                 .map_err(log_store_error)?;
@@ -2847,10 +2903,21 @@ impl Repository for PostgresRepository {
                 error!(%reason, "PostgreSQL MFA delivery replay row is invalid");
                 StoreError::Unavailable
             })?;
-            if !constant_time_sha256_eq(
-                &delivery.finish_request_binding_hash,
-                &lookup.finish_request_binding_hash,
-            ) {
+            if delivery.account_session_id != lookup.account_session_id
+                || delivery.factor_id != lookup.factor_id
+                || lookup
+                    .finish_request_binding_hash
+                    .as_ref()
+                    .is_some_and(|binding| {
+                        !constant_time_sha256_eq(&delivery.finish_request_binding_hash, binding)
+                    })
+                || lookup
+                    .client_ephemeral_public_key
+                    .as_ref()
+                    .is_some_and(|public_key| {
+                        !constant_time_sha256_eq(&delivery.client_ephemeral_public_key, public_key)
+                    })
+            {
                 return Ok(TotpEnrollmentReplayOutcome::BindingMismatch);
             }
             if delivery.acknowledged_at_epoch_millis.is_some()
@@ -3159,6 +3226,7 @@ impl Repository for PostgresRepository {
                 error!(%reason, "PostgreSQL locked enrollment grant row is invalid");
                 StoreError::Unavailable
             })?;
+            validate_device_registration_authority(&published, command, &grant)?;
             if !constant_time_sha256_eq(&grant.grant_secret_hash, &command.grant_secret_hash)
                 || grant.account_id != command.account_id
                 || grant.device_id != command.device.device_id
@@ -3179,15 +3247,19 @@ impl Repository for PostgresRepository {
 
             let challenge_row = transaction
                 .query_opt(
-                    "SELECT account_id, operation_binding_hash, status
+                    "SELECT account_id, operation_binding_hash, purpose, status,
+                            consumed_at_epoch_millis, login_device_id,
+                            login_device_public_key_fingerprint, login_protocol_version
                      FROM account_risk_challenges
                      WHERE risk_challenge_id=$1
                      FOR SHARE",
                     &[&grant.login_challenge_id],
                 )
                 .await
-                .map_err(log_store_error)?
-                .ok_or(StoreError::Unavailable)?;
+                .map_err(log_store_error)?;
+            let Some(challenge_row) = challenge_row else {
+                return Ok(DeviceRegistrationOutcome::InvalidGrant);
+            };
             let challenge_account_id: String = challenge_row.get("account_id");
             let challenge_binding_hash = fixed_32(
                 challenge_row.get::<_, Vec<u8>>("operation_binding_hash"),
@@ -3197,8 +3269,33 @@ impl Repository for PostgresRepository {
                 error!(%reason, "PostgreSQL enrollment challenge binding is invalid");
                 StoreError::Unavailable
             })?;
+            let challenge_public_key_fingerprint = fixed_32(
+                challenge_row.get::<_, Vec<u8>>("login_device_public_key_fingerprint"),
+                "account_risk_challenges.login_device_public_key_fingerprint",
+            )
+            .map_err(|reason| {
+                error!(%reason, "PostgreSQL enrollment challenge fingerprint is invalid");
+                StoreError::Unavailable
+            })?;
+            let challenge_protocol_version = u16::try_from(
+                challenge_row.get::<_, i32>("login_protocol_version"),
+            )
+            .map_err(|_| {
+                error!("PostgreSQL enrollment challenge protocol version is invalid");
+                StoreError::Unavailable
+            })?;
             if challenge_account_id != grant.account_id
+                || challenge_row.get::<_, String>("purpose") != "login_mfa"
                 || challenge_row.get::<_, String>("status") != "consumed"
+                || challenge_row
+                    .get::<_, Option<i64>>("consumed_at_epoch_millis")
+                    .is_none()
+                || challenge_row.get::<_, String>("login_device_id") != grant.device_id
+                || !constant_time_sha256_eq(
+                    &challenge_public_key_fingerprint,
+                    &grant.device_public_key_fingerprint,
+                )
+                || challenge_protocol_version != grant.protocol_version
                 || !constant_time_sha256_eq(
                     &challenge_binding_hash,
                     &grant.login_challenge_binding_hash,
@@ -3220,28 +3317,18 @@ impl Repository for PostgresRepository {
                 if grant.establish_trust != grant.registered_trusted_device_id.is_some() {
                     return Err(StoreError::Unavailable);
                 }
-                let existing = load_transaction_device(&transaction, &command.device.device_id)
-                    .await
-                    .map_err(log_persistence_error)?
-                    .ok_or(StoreError::Unavailable)?;
-                if existing.account_id != command.account_id
-                    || existing.public_key_id != registered_public_key_id
-                    || !constant_time_sha256_eq(
-                        &sha256(&existing.public_key),
-                        &grant.device_public_key_fingerprint,
-                    )
-                {
-                    return Err(StoreError::Conflict);
-                }
                 verify_replayed_device_trust(&transaction, &grant).await?;
+                let metadata =
+                    load_replayed_device_registration_metadata(&transaction, command, &grant)
+                        .await?;
+                let replayed = replayed_device_registration_result(
+                    &metadata,
+                    command,
+                    &grant,
+                    published.device_public_keys.get(registered_public_key_id),
+                )?;
                 transaction.commit().await.map_err(log_store_error)?;
-                published
-                    .devices
-                    .insert(existing.device_id.clone(), existing.clone());
-                published
-                    .device_enrollment_grants
-                    .insert(grant.grant_id.clone(), grant);
-                return Ok(DeviceRegistrationOutcome::Replayed(existing));
+                return Ok(DeviceRegistrationOutcome::Replayed(replayed));
             }
 
             if grant.expires_at_epoch_millis <= command.now_epoch_millis {
@@ -3254,21 +3341,24 @@ impl Repository for PostgresRepository {
                 return Err(StoreError::Unavailable);
             }
             let now = to_i64_lossless(command.now_epoch_millis);
-            let account_session_active: bool = transaction
-                .query_one(
-                    "SELECT EXISTS (
-                         SELECT 1 FROM account_sessions
-                         WHERE account_session_id=$1 AND account_id=$2
-                           AND revoked_at_epoch_millis IS NULL
-                           AND revoked_reason IS NULL
-                           AND expires_at_epoch_millis > $3
-                         FOR SHARE)",
+            let account_session = transaction
+                .query_opt(
+                    "SELECT mfa_verified FROM account_sessions
+                     WHERE account_session_id=$1 AND account_id=$2
+                       AND revoked_at_epoch_millis IS NULL
+                       AND revoked_reason IS NULL
+                       AND expires_at_epoch_millis > $3
+                     FOR SHARE",
                     &[&command.account_session_id, &command.account_id, &now],
                 )
                 .await
-                .map_err(log_store_error)?
-                .get(0);
-            if !account_session_active {
+                .map_err(log_store_error)?;
+            if account_session.is_none()
+                || (grant.establish_trust
+                    && !account_session
+                        .as_ref()
+                        .is_some_and(|row| row.get::<_, bool>("mfa_verified")))
+            {
                 return Ok(DeviceRegistrationOutcome::InvalidGrant);
             }
             if transaction
@@ -3368,7 +3458,8 @@ impl Repository for PostgresRepository {
             grant.registered_public_key_id = Some(command.device.public_key_id.clone());
             grant.registered_trusted_device_id =
                 registered_trusted_device_id.map(ToOwned::to_owned);
-            insert_audit_entry_strict(&transaction, &command.registration_audit_entry)
+            let registration_audit_entry = device_registration_result_audit(command)?;
+            insert_audit_entry_strict(&transaction, &registration_audit_entry)
                 .await
                 .map_err(log_conflict_or_store_error)?;
             insert_audit_entry_strict(&transaction, &command.grant_audit_entry)
@@ -3404,9 +3495,7 @@ impl Repository for PostgresRepository {
                         .ok_or(StoreError::Unavailable)?,
                 );
             }
-            published
-                .audit_logs
-                .push(command.registration_audit_entry.clone());
+            published.audit_logs.push(registration_audit_entry);
             published.audit_logs.push(command.grant_audit_entry.clone());
             Ok(DeviceRegistrationOutcome::Created(command.device.clone()))
         })
@@ -3454,7 +3543,7 @@ impl Repository for PostgresRepository {
                 .await
                 .map_err(log_store_error)?
                 .ok_or(StoreError::Conflict)?;
-            let (mut current, _) = device_from_row(&row).map_err(|reason| {
+            let (current, _) = device_from_row(&row).map_err(|reason| {
                 error!(%reason, "PostgreSQL rotation device row is invalid");
                 StoreError::Unavailable
             })?;
@@ -3479,6 +3568,7 @@ impl Repository for PostgresRepository {
             if duplicate || rotation.new_public_key_id == rotation.current_public_key_id {
                 return Err(StoreError::Conflict);
             }
+            let rotation_audit = device_key_rotation_authority_audit(rotation, &current)?;
 
             let affected_rows = transaction
                 .query(
@@ -3498,19 +3588,16 @@ impl Repository for PostgresRepository {
                 return Err(StoreError::Conflict);
             }
             let old_public_key_fingerprint = sha256(&current.public_key);
-            current.public_key_id = rotation.new_public_key_id.clone();
-            current.public_key = rotation.new_public_key;
-            current.public_key_version = rotation.new_public_key_version;
-            current.public_key_revoked_at_epoch_millis = None;
-            current.updated_at_epoch_millis = current
-                .updated_at_epoch_millis
-                .max(rotation.step_up.now_epoch_millis);
-            transaction
-                .execute(
+            let revoked_trusted_rows = transaction
+                .query(
                     "UPDATE trusted_controller_devices
                      SET status='revoked', revoked_at_epoch_millis=$4
                      WHERE account_id=$1 AND controller_device_id=$2
-                       AND device_fingerprint_hash=$3 AND status='active'",
+                       AND device_fingerprint_hash=$3 AND status='active'
+                     RETURNING trusted_device_id, account_id, controller_device_id,
+                               device_fingerprint_hash, trust_level, status, trust_proof_type,
+                               created_at_epoch_millis, last_used_at_epoch_millis,
+                               expires_at_epoch_millis, revoked_at_epoch_millis",
                     &[
                         &rotation.step_up.account_id,
                         &rotation.step_up.device_id,
@@ -3520,6 +3607,27 @@ impl Repository for PostgresRepository {
                 )
                 .await
                 .map_err(log_store_error)?;
+            let mut revoked_trusted_devices = revoked_trusted_rows
+                .iter()
+                .map(trusted_device_from_row)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|reason| {
+                    error!(%reason, "PostgreSQL rotation returned invalid trusted device");
+                    StoreError::Unavailable
+                })?;
+            revoked_trusted_devices
+                .sort_by(|left, right| left.trusted_device_id.cmp(&right.trusted_device_id));
+            let trust_revocation_audits = revoked_trusted_devices
+                .iter()
+                .map(|trusted| {
+                    trusted_device_revocation_audit(
+                        &rotation_audit,
+                        &trusted.trusted_device_id,
+                        &trusted.controller_device_id,
+                        "device_key_rotated",
+                    )
+                })
+                .collect::<Vec<_>>();
             let version =
                 i32::try_from(rotation.new_public_key_version).map_err(|_| StoreError::Conflict)?;
             let current_version = i32::try_from(rotation.current_public_key_version)
@@ -3548,6 +3656,10 @@ impl Repository for PostgresRepository {
             if updated != 1 {
                 return Err(StoreError::Conflict);
             }
+            let updated_device = load_transaction_device(&transaction, &rotation.step_up.device_id)
+                .await
+                .map_err(log_persistence_error)?
+                .ok_or(StoreError::Unavailable)?;
             transaction
                 .execute(
                     "UPDATE sessions SET relay_token_epoch=relay_token_epoch+1,
@@ -3571,7 +3683,7 @@ impl Repository for PostgresRepository {
                 let (event, audit) = forced_session_close_records(
                     &session,
                     from_status,
-                    &rotation.audit_entry,
+                    &rotation_audit,
                     "device_key_rotated",
                 );
                 insert_session_event_strict(&transaction, &event)
@@ -3583,7 +3695,12 @@ impl Repository for PostgresRepository {
                 forced_session_events.push(event);
                 forced_session_audits.push(audit);
             }
-            insert_audit_entry_strict(&transaction, &rotation.audit_entry)
+            for audit in &trust_revocation_audits {
+                insert_audit_entry_strict(&transaction, audit)
+                    .await
+                    .map_err(log_conflict_or_store_error)?;
+            }
+            insert_audit_entry_strict(&transaction, &rotation_audit)
                 .await
                 .map_err(log_conflict_or_store_error)?;
             transaction.commit().await.map_err(log_store_error)?;
@@ -3601,21 +3718,10 @@ impl Repository for PostgresRepository {
             {
                 old_key.revoked_at_epoch_millis = Some(rotation.step_up.now_epoch_millis);
             }
-            for trusted in published
-                .trusted_controller_devices
-                .values_mut()
-                .filter(|trusted| {
-                    trusted.account_id == rotation.step_up.account_id
-                        && trusted.controller_device_id == rotation.step_up.device_id
-                        && trusted.status == TrustedDeviceStatus::Active
-                        && constant_time_sha256_eq(
-                            &trusted.device_fingerprint_hash,
-                            &old_public_key_fingerprint,
-                        )
-                })
-            {
-                trusted.status = TrustedDeviceStatus::Revoked;
-                trusted.revoked_at_epoch_millis = Some(rotation.step_up.now_epoch_millis);
+            for trusted in revoked_trusted_devices {
+                published
+                    .trusted_controller_devices
+                    .insert(trusted.trusted_device_id.clone(), trusted);
             }
             published.device_public_keys.insert(
                 rotation.new_public_key_id.clone(),
@@ -3630,7 +3736,7 @@ impl Repository for PostgresRepository {
             );
             published
                 .devices
-                .insert(current.device_id.clone(), current.clone());
+                .insert(updated_device.device_id.clone(), updated_device.clone());
             for event in &forced_session_events {
                 if let Some(session) = &event.result_session {
                     published
@@ -3642,9 +3748,10 @@ impl Repository for PostgresRepository {
                 .session_events
                 .extend(forced_session_events.iter().cloned());
             published.audit_logs.extend(forced_session_audits);
-            published.audit_logs.push(rotation.audit_entry.clone());
+            published.audit_logs.extend(trust_revocation_audits);
+            published.audit_logs.push(rotation_audit);
             Ok(DeviceAuthorityChange {
-                device: Box::new(current),
+                device: Box::new(updated_device),
                 closed_session_events: forced_session_events,
             })
         })
@@ -3658,6 +3765,23 @@ impl Repository for PostgresRepository {
             let mut published = self.database.write().await;
             let mut client = self.client.lock().await;
             let transaction = client.transaction().await.map_err(log_store_error)?;
+            if command
+                .action
+                .is_some_and(device_management_revokes_account_sessions)
+            {
+                let account_active = transaction
+                    .query_opt(
+                        "SELECT account_id FROM accounts
+                         WHERE account_id=$1 AND status='active' FOR UPDATE",
+                        &[&command.account_id],
+                    )
+                    .await
+                    .map_err(log_store_error)?
+                    .is_some();
+                if !account_active {
+                    return Err(StoreError::Conflict);
+                }
+            }
             let mut lock_ids = vec![
                 command.actor_device_id.clone(),
                 command.target_device_id.clone(),
@@ -3734,6 +3858,15 @@ impl Repository for PostgresRepository {
                 .iter()
                 .map(|row| row.get::<_, String>("session_id"))
                 .collect::<Vec<_>>();
+            let authority_audits =
+                device_management_authority_audits(command, &target, &affected_session_ids)?;
+            let authority_audit = authority_audits.first().ok_or(StoreError::Unavailable)?;
+            let trust_revocation_reason = command.action.and_then(|action| match action {
+                DeviceManagementAction::Disable => Some("device_disabled"),
+                DeviceManagementAction::Unbind => Some("device_unbound"),
+                DeviceManagementAction::RevokePublicKey => Some("device_public_key_revoked"),
+                DeviceManagementAction::Restore => None,
+            });
 
             apply_device_management(&mut target, command);
             let now = to_i64_lossless(command.now_epoch_millis);
@@ -3781,30 +3914,80 @@ impl Repository for PostgresRepository {
                 )
                 .await
                 .map_err(log_store_error)?;
+            let mut revoked_trusted_devices = Vec::new();
+            let mut revoked_account_sessions = Vec::new();
+            let mut authority_revocation_audits = Vec::new();
             if tightening {
-                transaction
-                    .execute(
+                let trusted_rows = transaction
+                    .query(
                         "UPDATE trusted_controller_devices
                          SET status='revoked', revoked_at_epoch_millis=$3
-                         WHERE account_id=$1 AND controller_device_id=$2 AND status='active'",
+                         WHERE account_id=$1 AND controller_device_id=$2 AND status='active'
+                         RETURNING trusted_device_id, account_id, controller_device_id,
+                                   device_fingerprint_hash, trust_level, status, trust_proof_type,
+                                   created_at_epoch_millis, last_used_at_epoch_millis,
+                                   expires_at_epoch_millis, revoked_at_epoch_millis",
                         &[&command.account_id, &command.target_device_id, &now],
                     )
                     .await
                     .map_err(log_store_error)?;
+                revoked_trusted_devices = trusted_rows
+                    .iter()
+                    .map(trusted_device_from_row)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|reason| {
+                        error!(%reason, "PostgreSQL device management returned invalid trusted device");
+                        StoreError::Unavailable
+                    })?;
+                revoked_trusted_devices
+                    .sort_by(|left, right| left.trusted_device_id.cmp(&right.trusted_device_id));
+                let reason = trust_revocation_reason.ok_or(StoreError::Unavailable)?;
+                authority_revocation_audits.extend(revoked_trusted_devices.iter().map(|trusted| {
+                    trusted_device_revocation_audit(
+                        authority_audit,
+                        &trusted.trusted_device_id,
+                        &trusted.controller_device_id,
+                        reason,
+                    )
+                }));
                 if command
                     .action
                     .is_some_and(device_management_revokes_account_sessions)
                 {
-                    transaction
-                        .execute(
+                    let account_session_rows = transaction
+                        .query(
                             "UPDATE account_sessions
                              SET revoked_at_epoch_millis=$2, revoked_reason='device_unbound',
                                  updated_at_epoch_millis=GREATEST(updated_at_epoch_millis,$2)
-                             WHERE account_id=$1 AND revoked_at_epoch_millis IS NULL",
+                             WHERE account_id=$1 AND revoked_at_epoch_millis IS NULL
+                               AND revoked_reason IS NULL
+                             RETURNING account_session_id, account_id, refresh_token_hash,
+                                       mfa_verified, expires_at_epoch_millis,
+                                       revoked_at_epoch_millis, revoked_reason",
                             &[&command.account_id, &now],
                         )
                         .await
                         .map_err(log_store_error)?;
+                    revoked_account_sessions = account_session_rows
+                        .iter()
+                        .map(account_session_from_row)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|reason| {
+                            error!(%reason, "PostgreSQL device management returned invalid account session");
+                            StoreError::Unavailable
+                        })?;
+                    revoked_account_sessions.sort_by(|left, right| {
+                        left.account_session_id.cmp(&right.account_session_id)
+                    });
+                    authority_revocation_audits.extend(revoked_account_sessions.iter().map(
+                        |session| {
+                            account_session_revocation_audit(
+                                authority_audit,
+                                &session.account_session_id,
+                                "device_unbound",
+                            )
+                        },
+                    ));
                 }
                 transaction
                     .execute(
@@ -3833,7 +4016,7 @@ impl Repository for PostgresRepository {
                 let (event, audit) = forced_session_close_records(
                     &session,
                     from_status,
-                    &command.audit_entry,
+                    authority_audit,
                     close_reason.ok_or(StoreError::Unavailable)?,
                 );
                 insert_session_event_strict(&transaction, &event)
@@ -3845,10 +4028,20 @@ impl Repository for PostgresRepository {
                 forced_session_events.push(event);
                 forced_session_audits.push(audit);
             }
-            let audit = device_management_audit(command, &affected_session_ids)?;
-            insert_audit_entry_strict(&transaction, &audit)
+            for audit in &authority_revocation_audits {
+                insert_audit_entry_strict(&transaction, audit)
+                    .await
+                    .map_err(log_conflict_or_store_error)?;
+            }
+            for audit in &authority_audits {
+                insert_audit_entry_strict(&transaction, audit)
+                    .await
+                    .map_err(log_conflict_or_store_error)?;
+            }
+            target = load_transaction_device(&transaction, &command.target_device_id)
                 .await
-                .map_err(log_conflict_or_store_error)?;
+                .map_err(log_persistence_error)?
+                .ok_or(StoreError::Unavailable)?;
             transaction.commit().await.map_err(log_store_error)?;
 
             published
@@ -3859,33 +4052,17 @@ impl Repository for PostgresRepository {
                     key.revoked_at_epoch_millis = Some(revoked_at);
                 }
             }
-            if tightening {
-                for trusted in published
+            for trusted in revoked_trusted_devices {
+                published
                     .trusted_controller_devices
-                    .values_mut()
-                    .filter(|trusted| {
-                        trusted.account_id == command.account_id
-                            && trusted.controller_device_id == command.target_device_id
-                            && trusted.status == TrustedDeviceStatus::Active
-                    })
-                {
-                    trusted.status = TrustedDeviceStatus::Revoked;
-                    trusted.revoked_at_epoch_millis = Some(command.now_epoch_millis);
-                }
-                if command
-                    .action
-                    .is_some_and(device_management_revokes_account_sessions)
-                {
-                    for account_session in
-                        published.account_sessions.values_mut().filter(|session| {
-                            session.account_id == command.account_id
-                                && session.revoked_at_epoch_millis.is_none()
-                        })
-                    {
-                        account_session.revoked_at_epoch_millis = Some(command.now_epoch_millis);
-                        account_session.revoked_reason = Some("device_unbound".to_owned());
-                    }
-                }
+                    .insert(trusted.trusted_device_id.clone(), trusted);
+            }
+            for account_session in revoked_account_sessions {
+                published
+                    .account_sessions
+                    .insert(account_session.account_session_id.clone(), account_session);
+            }
+            if tightening {
                 for event in &forced_session_events {
                     if let Some(session) = &event.result_session {
                         published
@@ -3898,7 +4075,8 @@ impl Repository for PostgresRepository {
                 .session_events
                 .extend(forced_session_events.iter().cloned());
             published.audit_logs.extend(forced_session_audits);
-            published.audit_logs.push(audit);
+            published.audit_logs.extend(authority_revocation_audits);
+            published.audit_logs.extend(authority_audits);
             Ok(DeviceManagementOutcome::Updated(DeviceAuthorityChange {
                 device: Box::new(target),
                 closed_session_events: forced_session_events,
@@ -3908,7 +4086,15 @@ impl Repository for PostgresRepository {
 }
 
 fn log_store_error(error: tokio_postgres::Error) -> StoreError {
-    error!(error = %error, "PostgreSQL repository operation failed");
+    let database_error = error.as_db_error();
+    error!(
+        error = %error,
+        sqlstate = database_error.map(|value| value.code().code()),
+        constraint = database_error.and_then(|value| value.constraint()),
+        table = database_error.and_then(|value| value.table()),
+        column = database_error.and_then(|value| value.column()),
+        "PostgreSQL repository operation failed"
+    );
     StoreError::Unavailable
 }
 
@@ -4362,7 +4548,10 @@ fn login_challenge_authority_from_row(row: &Row) -> Result<LoginChallengeAuthori
         attempts_limit,
     };
     let authority = LoginChallengeAuthority { challenge, context };
-    validate_login_challenge_authority(&authority)
+    let mut authority_shape = authority.clone();
+    authority_shape.challenge.status = RiskChallengeStatus::Issued;
+    authority_shape.challenge.attempts_remaining = authority_shape.context.attempts_limit;
+    validate_login_challenge_authority(&authority_shape)
         .map_err(|_| "account_risk_challenges login context binding is invalid".to_owned())?;
     Ok(authority)
 }
@@ -5176,6 +5365,61 @@ async fn persist_risk_challenges(
     after: &Database,
 ) -> Result<(), PersistenceError> {
     for (id, challenge) in changed_values(&before.risk_challenges, &after.risk_challenges) {
+        if challenge.purpose == "login_mfa" {
+            let previous = before.risk_challenges.get(id).ok_or_else(|| {
+                PersistenceError::Data(format!(
+                    "login challenge {id} must be created through the specialized repository API"
+                ))
+            })?;
+            let mut expected = previous.clone();
+            expected.status = challenge.status;
+            expected.attempts_remaining = challenge.attempts_remaining;
+            expected.verified_at_epoch_millis = challenge.verified_at_epoch_millis;
+            expected.consumed_at_epoch_millis = challenge.consumed_at_epoch_millis;
+            if &expected != challenge {
+                return Err(PersistenceError::Data(format!(
+                    "login challenge {id} immutable authority fields changed"
+                )));
+            }
+
+            let old_attempts_remaining = i16::from(previous.attempts_remaining);
+            let attempts_remaining = i16::from(challenge.attempts_remaining);
+            let old_verified = previous.verified_at_epoch_millis.map(to_i64_lossless);
+            let verified = challenge.verified_at_epoch_millis.map(to_i64_lossless);
+            let old_consumed = previous.consumed_at_epoch_millis.map(to_i64_lossless);
+            let consumed = challenge.consumed_at_epoch_millis.map(to_i64_lossless);
+            let affected = transaction
+                .execute(
+                    "UPDATE account_risk_challenges
+                     SET status=$3, attempts_remaining=$4,
+                         verified_at_epoch_millis=$5,
+                         consumed_at_epoch_millis=$6
+                     WHERE risk_challenge_id=$1 AND account_id=$2
+                       AND purpose='login_mfa'
+                       AND status=$7 AND attempts_remaining=$8
+                       AND verified_at_epoch_millis IS NOT DISTINCT FROM $9
+                       AND consumed_at_epoch_millis IS NOT DISTINCT FROM $10",
+                    &[
+                        id,
+                        &challenge.account_id,
+                        &risk_challenge_status_name(challenge.status),
+                        &attempts_remaining,
+                        &verified,
+                        &consumed,
+                        &risk_challenge_status_name(previous.status),
+                        &old_attempts_remaining,
+                        &old_verified,
+                        &old_consumed,
+                    ],
+                )
+                .await?;
+            if affected != 1 {
+                return Err(PersistenceError::Data(format!(
+                    "login challenge {id} changed concurrently or is missing"
+                )));
+            }
+            continue;
+        }
         validate_fixed_enum(
             &challenge.purpose,
             "account_risk_challenges.purpose",
@@ -6214,6 +6458,7 @@ fn validate_recovery_code_delivery(delivery: &RecoveryCodeDelivery) -> Result<()
         || delivery.factor_id.trim().is_empty()
         || delivery.recovery_code_count == 0
         || delivery.ciphertext.len() < 16
+        || !recovery_delivery_binding_is_valid(delivery)
     {
         return Err("mfa_recovery_code_deliveries contains invalid required data".to_owned());
     }
@@ -6337,6 +6582,47 @@ async fn load_transaction_device(
                 .map_err(PersistenceError::Data)
         })
         .transpose()
+}
+
+async fn load_replayed_device_registration_metadata(
+    transaction: &Transaction<'_>,
+    command: &DeviceRegistrationCommand,
+    grant: &DeviceEnrollmentGrant,
+) -> Result<BTreeMap<String, Value>, StoreError> {
+    let binding_hash = hex_encode(&command.registration_request_binding_hash);
+    let rows = transaction
+        .query(
+            "SELECT metadata FROM audit_logs
+             WHERE action='device_registered' AND result='success'
+               AND actor_account_id=$1 AND target_device_id=$2
+               AND metadata -> ($3::text) ->> 'grant_id'=$4
+               AND metadata -> ($3::text) ->> 'registration_request_binding_hash'=$5
+             ORDER BY created_at_epoch_millis, audit_id
+             LIMIT 2
+             FOR SHARE",
+            &[
+                &command.account_id,
+                &command.device.device_id,
+                &DEVICE_REGISTRATION_RESULT_METADATA_KEY,
+                &grant.grant_id,
+                &binding_hash,
+            ],
+        )
+        .await
+        .map_err(log_store_error)?;
+    if rows.len() != 1 {
+        return Err(StoreError::Unavailable);
+    }
+    rows[0]
+        .get::<_, Value>("metadata")
+        .as_object()
+        .ok_or(StoreError::Unavailable)
+        .map(|metadata| {
+            metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
 }
 
 async fn verify_replayed_device_trust(
@@ -6723,6 +7009,7 @@ fn idempotency_storage_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::device_registration_binding_hash;
 
     fn issued_risk_challenge(
         risk_challenge_id: String,
@@ -6754,7 +7041,7 @@ mod tests {
             audit_id: format!("audit-{}", challenge.risk_challenge_id),
             actor_type: "account".into(),
             actor_account_id: Some(challenge.account_id.clone()),
-            actor_device_id: challenge.device_id.clone(),
+            actor_device_id: None,
             actor_role: None,
             actor_service: None,
             target_device_id: challenge.device_id.clone(),
@@ -6775,6 +7062,1169 @@ mod tests {
         audit.result = "failure".into();
         audit.reason = Some("cancelled".into());
         audit
+    }
+
+    fn login_audit(
+        audit_id: impl Into<String>,
+        account_id: &str,
+        action: &str,
+        result: &str,
+        now_epoch_millis: u64,
+    ) -> AuditEntry {
+        AuditEntry {
+            audit_id: audit_id.into(),
+            actor_type: "account".into(),
+            actor_account_id: Some(account_id.to_owned()),
+            actor_device_id: None,
+            actor_role: None,
+            actor_service: None,
+            target_device_id: None,
+            session_id: None,
+            action: action.to_owned(),
+            result: result.to_owned(),
+            reason: None,
+            metadata: BTreeMap::new(),
+            request_id: format!("request-{action}"),
+            created_at_epoch_millis: now_epoch_millis,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn registered_login_authority(
+        challenge_id: &str,
+        account_id: &str,
+        account_updated_at_epoch_millis: u64,
+        device_id: &str,
+        public_key_id: &str,
+        device_public_key: [u8; 32],
+        operation_binding_hash: [u8; 32],
+        issued_at_epoch_millis: u64,
+    ) -> LoginChallengeAuthority {
+        let required_factors = vec!["totp".to_owned(), "recovery_code".to_owned()];
+        LoginChallengeAuthority {
+            challenge: RiskChallenge {
+                risk_challenge_id: challenge_id.to_owned(),
+                account_id: account_id.to_owned(),
+                device_id: Some(device_id.to_owned()),
+                purpose: "login_mfa".into(),
+                operation_binding_hash,
+                risk_level: "low".into(),
+                required_methods: required_factors.clone(),
+                status: RiskChallengeStatus::Issued,
+                attempts_remaining: 5,
+                ip_address: Some("127.0.0.1".into()),
+                user_agent: Some("postgres-login-audit-test".into()),
+                expires_at_epoch_millis: issued_at_epoch_millis + 300_000,
+                created_at_epoch_millis: issued_at_epoch_millis,
+                verified_at_epoch_millis: None,
+                consumed_at_epoch_millis: None,
+            },
+            context: LoginChallengeContext {
+                device_state: LoginDeviceState::Registered,
+                device_id: device_id.to_owned(),
+                account_updated_at_epoch_millis,
+                device_public_key,
+                device_public_key_fingerprint: sha256(&device_public_key),
+                public_key_id: Some(public_key_id.to_owned()),
+                public_key_version: 1,
+                client_nonce: [31; 32],
+                server_nonce: [32; 32],
+                login_request_binding_hash: [33; 32],
+                login_challenge_binding_hash: operation_binding_hash,
+                ip_address_hash: [34; 32],
+                user_agent_hash: [35; 32],
+                required_factors,
+                trusted_device_id: None,
+                protocol_version: 1,
+                issued_at_epoch_millis,
+                attempts_limit: 5,
+            },
+        }
+    }
+
+    fn mfa_login_finish_command(
+        authority: &LoginChallengeAuthority,
+        factor_kind: &str,
+        factor_code: &str,
+        session_id: &str,
+        trusted_device_id: &str,
+        audit_prefix: &str,
+        now_epoch_millis: u64,
+    ) -> LoginFinishCommand {
+        let account_id = authority.challenge.account_id.as_str();
+        let device_id = authority.context.device_id.as_str();
+        let (trust_proof_type, trust_level, trust_ttl) = match factor_kind {
+            "totp" => ("device_signature_and_mfa", "standard", 2_592_000_000),
+            "recovery_code" => (
+                "device_signature_and_recovery_code",
+                "high_risk_step_up_required",
+                86_400_000,
+            ),
+            _ => panic!("unsupported login test factor: {factor_kind}"),
+        };
+        let mut audit_entries = vec![
+            login_audit(
+                format!("{audit_prefix}-mfa"),
+                account_id,
+                "mfa_challenge_succeeded",
+                "success",
+                now_epoch_millis,
+            ),
+            login_audit(
+                format!("{audit_prefix}-login"),
+                account_id,
+                "login_succeeded",
+                "success",
+                now_epoch_millis,
+            ),
+            login_audit(
+                format!("{audit_prefix}-trust"),
+                account_id,
+                "trusted_device_added",
+                "success",
+                now_epoch_millis,
+            ),
+        ];
+        if factor_kind == "recovery_code" {
+            audit_entries.push(login_audit(
+                format!("{audit_prefix}-recovery"),
+                account_id,
+                "mfa_recovery_code_used",
+                "success",
+                now_epoch_millis,
+            ));
+        }
+        LoginFinishCommand {
+            challenge_id: authority.challenge.risk_challenge_id.clone(),
+            account_id: account_id.to_owned(),
+            account_updated_at_epoch_millis: authority.context.account_updated_at_epoch_millis,
+            persistent_device_id: Some(device_id.to_owned()),
+            device_id: device_id.to_owned(),
+            public_key_id: authority.context.public_key_id.clone(),
+            public_key_version: authority.context.public_key_version,
+            device_public_key_fingerprint: authority.context.device_public_key_fingerprint,
+            challenge_binding_hash: authority.challenge.operation_binding_hash,
+            required_factors: authority.context.required_factors.clone(),
+            factor_kind: Some(factor_kind.to_owned()),
+            factor_code: Some(factor_code.to_owned()),
+            trusted_device_id_to_use: None,
+            account_session: AccountSession {
+                account_session_id: session_id.to_owned(),
+                account_id: account_id.to_owned(),
+                refresh_token_hash: sha256(format!("refresh-{session_id}").as_bytes()),
+                mfa_verified: true,
+                expires_at_epoch_millis: now_epoch_millis + 600_000,
+                revoked_at_epoch_millis: None,
+                revoked_reason: None,
+            },
+            enrollment_grant: None,
+            trusted_device_to_create: Some(TrustedControllerDevice {
+                trusted_device_id: trusted_device_id.to_owned(),
+                account_id: account_id.to_owned(),
+                controller_device_id: device_id.to_owned(),
+                device_fingerprint_hash: authority.context.device_public_key_fingerprint,
+                trust_level: trust_level.into(),
+                status: TrustedDeviceStatus::Active,
+                trust_proof_type: trust_proof_type.into(),
+                created_at_epoch_millis: now_epoch_millis,
+                last_used_at_epoch_millis: None,
+                expires_at_epoch_millis: now_epoch_millis + trust_ttl,
+                revoked_at_epoch_millis: None,
+            }),
+            audit_entries,
+            failure_audit_entry: login_audit(
+                format!("{audit_prefix}-failure"),
+                account_id,
+                "mfa_challenge_failed",
+                "failure",
+                now_epoch_millis,
+            ),
+            now_epoch_millis,
+        }
+    }
+
+    fn recovery_login_finish_command(
+        authority: &LoginChallengeAuthority,
+        recovery_code: &str,
+        session_id: &str,
+        trusted_device_id: &str,
+        audit_prefix: &str,
+        now_epoch_millis: u64,
+    ) -> LoginFinishCommand {
+        mfa_login_finish_command(
+            authority,
+            "recovery_code",
+            recovery_code,
+            session_id,
+            trusted_device_id,
+            audit_prefix,
+            now_epoch_millis,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn trusted_login_authority(
+        challenge_id: &str,
+        account_id: &str,
+        account_updated_at_epoch_millis: u64,
+        device_id: &str,
+        public_key_id: &str,
+        device_public_key: [u8; 32],
+        trusted_device_id: &str,
+        operation_binding_hash: [u8; 32],
+        issued_at_epoch_millis: u64,
+    ) -> LoginChallengeAuthority {
+        let mut authority = registered_login_authority(
+            challenge_id,
+            account_id,
+            account_updated_at_epoch_millis,
+            device_id,
+            public_key_id,
+            device_public_key,
+            operation_binding_hash,
+            issued_at_epoch_millis,
+        );
+        authority.challenge.required_methods.clear();
+        authority.context.required_factors.clear();
+        authority.context.trusted_device_id = Some(trusted_device_id.to_owned());
+        authority
+    }
+
+    fn trusted_login_finish_command(
+        authority: &LoginChallengeAuthority,
+        session_id: &str,
+        audit_prefix: &str,
+        now_epoch_millis: u64,
+    ) -> LoginFinishCommand {
+        let account_id = authority.challenge.account_id.as_str();
+        let device_id = authority.context.device_id.as_str();
+        LoginFinishCommand {
+            challenge_id: authority.challenge.risk_challenge_id.clone(),
+            account_id: account_id.to_owned(),
+            account_updated_at_epoch_millis: authority.context.account_updated_at_epoch_millis,
+            persistent_device_id: Some(device_id.to_owned()),
+            device_id: device_id.to_owned(),
+            public_key_id: authority.context.public_key_id.clone(),
+            public_key_version: authority.context.public_key_version,
+            device_public_key_fingerprint: authority.context.device_public_key_fingerprint,
+            challenge_binding_hash: authority.challenge.operation_binding_hash,
+            required_factors: Vec::new(),
+            factor_kind: None,
+            factor_code: None,
+            trusted_device_id_to_use: authority.context.trusted_device_id.clone(),
+            account_session: AccountSession {
+                account_session_id: session_id.to_owned(),
+                account_id: account_id.to_owned(),
+                refresh_token_hash: sha256(format!("refresh-{session_id}").as_bytes()),
+                mfa_verified: true,
+                expires_at_epoch_millis: now_epoch_millis + 600_000,
+                revoked_at_epoch_millis: None,
+                revoked_reason: None,
+            },
+            enrollment_grant: None,
+            trusted_device_to_create: None,
+            audit_entries: vec![
+                login_audit(
+                    format!("{audit_prefix}-mfa"),
+                    account_id,
+                    "mfa_challenge_succeeded",
+                    "success",
+                    now_epoch_millis,
+                ),
+                login_audit(
+                    format!("{audit_prefix}-login"),
+                    account_id,
+                    "login_succeeded",
+                    "success",
+                    now_epoch_millis,
+                ),
+            ],
+            failure_audit_entry: login_audit(
+                format!("{audit_prefix}-failure"),
+                account_id,
+                "mfa_challenge_failed",
+                "failure",
+                now_epoch_millis,
+            ),
+            now_epoch_millis,
+        }
+    }
+
+    struct PostgresLoginFixture {
+        account_id: String,
+        email: String,
+        device_id: String,
+        public_key_id: String,
+        device_public_key: [u8; 32],
+        factor_id: String,
+        totp_secret: String,
+        recovery_code_id: String,
+        recovery_code: String,
+        created_at_epoch_millis: u64,
+    }
+
+    impl PostgresLoginFixture {
+        fn random(prefix: &str) -> Self {
+            let suffix = crate::security::random_uuid_v4();
+            Self {
+                account_id: format!("{prefix}-account-{suffix}"),
+                email: format!("{prefix}-{suffix}@example.com"),
+                device_id: format!("{prefix}-device-{suffix}"),
+                public_key_id: format!("{prefix}-key-{suffix}"),
+                device_public_key: sha256(format!("{prefix}-public-key-{suffix}").as_bytes()),
+                factor_id: format!("{prefix}-factor-{suffix}"),
+                totp_secret: crate::security::generate_totp_secret(),
+                recovery_code_id: format!("{prefix}-recovery-{suffix}"),
+                recovery_code: format!("{prefix}-recovery-code-{suffix}"),
+                created_at_epoch_millis: now_epoch_millis(),
+            }
+        }
+    }
+
+    async fn postgres_test_client(database_url: &str) -> Result<Client, String> {
+        let (client, connection) = tokio_postgres::connect(database_url, NoTls)
+            .await
+            .map_err(|error| format!("connect PostgreSQL test client: {error}"))?;
+        tokio::spawn(async move {
+            if let Err(connection_error) = connection.await {
+                error!(error = %connection_error, "PostgreSQL test connection terminated");
+            }
+        });
+        Ok(client)
+    }
+
+    async fn seed_postgres_login_fixture(
+        database_url: &str,
+        mfa_secret_key: &[u8; 32],
+        fixture: &PostgresLoginFixture,
+    ) -> Result<(), String> {
+        let mut client = postgres_test_client(database_url).await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| format!("start PostgreSQL fixture transaction: {error}"))?;
+        let factor = MfaFactor {
+            factor_id: fixture.factor_id.clone(),
+            account_id: fixture.account_id.clone(),
+            secret_base32: fixture.totp_secret.clone(),
+            active: true,
+            last_used_counter: None,
+            created_at_epoch_millis: fixture.created_at_epoch_millis,
+        };
+        let encrypted_factor = encrypt_mfa(mfa_secret_key, &factor)?;
+        let created_at = to_i64_lossless(fixture.created_at_epoch_millis);
+        transaction
+            .execute(
+                "INSERT INTO accounts (account_id, email, display_name, password_hash,
+                    status, created_at_epoch_millis, updated_at_epoch_millis)
+                 VALUES ($1,$2,'PostgreSQL Login Test','test-password-hash','active',$3,$3)",
+                &[&fixture.account_id, &fixture.email, &created_at],
+            )
+            .await
+            .map_err(|error| format!("insert PostgreSQL test account: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO devices (device_id, account_id, display_name, platform,
+                    os_version, arch, public_key_id, public_key, public_key_version,
+                    public_key_revoked_at_epoch_millis, status, unattended_enabled,
+                    last_seen_epoch_millis, created_at_epoch_millis,
+                    updated_at_epoch_millis)
+                 VALUES ($1,$2,'PostgreSQL Login Device','ubuntu','26.04','x86_64',$3,$4,1,
+                    NULL,'online',FALSE,$5,$5,$5)",
+                &[
+                    &fixture.device_id,
+                    &fixture.account_id,
+                    &fixture.public_key_id,
+                    &&fixture.device_public_key[..],
+                    &created_at,
+                ],
+            )
+            .await
+            .map_err(|error| format!("insert PostgreSQL test device: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO account_mfa_factors (factor_id, account_id, factor_type,
+                    encrypted_secret, status, last_used_at_epoch_millis,
+                    created_at_epoch_millis, disabled_at_epoch_millis)
+                 VALUES ($1,$2,'totp',$3,'active',NULL,$4,NULL)",
+                &[
+                    &fixture.factor_id,
+                    &fixture.account_id,
+                    &encrypted_factor,
+                    &created_at,
+                ],
+            )
+            .await
+            .map_err(|error| format!("insert PostgreSQL test MFA factor: {error}"))?;
+        let recovery_code_hash = sha256(fixture.recovery_code.as_bytes());
+        transaction
+            .execute(
+                "INSERT INTO account_recovery_codes (recovery_code_id, account_id,
+                    code_hash, status, used_at_epoch_millis, created_at_epoch_millis,
+                    expires_at_epoch_millis)
+                 VALUES ($1,$2,$3,'active',NULL,$4,NULL)",
+                &[
+                    &fixture.recovery_code_id,
+                    &fixture.account_id,
+                    &&recovery_code_hash[..],
+                    &created_at,
+                ],
+            )
+            .await
+            .map_err(|error| format!("insert PostgreSQL test recovery code: {error}"))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| format!("commit PostgreSQL fixture transaction: {error}"))
+    }
+
+    async fn seed_postgres_trusted_device(
+        database_url: &str,
+        fixture: &PostgresLoginFixture,
+        trusted_device_id: &str,
+        expires_at_epoch_millis: u64,
+    ) -> Result<(), String> {
+        let client = postgres_test_client(database_url).await?;
+        let fingerprint = sha256(&fixture.device_public_key);
+        client
+            .execute(
+                "INSERT INTO trusted_controller_devices (trusted_device_id, account_id,
+                    controller_device_id, device_fingerprint_hash, trust_level, status,
+                    trust_proof_type, created_at_epoch_millis, last_used_at_epoch_millis,
+                    expires_at_epoch_millis, revoked_at_epoch_millis)
+                 VALUES ($1,$2,$3,$4,'standard','active','device_signature_and_mfa',
+                    $5,NULL,$6,NULL)",
+                &[
+                    &trusted_device_id,
+                    &fixture.account_id,
+                    &fixture.device_id,
+                    &&fingerprint[..],
+                    &to_i64_lossless(fixture.created_at_epoch_millis),
+                    &to_i64_lossless(expires_at_epoch_millis),
+                ],
+            )
+            .await
+            .map_err(|error| format!("insert PostgreSQL test trusted device: {error}"))?;
+        Ok(())
+    }
+
+    async fn cleanup_postgres_login_fixture(
+        database_url: &str,
+        account_id: &str,
+    ) -> Result<(), String> {
+        let mut client = postgres_test_client(database_url).await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| format!("start PostgreSQL cleanup transaction: {error}"))?;
+        for statement in [
+            "DELETE FROM audit_logs WHERE actor_account_id=$1",
+            "DELETE FROM mfa_recovery_code_deliveries WHERE account_id=$1",
+            "DELETE FROM device_enrollment_grants WHERE account_id=$1",
+            "DELETE FROM trusted_controller_devices WHERE account_id=$1",
+            "DELETE FROM account_risk_challenges WHERE account_id=$1",
+            "DELETE FROM account_recovery_codes WHERE account_id=$1",
+            "DELETE FROM account_mfa_factors WHERE account_id=$1",
+            "DELETE FROM account_sessions WHERE account_id=$1",
+            "DELETE FROM device_policies WHERE device_id IN (
+                SELECT device_id FROM devices WHERE account_id=$1)",
+            "DELETE FROM devices WHERE account_id=$1",
+            "DELETE FROM accounts WHERE account_id=$1",
+        ] {
+            transaction
+                .execute(statement, &[&account_id])
+                .await
+                .map_err(|error| format!("clean PostgreSQL login fixture: {error}"))?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| format!("commit PostgreSQL cleanup transaction: {error}"))
+    }
+
+    struct PostgresDeviceAuthorityFixture {
+        account_id: String,
+        email: String,
+        device_id: String,
+        public_key_id: String,
+        public_key: [u8; 32],
+        trusted_device_id: String,
+        created_at_epoch_millis: u64,
+    }
+
+    impl PostgresDeviceAuthorityFixture {
+        fn random(prefix: &str) -> Self {
+            let suffix = crate::security::random_uuid_v4();
+            Self {
+                account_id: format!("{prefix}-account-{suffix}"),
+                email: format!("{prefix}-{suffix}@example.com"),
+                device_id: format!("{prefix}-device-{suffix}"),
+                public_key_id: format!("{prefix}-key-{suffix}"),
+                public_key: sha256(format!("{prefix}-public-key-{suffix}").as_bytes()),
+                trusted_device_id: format!("{prefix}-trust-{suffix}"),
+                created_at_epoch_millis: now_epoch_millis(),
+            }
+        }
+
+        fn account_session_id(&self, index: usize) -> String {
+            format!("{}-session-{index}", self.account_id)
+        }
+
+        fn device(&self) -> Device {
+            Device {
+                device_id: self.device_id.clone(),
+                account_id: self.account_id.clone(),
+                display_name: "PostgreSQL Device Authority Test".into(),
+                platform: Platform::Ubuntu,
+                os_version: "26.04".into(),
+                arch: Architecture::X86_64,
+                capabilities: DeviceCapabilities {
+                    controller: true,
+                    controlled: false,
+                    file_transfer: false,
+                    unattended: false,
+                },
+                public_key_id: self.public_key_id.clone(),
+                public_key: self.public_key,
+                public_key_version: 1,
+                public_key_revoked_at_epoch_millis: None,
+                status: DeviceLifecycleStatus::Online,
+                last_seen_epoch_millis: Some(self.created_at_epoch_millis),
+                created_at_epoch_millis: self.created_at_epoch_millis,
+                updated_at_epoch_millis: self.created_at_epoch_millis,
+            }
+        }
+    }
+
+    async fn seed_postgres_device_authority_fixture(
+        database_url: &str,
+        fixture: &PostgresDeviceAuthorityFixture,
+        account_session_count: usize,
+        establish_trust: bool,
+    ) -> Result<Vec<[u8; 32]>, String> {
+        let mut client = postgres_test_client(database_url).await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| format!("start device authority fixture transaction: {error}"))?;
+        let created_at = to_i64_lossless(fixture.created_at_epoch_millis);
+        transaction
+            .execute(
+                "INSERT INTO accounts (account_id, email, display_name, password_hash,
+                    status, created_at_epoch_millis, updated_at_epoch_millis)
+                 VALUES ($1,$2,'PostgreSQL Device Authority Test','test-password-hash',
+                    'active',$3,$3)",
+                &[&fixture.account_id, &fixture.email, &created_at],
+            )
+            .await
+            .map_err(|error| format!("insert device authority test account: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO devices (device_id, account_id, display_name, platform,
+                    os_version, arch, public_key_id, public_key, public_key_version,
+                    public_key_revoked_at_epoch_millis, status, unattended_enabled,
+                    last_seen_epoch_millis, created_at_epoch_millis,
+                    updated_at_epoch_millis)
+                 VALUES ($1,$2,'PostgreSQL Device Authority Test','ubuntu','26.04','x86_64',
+                    $3,$4,1,NULL,'online',FALSE,$5,$5,$5)",
+                &[
+                    &fixture.device_id,
+                    &fixture.account_id,
+                    &fixture.public_key_id,
+                    &&fixture.public_key[..],
+                    &created_at,
+                ],
+            )
+            .await
+            .map_err(|error| format!("insert device authority test device: {error}"))?;
+
+        let mut refresh_token_hashes = Vec::with_capacity(account_session_count);
+        for index in 0..account_session_count {
+            let account_session_id = fixture.account_session_id(index);
+            let refresh_token_hash = sha256(account_session_id.as_bytes());
+            transaction
+                .execute(
+                    "INSERT INTO account_sessions (account_session_id, account_id,
+                        refresh_token_hash, device_label, mfa_verified,
+                        expires_at_epoch_millis, revoked_at_epoch_millis, revoked_reason,
+                        created_at_epoch_millis, updated_at_epoch_millis)
+                     VALUES ($1,$2,$3,'device-authority-test',TRUE,$4,NULL,NULL,$5,$5)",
+                    &[
+                        &account_session_id,
+                        &fixture.account_id,
+                        &&refresh_token_hash[..],
+                        &to_i64_lossless(fixture.created_at_epoch_millis + 600_000),
+                        &created_at,
+                    ],
+                )
+                .await
+                .map_err(|error| format!("insert device authority account session: {error}"))?;
+            refresh_token_hashes.push(refresh_token_hash);
+        }
+        if establish_trust {
+            let fingerprint = sha256(&fixture.public_key);
+            transaction
+                .execute(
+                    "INSERT INTO trusted_controller_devices (trusted_device_id, account_id,
+                        controller_device_id, device_fingerprint_hash, trust_level, status,
+                        trust_proof_type, created_at_epoch_millis, last_used_at_epoch_millis,
+                        expires_at_epoch_millis, revoked_at_epoch_millis)
+                     VALUES ($1,$2,$3,$4,'standard','active','device_signature_and_mfa',
+                        $5,NULL,$6,NULL)",
+                    &[
+                        &fixture.trusted_device_id,
+                        &fixture.account_id,
+                        &fixture.device_id,
+                        &&fingerprint[..],
+                        &created_at,
+                        &to_i64_lossless(fixture.created_at_epoch_millis + 600_000),
+                    ],
+                )
+                .await
+                .map_err(|error| format!("insert device authority trusted device: {error}"))?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| format!("commit device authority fixture transaction: {error}"))?;
+        Ok(refresh_token_hashes)
+    }
+
+    async fn seed_postgres_rotation_challenge(
+        database_url: &str,
+        fixture: &PostgresDeviceAuthorityFixture,
+        challenge_id: &str,
+        operation_binding_hash: &[u8; 32],
+    ) -> Result<(), String> {
+        let client = postgres_test_client(database_url).await?;
+        let created_at = to_i64_lossless(fixture.created_at_epoch_millis);
+        client
+            .execute(
+                "INSERT INTO account_risk_challenges (risk_challenge_id, account_id,
+                    device_id, purpose, operation_binding_hash, risk_level, required_methods,
+                    status, attempts_remaining, expires_at_epoch_millis,
+                    created_at_epoch_millis, verified_at_epoch_millis,
+                    consumed_at_epoch_millis)
+                 VALUES ($1,$2,$3,'device_key_rotation',$4,'high',$5,'verified',5,$6,$7,$7,NULL)",
+                &[
+                    &challenge_id,
+                    &fixture.account_id,
+                    &fixture.device_id,
+                    &&operation_binding_hash[..],
+                    &json!(["totp", "recovery_code"]),
+                    &to_i64_lossless(fixture.created_at_epoch_millis + 300_000),
+                    &created_at,
+                ],
+            )
+            .await
+            .map_err(|error| format!("insert device key rotation challenge: {error}"))?;
+        Ok(())
+    }
+
+    fn device_authority_audit(
+        fixture: &PostgresDeviceAuthorityFixture,
+        audit_id: impl Into<String>,
+        action: &str,
+        now_epoch_millis: u64,
+    ) -> AuditEntry {
+        AuditEntry {
+            audit_id: audit_id.into(),
+            actor_type: "device".into(),
+            actor_account_id: Some(fixture.account_id.clone()),
+            actor_device_id: Some(fixture.device_id.clone()),
+            actor_role: Some("none".into()),
+            actor_service: None,
+            target_device_id: Some(fixture.device_id.clone()),
+            session_id: None,
+            action: action.into(),
+            result: "success".into(),
+            reason: None,
+            metadata: BTreeMap::new(),
+            request_id: format!("request-{action}-{}", fixture.device_id),
+            created_at_epoch_millis: now_epoch_millis,
+        }
+    }
+
+    fn device_management_test_command(
+        fixture: &PostgresDeviceAuthorityFixture,
+        action: DeviceManagementAction,
+        audit_id: impl Into<String>,
+        now_epoch_millis: u64,
+    ) -> DeviceManagementCommand {
+        let audit_action = match action {
+            DeviceManagementAction::Unbind => "device_unregistered",
+            DeviceManagementAction::RevokePublicKey => "device_public_key_revoked",
+            DeviceManagementAction::Disable | DeviceManagementAction::Restore => {
+                "device_status_changed"
+            }
+        };
+        DeviceManagementCommand {
+            account_id: fixture.account_id.clone(),
+            actor_device_id: fixture.device_id.clone(),
+            actor_public_key_id: fixture.public_key_id.clone(),
+            actor_public_key_version: 1,
+            target_device_id: fixture.device_id.clone(),
+            expected_target_public_key_id: fixture.public_key_id.clone(),
+            expected_target_public_key_version: 1,
+            display_name: None,
+            action: Some(action),
+            audit_entry: device_authority_audit(fixture, audit_id, audit_action, now_epoch_millis),
+            now_epoch_millis,
+        }
+    }
+
+    fn device_rotation_test_command(
+        fixture: &PostgresDeviceAuthorityFixture,
+        challenge_id: &str,
+        operation_binding_hash: [u8; 32],
+        audit_id: impl Into<String>,
+        now_epoch_millis: u64,
+    ) -> DeviceKeyRotation {
+        DeviceKeyRotation {
+            step_up: StepUpExpectation {
+                challenge_id: challenge_id.into(),
+                account_id: fixture.account_id.clone(),
+                device_id: fixture.device_id.clone(),
+                purpose: "device_key_rotation".into(),
+                operation_binding_hash,
+                now_epoch_millis,
+            },
+            current_public_key_id: fixture.public_key_id.clone(),
+            current_public_key_version: 1,
+            new_public_key_id: format!("{}-rotated", fixture.public_key_id),
+            new_public_key: sha256(format!("{}-rotated", fixture.public_key_id).as_bytes()),
+            new_public_key_version: 2,
+            audit_entry: device_authority_audit(
+                fixture,
+                audit_id,
+                "device_public_key_rotated",
+                now_epoch_millis,
+            ),
+        }
+    }
+
+    async fn seed_postgres_audit(database_url: &str, audit: &AuditEntry) -> Result<(), String> {
+        let mut client = postgres_test_client(database_url).await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| format!("start audit fixture transaction: {error}"))?;
+        insert_audit_entry_strict(&transaction, audit)
+            .await
+            .map_err(|error| format!("insert audit fixture: {error}"))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| format!("commit audit fixture transaction: {error}"))
+    }
+
+    async fn run_postgres_login_factor_single_use(
+        database_url: &str,
+        fixture: &PostgresLoginFixture,
+        factor_kind: &str,
+        factor_code: &str,
+        expected_totp_counter: Option<u64>,
+    ) -> Result<(), String> {
+        let mfa_secret_key = [0_u8; 32];
+        seed_postgres_login_fixture(database_url, &mfa_secret_key, fixture).await?;
+        let repository_a = PostgresRepository::connect(database_url, mfa_secret_key).await?;
+        let repository_b = PostgresRepository::connect(database_url, mfa_secret_key).await?;
+        let finish_at = fixture.created_at_epoch_millis.saturating_add(1);
+        let challenge_a_id = format!("{factor_kind}-concurrent-a-{}", fixture.account_id);
+        let challenge_b_id = format!("{factor_kind}-concurrent-b-{}", fixture.account_id);
+        let authority_a = registered_login_authority(
+            &challenge_a_id,
+            &fixture.account_id,
+            fixture.created_at_epoch_millis,
+            &fixture.device_id,
+            &fixture.public_key_id,
+            fixture.device_public_key,
+            [61; 32],
+            fixture.created_at_epoch_millis,
+        );
+        let authority_b = registered_login_authority(
+            &challenge_b_id,
+            &fixture.account_id,
+            fixture.created_at_epoch_millis,
+            &fixture.device_id,
+            &fixture.public_key_id,
+            fixture.device_public_key,
+            [62; 32],
+            fixture.created_at_epoch_millis,
+        );
+        repository_a
+            .create_login_challenge(
+                &authority_a,
+                &login_audit(
+                    format!("{factor_kind}-concurrent-issued-a-{}", fixture.account_id),
+                    &fixture.account_id,
+                    "mfa_challenge_issued",
+                    "success",
+                    fixture.created_at_epoch_millis,
+                ),
+            )
+            .await
+            .map_err(|error| format!("create first concurrent login challenge: {error:?}"))?;
+        repository_b
+            .create_login_challenge(
+                &authority_b,
+                &login_audit(
+                    format!("{factor_kind}-concurrent-issued-b-{}", fixture.account_id),
+                    &fixture.account_id,
+                    "mfa_challenge_issued",
+                    "success",
+                    fixture.created_at_epoch_millis,
+                ),
+            )
+            .await
+            .map_err(|error| format!("create second concurrent login challenge: {error:?}"))?;
+        let command_a = mfa_login_finish_command(
+            &authority_a,
+            factor_kind,
+            factor_code,
+            &format!("{factor_kind}-concurrent-session-a-{}", fixture.account_id),
+            &format!("{factor_kind}-concurrent-trust-a-{}", fixture.account_id),
+            &format!("{factor_kind}-concurrent-a-{}", fixture.account_id),
+            finish_at,
+        );
+        let command_b = mfa_login_finish_command(
+            &authority_b,
+            factor_kind,
+            factor_code,
+            &format!("{factor_kind}-concurrent-session-b-{}", fixture.account_id),
+            &format!("{factor_kind}-concurrent-trust-b-{}", fixture.account_id),
+            &format!("{factor_kind}-concurrent-b-{}", fixture.account_id),
+            finish_at,
+        );
+        let (outcome_a, outcome_b) = tokio::join!(
+            repository_a.finish_login(&command_a),
+            repository_b.finish_login(&command_b)
+        );
+        let outcomes = [
+            outcome_a.map_err(|error| format!("first concurrent login failed: {error:?}"))?,
+            outcome_b.map_err(|error| format!("second concurrent login failed: {error:?}"))?,
+        ];
+        let completed = outcomes
+            .iter()
+            .filter(|outcome| **outcome == LoginFinishOutcome::Completed)
+            .count();
+        let rejected = outcomes
+            .iter()
+            .filter(|outcome| **outcome == LoginFinishOutcome::InvalidFactor)
+            .count();
+        if completed != 1 || rejected != 1 {
+            return Err(format!(
+                "concurrent {factor_kind} login outcomes were not single-use: {outcomes:?}"
+            ));
+        }
+
+        drop(repository_a);
+        drop(repository_b);
+        let restarted = PostgresRepository::connect(database_url, mfa_secret_key).await?;
+        let restart_challenge_id =
+            format!("{factor_kind}-restart-challenge-{}", fixture.account_id);
+        let restart_authority = registered_login_authority(
+            &restart_challenge_id,
+            &fixture.account_id,
+            fixture.created_at_epoch_millis,
+            &fixture.device_id,
+            &fixture.public_key_id,
+            fixture.device_public_key,
+            [63; 32],
+            fixture.created_at_epoch_millis,
+        );
+        restarted
+            .create_login_challenge(
+                &restart_authority,
+                &login_audit(
+                    format!("{factor_kind}-restart-issued-{}", fixture.account_id),
+                    &fixture.account_id,
+                    "mfa_challenge_issued",
+                    "success",
+                    fixture.created_at_epoch_millis,
+                ),
+            )
+            .await
+            .map_err(|error| format!("create restart login challenge: {error:?}"))?;
+        let restart_command = mfa_login_finish_command(
+            &restart_authority,
+            factor_kind,
+            factor_code,
+            &format!("{factor_kind}-restart-session-{}", fixture.account_id),
+            &format!("{factor_kind}-restart-trust-{}", fixture.account_id),
+            &format!("{factor_kind}-restart-{}", fixture.account_id),
+            finish_at,
+        );
+        let restart_outcome = restarted
+            .finish_login(&restart_command)
+            .await
+            .map_err(|error| format!("restart login failed: {error:?}"))?;
+        if restart_outcome != LoginFinishOutcome::InvalidFactor {
+            return Err(format!(
+                "restarted repository accepted reused {factor_kind}: {restart_outcome:?}"
+            ));
+        }
+
+        let client = restarted.client.lock().await;
+        let counts = client
+            .query_one(
+                "SELECT
+                    (SELECT count(*) FROM account_sessions WHERE account_id=$1) AS sessions,
+                    (SELECT count(*) FROM trusted_controller_devices
+                     WHERE account_id=$1 AND status='active') AS active_trusts,
+                    (SELECT count(*) FROM account_risk_challenges
+                     WHERE account_id=$1 AND status='consumed') AS consumed_challenges",
+                &[&fixture.account_id],
+            )
+            .await
+            .map_err(|error| format!("query PostgreSQL single-use results: {error}"))?;
+        let sessions = counts.get::<_, i64>("sessions");
+        let active_trusts = counts.get::<_, i64>("active_trusts");
+        let consumed_challenges = counts.get::<_, i64>("consumed_challenges");
+        if (sessions, active_trusts, consumed_challenges) != (1, 1, 1) {
+            return Err(format!(
+                "{factor_kind} single-use persistence mismatch: sessions={sessions}, active_trusts={active_trusts}, consumed_challenges={consumed_challenges}"
+            ));
+        }
+        if factor_kind == "totp" {
+            let encrypted_secret: Vec<u8> = client
+                .query_one(
+                    "SELECT encrypted_secret FROM account_mfa_factors WHERE factor_id=$1",
+                    &[&fixture.factor_id],
+                )
+                .await
+                .map_err(|error| format!("query persisted TOTP factor: {error}"))?
+                .get("encrypted_secret");
+            let payload = decrypt_mfa(
+                &mfa_secret_key,
+                &fixture.account_id,
+                &fixture.factor_id,
+                &encrypted_secret,
+            )?;
+            if payload.last_used_counter != expected_totp_counter {
+                return Err(format!(
+                    "persisted TOTP counter mismatch: expected={expected_totp_counter:?}, actual={:?}",
+                    payload.last_used_counter
+                ));
+            }
+        } else {
+            let recovery_status: String = client
+                .query_one(
+                    "SELECT status FROM account_recovery_codes WHERE recovery_code_id=$1",
+                    &[&fixture.recovery_code_id],
+                )
+                .await
+                .map_err(|error| format!("query persisted recovery code: {error}"))?
+                .get("status");
+            if recovery_status != "used" {
+                return Err(format!(
+                    "persisted recovery code was not used: {recovery_status}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_postgres_trusted_login_non_sliding(
+        database_url: &str,
+        fixture: &PostgresLoginFixture,
+    ) -> Result<(), String> {
+        let mfa_secret_key = [0_u8; 32];
+        seed_postgres_login_fixture(database_url, &mfa_secret_key, fixture).await?;
+        let trusted_device_id = format!("trusted-login-{}", fixture.account_id);
+        let fixed_expiry = fixture
+            .created_at_epoch_millis
+            .saturating_add(2_592_000_000);
+        seed_postgres_trusted_device(database_url, fixture, &trusted_device_id, fixed_expiry)
+            .await?;
+
+        let first_used_at = fixture.created_at_epoch_millis.saturating_add(1);
+        let first_repository = PostgresRepository::connect(database_url, mfa_secret_key).await?;
+        let first_authority = trusted_login_authority(
+            &format!("trusted-login-first-challenge-{}", fixture.account_id),
+            &fixture.account_id,
+            fixture.created_at_epoch_millis,
+            &fixture.device_id,
+            &fixture.public_key_id,
+            fixture.device_public_key,
+            &trusted_device_id,
+            [71; 32],
+            fixture.created_at_epoch_millis,
+        );
+        first_repository
+            .create_login_challenge(
+                &first_authority,
+                &login_audit(
+                    format!("trusted-login-first-issued-{}", fixture.account_id),
+                    &fixture.account_id,
+                    "mfa_challenge_issued",
+                    "success",
+                    fixture.created_at_epoch_millis,
+                ),
+            )
+            .await
+            .map_err(|error| format!("create first trusted login challenge: {error:?}"))?;
+        let first_command = trusted_login_finish_command(
+            &first_authority,
+            &format!("trusted-login-first-session-{}", fixture.account_id),
+            &format!("trusted-login-first-{}", fixture.account_id),
+            first_used_at,
+        );
+        let first_outcome = first_repository
+            .finish_login(&first_command)
+            .await
+            .map_err(|error| format!("finish first trusted login: {error:?}"))?;
+        if first_outcome != LoginFinishOutcome::Completed {
+            return Err(format!(
+                "first trusted login was not completed: {first_outcome:?}"
+            ));
+        }
+        {
+            let client = first_repository.client.lock().await;
+            let row = client
+                .query_one(
+                    "SELECT last_used_at_epoch_millis, expires_at_epoch_millis
+                     FROM trusted_controller_devices WHERE trusted_device_id=$1",
+                    &[&trusted_device_id],
+                )
+                .await
+                .map_err(|error| format!("query first trusted login result: {error}"))?;
+            let last_used = row.get::<_, Option<i64>>("last_used_at_epoch_millis");
+            let expires_at = row.get::<_, i64>("expires_at_epoch_millis");
+            if last_used != Some(to_i64_lossless(first_used_at))
+                || expires_at != to_i64_lossless(fixed_expiry)
+            {
+                return Err(format!(
+                    "first trusted login changed fixed expiry: last_used={last_used:?}, expires_at={expires_at}"
+                ));
+            }
+        }
+
+        drop(first_repository);
+        let second_used_at = first_used_at.saturating_add(1);
+        let restarted = PostgresRepository::connect(database_url, mfa_secret_key).await?;
+        let second_authority = trusted_login_authority(
+            &format!("trusted-login-second-challenge-{}", fixture.account_id),
+            &fixture.account_id,
+            fixture.created_at_epoch_millis,
+            &fixture.device_id,
+            &fixture.public_key_id,
+            fixture.device_public_key,
+            &trusted_device_id,
+            [72; 32],
+            first_used_at,
+        );
+        restarted
+            .create_login_challenge(
+                &second_authority,
+                &login_audit(
+                    format!("trusted-login-second-issued-{}", fixture.account_id),
+                    &fixture.account_id,
+                    "mfa_challenge_issued",
+                    "success",
+                    first_used_at,
+                ),
+            )
+            .await
+            .map_err(|error| format!("create second trusted login challenge: {error:?}"))?;
+        let second_command = trusted_login_finish_command(
+            &second_authority,
+            &format!("trusted-login-second-session-{}", fixture.account_id),
+            &format!("trusted-login-second-{}", fixture.account_id),
+            second_used_at,
+        );
+        let second_outcome = restarted
+            .finish_login(&second_command)
+            .await
+            .map_err(|error| format!("finish second trusted login: {error:?}"))?;
+        if second_outcome != LoginFinishOutcome::Completed {
+            return Err(format!(
+                "second trusted login was not completed: {second_outcome:?}"
+            ));
+        }
+
+        let client = restarted.client.lock().await;
+        let row = client
+            .query_one(
+                "SELECT last_used_at_epoch_millis, expires_at_epoch_millis,
+                    (SELECT count(*) FROM trusted_controller_devices
+                     WHERE account_id=$2) AS trust_count,
+                    (SELECT count(*) FROM account_sessions
+                     WHERE account_id=$2 AND mfa_verified=TRUE) AS session_count
+                 FROM trusted_controller_devices WHERE trusted_device_id=$1",
+                &[&trusted_device_id, &fixture.account_id],
+            )
+            .await
+            .map_err(|error| format!("query restarted trusted login result: {error}"))?;
+        let last_used = row.get::<_, Option<i64>>("last_used_at_epoch_millis");
+        let expires_at = row.get::<_, i64>("expires_at_epoch_millis");
+        let trust_count = row.get::<_, i64>("trust_count");
+        let session_count = row.get::<_, i64>("session_count");
+        if last_used != Some(to_i64_lossless(second_used_at))
+            || expires_at != to_i64_lossless(fixed_expiry)
+            || trust_count != 1
+            || session_count != 2
+        {
+            return Err(format!(
+                "trusted login persistence mismatch: last_used={last_used:?}, expires_at={expires_at}, trust_count={trust_count}, session_count={session_count}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
+    async fn postgres_login_totp_counter_is_single_use_across_concurrency_and_restart() {
+        let database_url = std::env::var("API_TEST_DATABASE_URL")
+            .expect("API_TEST_DATABASE_URL must point to an isolated migrated database");
+        let fixture = PostgresLoginFixture::random("pg-login-totp");
+        let (totp_code, counter) = crate::security::totp_code(
+            &fixture.totp_secret,
+            fixture.created_at_epoch_millis.saturating_add(1),
+        )
+        .expect("generated PostgreSQL fixture TOTP secret must be valid");
+        let result = run_postgres_login_factor_single_use(
+            &database_url,
+            &fixture,
+            "totp",
+            &totp_code,
+            Some(counter),
+        )
+        .await;
+        let cleanup = cleanup_postgres_login_fixture(&database_url, &fixture.account_id).await;
+        cleanup.expect("clean PostgreSQL TOTP login fixture");
+        result.expect("verify PostgreSQL TOTP concurrency and restart replay rejection");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
+    async fn postgres_login_recovery_code_is_single_use_across_concurrency_and_restart() {
+        let database_url = std::env::var("API_TEST_DATABASE_URL")
+            .expect("API_TEST_DATABASE_URL must point to an isolated migrated database");
+        let fixture = PostgresLoginFixture::random("pg-login-recovery");
+        let result = run_postgres_login_factor_single_use(
+            &database_url,
+            &fixture,
+            "recovery_code",
+            &fixture.recovery_code,
+            None,
+        )
+        .await;
+        let cleanup = cleanup_postgres_login_fixture(&database_url, &fixture.account_id).await;
+        cleanup.expect("clean PostgreSQL recovery-code login fixture");
+        result.expect("verify PostgreSQL recovery-code concurrency and restart replay rejection");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
+    async fn postgres_registered_trusted_login_updates_last_used_without_sliding_expiry() {
+        let database_url = std::env::var("API_TEST_DATABASE_URL")
+            .expect("API_TEST_DATABASE_URL must point to an isolated migrated database");
+        let fixture = PostgresLoginFixture::random("pg-trusted-login");
+        let result = run_postgres_trusted_login_non_sliding(&database_url, &fixture).await;
+        let cleanup = cleanup_postgres_login_fixture(&database_url, &fixture.account_id).await;
+        cleanup.expect("clean PostgreSQL trusted login fixture");
+        result.expect("verify PostgreSQL trusted login fixed expiry");
     }
 
     fn normalized_sql(sql: &str) -> String {
@@ -6809,6 +8259,53 @@ mod tests {
         assert!(upsert
             .contains("refresh_token_hash, mfa_verified, device_label, expires_at_epoch_millis"));
         assert!(upsert.contains("mfa_verified=EXCLUDED.mfa_verified"));
+    }
+
+    #[test]
+    fn refresh_revocation_audits_use_frozen_reasons_and_object_ids() {
+        let trusted_source = login_audit(
+            "trusted-source",
+            "account-1",
+            "trusted_device_added",
+            "success",
+            10,
+        );
+        let trusted_audit =
+            trusted_device_revocation_audit(&trusted_source, "trust-1", "device-1", "refreshed");
+        assert_eq!(
+            trusted_audit.audit_id,
+            "trusted-source:trusted-device:trust-1"
+        );
+        assert_eq!(trusted_audit.action, "trusted_device_revoked");
+        assert_eq!(trusted_audit.reason.as_deref(), Some("refreshed"));
+        assert_eq!(trusted_audit.target_device_id.as_deref(), Some("device-1"));
+        assert_eq!(
+            trusted_audit.metadata["revoked_reason"],
+            Value::String("refreshed".into())
+        );
+
+        let refresh_source = login_audit(
+            "refresh-source",
+            "account-1",
+            "token_refreshed",
+            "success",
+            11,
+        );
+        let session_audit = account_session_revocation_audit(
+            &refresh_source,
+            "account-session-1",
+            "refresh_replay",
+        );
+        assert_eq!(
+            session_audit.audit_id,
+            "refresh-source:account-session:account-session-1"
+        );
+        assert_eq!(session_audit.action, "account_session_revoked");
+        assert_eq!(session_audit.reason.as_deref(), Some("refresh_replay"));
+        assert_eq!(
+            session_audit.metadata["revoked_reason"],
+            Value::String("refresh_replay".into())
+        );
     }
 
     #[test]
@@ -6874,6 +8371,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
     async fn risk_challenge_create_and_cancel_use_authority_across_instances() {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::ERROR)
+            .try_init();
         let database_url = std::env::var("API_TEST_DATABASE_URL")
             .expect("API_TEST_DATABASE_URL must point to an isolated migrated database");
         let left = PostgresRepository::connect(&database_url, [0; 32])
@@ -6931,8 +8432,8 @@ mod tests {
             left.create_risk_challenge(&duplicate, &duplicate_audit),
             right.create_risk_challenge(&duplicate, &duplicate_audit)
         );
-        assert!(matches!(
-            (left_create, right_create),
+        let one_created_one_conflict = matches!(
+            (&left_create, &right_create),
             (
                 Ok(RiskChallengeCreationOutcome::Created(_)),
                 Err(StoreError::Conflict)
@@ -6940,12 +8441,16 @@ mod tests {
                 Err(StoreError::Conflict),
                 Ok(RiskChallengeCreationOutcome::Created(_))
             )
-        ));
+        );
+        assert!(
+            one_created_one_conflict,
+            "left={left_create:?}, right={right_create:?}"
+        );
 
         let challenge = issued_risk_challenge(
             format!("risk-cancel-{suffix}"),
             account_id.clone(),
-            device_id,
+            device_id.clone(),
             created_at,
         );
         let challenge_audit = risk_challenge_audit(&challenge);
@@ -7022,9 +8527,1682 @@ mod tests {
             .await
             .expect("delete risk challenge test audits");
         client
+            .execute("DELETE FROM devices WHERE device_id=$1", &[&device_id])
+            .await
+            .expect("delete risk challenge test device");
+        client
             .execute("DELETE FROM accounts WHERE account_id=$1", &[&account_id])
             .await
             .expect("delete risk challenge test account");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
+    async fn login_finish_uses_persisted_account_security_snapshot() {
+        let database_url = std::env::var("API_TEST_DATABASE_URL")
+            .expect("API_TEST_DATABASE_URL must point to an isolated migrated database");
+        let repository = PostgresRepository::connect(&database_url, [0; 32])
+            .await
+            .expect("connect PostgreSQL repository");
+        let suffix = crate::security::random_uuid_v4();
+        let account_id = format!("login-snapshot-account-{suffix}");
+        let device_id = format!("login-snapshot-device-{suffix}");
+        let challenge_id = format!("login-snapshot-challenge-{suffix}");
+        let email = format!("login-snapshot-{suffix}@example.com");
+        let created_at = now_epoch_millis();
+        let changed_at = created_at.saturating_add(1);
+        {
+            let client = repository.client.lock().await;
+            client
+                .execute(
+                    "INSERT INTO accounts (account_id, email, display_name, password_hash,
+                        status, created_at_epoch_millis, updated_at_epoch_millis)
+                     VALUES ($1,$2,'Login Snapshot Test','test-password-hash','active',$3,$3)",
+                    &[&account_id, &email, &to_i64_lossless(created_at)],
+                )
+                .await
+                .expect("insert login snapshot account");
+        }
+
+        let device_public_key = [11_u8; 32];
+        let device_public_key_fingerprint = sha256(&device_public_key);
+        let challenge = RiskChallenge {
+            risk_challenge_id: challenge_id.clone(),
+            account_id: account_id.clone(),
+            device_id: None,
+            purpose: "login_mfa".into(),
+            operation_binding_hash: [12; 32],
+            risk_level: "low".into(),
+            required_methods: Vec::new(),
+            status: RiskChallengeStatus::Issued,
+            attempts_remaining: 5,
+            ip_address: Some("127.0.0.1".into()),
+            user_agent: Some("login-snapshot-test".into()),
+            expires_at_epoch_millis: created_at + 300_000,
+            created_at_epoch_millis: created_at,
+            verified_at_epoch_millis: None,
+            consumed_at_epoch_millis: None,
+        };
+        let context = LoginChallengeContext {
+            device_state: LoginDeviceState::PendingEnrollment,
+            device_id: device_id.clone(),
+            account_updated_at_epoch_millis: created_at,
+            device_public_key,
+            device_public_key_fingerprint,
+            public_key_id: None,
+            public_key_version: 0,
+            client_nonce: [13; 32],
+            server_nonce: [14; 32],
+            login_request_binding_hash: [15; 32],
+            login_challenge_binding_hash: challenge.operation_binding_hash,
+            ip_address_hash: [16; 32],
+            user_agent_hash: [17; 32],
+            required_factors: Vec::new(),
+            trusted_device_id: None,
+            protocol_version: 1,
+            issued_at_epoch_millis: created_at,
+            attempts_limit: 5,
+        };
+        repository
+            .create_login_challenge(
+                &LoginChallengeAuthority {
+                    challenge: challenge.clone(),
+                    context,
+                },
+                &login_audit(
+                    format!("login-snapshot-issued-{suffix}"),
+                    &account_id,
+                    "mfa_challenge_issued",
+                    "success",
+                    created_at,
+                ),
+            )
+            .await
+            .expect("create login snapshot challenge");
+        {
+            let client = repository.client.lock().await;
+            client
+                .execute(
+                    "UPDATE accounts SET updated_at_epoch_millis=$2 WHERE account_id=$1",
+                    &[&account_id, &to_i64_lossless(changed_at)],
+                )
+                .await
+                .expect("advance account security snapshot");
+        }
+
+        let session_id = format!("login-snapshot-session-{suffix}");
+        let grant_id = format!("login-snapshot-grant-{suffix}");
+        let command = LoginFinishCommand {
+            challenge_id: challenge_id.clone(),
+            account_id: account_id.clone(),
+            account_updated_at_epoch_millis: changed_at,
+            persistent_device_id: None,
+            device_id,
+            public_key_id: None,
+            public_key_version: 0,
+            device_public_key_fingerprint,
+            challenge_binding_hash: challenge.operation_binding_hash,
+            required_factors: Vec::new(),
+            factor_kind: None,
+            factor_code: None,
+            trusted_device_id_to_use: None,
+            account_session: AccountSession {
+                account_session_id: session_id.clone(),
+                account_id: account_id.clone(),
+                refresh_token_hash: sha256(format!("refresh-{suffix}").as_bytes()),
+                mfa_verified: false,
+                expires_at_epoch_millis: created_at + 600_000,
+                revoked_at_epoch_millis: None,
+                revoked_reason: None,
+            },
+            enrollment_grant: Some(DeviceEnrollmentGrant {
+                grant_id: grant_id.clone(),
+                grant_secret_hash: sha256(format!("grant-secret-{suffix}").as_bytes()),
+                account_id: account_id.clone(),
+                device_id: format!("login-snapshot-device-{suffix}"),
+                device_public_key_fingerprint,
+                login_challenge_id: challenge_id.clone(),
+                login_challenge_binding_hash: challenge.operation_binding_hash,
+                trust_proof_type: None,
+                trust_level: None,
+                establish_trust: false,
+                protocol_version: 1,
+                issued_account_session_id: session_id.clone(),
+                issued_at_epoch_millis: changed_at,
+                expires_at_epoch_millis: challenge.expires_at_epoch_millis,
+                consumed_at_epoch_millis: None,
+                registration_request_binding_hash: None,
+                registered_public_key_id: None,
+                registered_trusted_device_id: None,
+            }),
+            trusted_device_to_create: None,
+            audit_entries: vec![
+                login_audit(
+                    format!("login-snapshot-mfa-success-{suffix}"),
+                    &account_id,
+                    "mfa_challenge_succeeded",
+                    "success",
+                    changed_at,
+                ),
+                login_audit(
+                    format!("login-snapshot-success-{suffix}"),
+                    &account_id,
+                    "login_succeeded",
+                    "success",
+                    changed_at,
+                ),
+            ],
+            failure_audit_entry: login_audit(
+                format!("login-snapshot-failure-{suffix}"),
+                &account_id,
+                "mfa_challenge_failed",
+                "failure",
+                changed_at,
+            ),
+            now_epoch_millis: changed_at,
+        };
+        assert_eq!(
+            repository.finish_login(&command).await,
+            Ok(LoginFinishOutcome::InvalidChallenge)
+        );
+        let mut frozen_snapshot_command = command.clone();
+        frozen_snapshot_command.account_updated_at_epoch_millis = created_at;
+        assert_eq!(
+            repository.finish_login(&frozen_snapshot_command).await,
+            Ok(LoginFinishOutcome::Rejected)
+        );
+
+        let client = repository.client.lock().await;
+        let row = client
+            .query_one(
+                "SELECT
+                    (SELECT count(*) FROM account_sessions WHERE account_session_id=$1) AS sessions,
+                    (SELECT count(*) FROM device_enrollment_grants WHERE grant_id=$2) AS grants,
+                    (SELECT status FROM account_risk_challenges
+                     WHERE risk_challenge_id=$3) AS challenge_status,
+                    (SELECT attempts_remaining FROM account_risk_challenges
+                     WHERE risk_challenge_id=$3) AS attempts_remaining,
+                    (SELECT reason FROM audit_logs WHERE audit_id=$4) AS failure_reason",
+                &[
+                    &session_id,
+                    &grant_id,
+                    &challenge_id,
+                    &command.failure_audit_entry.audit_id,
+                ],
+            )
+            .await
+            .expect("query login snapshot rejection");
+        assert_eq!(row.get::<_, i64>("sessions"), 0);
+        assert_eq!(row.get::<_, i64>("grants"), 0);
+        assert_eq!(row.get::<_, String>("challenge_status"), "issued");
+        assert_eq!(row.get::<_, i16>("attempts_remaining"), 4);
+        assert_eq!(
+            row.get::<_, Option<String>>("failure_reason").as_deref(),
+            Some("account_security_changed")
+        );
+
+        drop(client);
+        let fresh_challenge_id = format!("login-snapshot-fresh-challenge-{suffix}");
+        let fresh_now = changed_at.saturating_add(1);
+        let mut fresh_challenge = challenge.clone();
+        fresh_challenge.risk_challenge_id = fresh_challenge_id.clone();
+        fresh_challenge.operation_binding_hash = [18; 32];
+        fresh_challenge.created_at_epoch_millis = changed_at;
+        fresh_challenge.expires_at_epoch_millis = changed_at + 300_000;
+        let mut fresh_context = LoginChallengeContext {
+            device_state: LoginDeviceState::PendingEnrollment,
+            device_id: command.device_id.clone(),
+            account_updated_at_epoch_millis: changed_at,
+            device_public_key,
+            device_public_key_fingerprint,
+            public_key_id: None,
+            public_key_version: 0,
+            client_nonce: [19; 32],
+            server_nonce: [20; 32],
+            login_request_binding_hash: [21; 32],
+            login_challenge_binding_hash: fresh_challenge.operation_binding_hash,
+            ip_address_hash: [22; 32],
+            user_agent_hash: [23; 32],
+            required_factors: Vec::new(),
+            trusted_device_id: None,
+            protocol_version: 1,
+            issued_at_epoch_millis: changed_at,
+            attempts_limit: 5,
+        };
+        repository
+            .create_login_challenge(
+                &LoginChallengeAuthority {
+                    challenge: fresh_challenge.clone(),
+                    context: fresh_context.clone(),
+                },
+                &login_audit(
+                    format!("login-snapshot-fresh-issued-{suffix}"),
+                    &account_id,
+                    "mfa_challenge_issued",
+                    "success",
+                    changed_at,
+                ),
+            )
+            .await
+            .expect("create fresh login snapshot challenge");
+        fresh_context.account_updated_at_epoch_millis = changed_at;
+        let fresh_session_id = format!("login-snapshot-fresh-session-{suffix}");
+        let fresh_grant_id = format!("login-snapshot-fresh-grant-{suffix}");
+        let mut fresh_command = command.clone();
+        fresh_command.challenge_id = fresh_challenge_id.clone();
+        fresh_command.account_updated_at_epoch_millis = changed_at;
+        fresh_command.challenge_binding_hash = fresh_challenge.operation_binding_hash;
+        fresh_command.account_session.account_session_id = fresh_session_id.clone();
+        fresh_command.account_session.refresh_token_hash =
+            sha256(format!("fresh-refresh-{suffix}").as_bytes());
+        fresh_command.account_session.expires_at_epoch_millis = fresh_now + 600_000;
+        let fresh_grant = fresh_command
+            .enrollment_grant
+            .as_mut()
+            .expect("pending login has enrollment grant");
+        fresh_grant.grant_id = fresh_grant_id.clone();
+        fresh_grant.grant_secret_hash = sha256(format!("fresh-grant-secret-{suffix}").as_bytes());
+        fresh_grant.login_challenge_id = fresh_challenge_id.clone();
+        fresh_grant.login_challenge_binding_hash = fresh_challenge.operation_binding_hash;
+        fresh_grant.issued_account_session_id = fresh_session_id.clone();
+        fresh_grant.issued_at_epoch_millis = fresh_now;
+        fresh_grant.expires_at_epoch_millis = fresh_challenge.expires_at_epoch_millis;
+        fresh_command.audit_entries = vec![
+            login_audit(
+                format!("login-snapshot-fresh-mfa-success-{suffix}"),
+                &account_id,
+                "mfa_challenge_succeeded",
+                "success",
+                fresh_now,
+            ),
+            login_audit(
+                format!("login-snapshot-fresh-success-{suffix}"),
+                &account_id,
+                "login_succeeded",
+                "success",
+                fresh_now,
+            ),
+        ];
+        fresh_command.failure_audit_entry = login_audit(
+            format!("login-snapshot-fresh-failure-{suffix}"),
+            &account_id,
+            "mfa_challenge_failed",
+            "failure",
+            fresh_now,
+        );
+        fresh_command.now_epoch_millis = fresh_now;
+        assert_eq!(
+            repository.finish_login(&fresh_command).await,
+            Ok(LoginFinishOutcome::Completed)
+        );
+
+        let client = repository.client.lock().await;
+        let row = client
+            .query_one(
+                "SELECT
+                    (SELECT count(*) FROM account_sessions WHERE account_session_id=$1
+                       AND mfa_verified=FALSE AND revoked_at_epoch_millis IS NULL) AS sessions,
+                    (SELECT count(*) FROM device_enrollment_grants WHERE grant_id=$2
+                       AND consumed_at_epoch_millis IS NULL) AS grants,
+                    (SELECT status FROM account_risk_challenges
+                     WHERE risk_challenge_id=$3) AS challenge_status",
+                &[&fresh_session_id, &fresh_grant_id, &fresh_challenge_id],
+            )
+            .await
+            .expect("query fresh login completion");
+        assert_eq!(row.get::<_, i64>("sessions"), 1);
+        assert_eq!(row.get::<_, i64>("grants"), 1);
+        assert_eq!(row.get::<_, String>("challenge_status"), "consumed");
+        client
+            .execute(
+                "DELETE FROM device_enrollment_grants WHERE account_id=$1",
+                &[&account_id],
+            )
+            .await
+            .expect("delete login snapshot grants");
+        client
+            .execute(
+                "DELETE FROM account_sessions WHERE account_id=$1",
+                &[&account_id],
+            )
+            .await
+            .expect("delete login snapshot sessions");
+        client
+            .execute(
+                "DELETE FROM audit_logs WHERE actor_account_id=$1",
+                &[&account_id],
+            )
+            .await
+            .expect("delete login snapshot audits");
+        client
+            .execute(
+                "DELETE FROM account_risk_challenges WHERE account_id=$1",
+                &[&account_id],
+            )
+            .await
+            .expect("delete login snapshot challenge");
+        client
+            .execute("DELETE FROM accounts WHERE account_id=$1", &[&account_id])
+            .await
+            .expect("delete login snapshot account");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
+    async fn login_trust_refresh_audits_revocation_and_rolls_back_on_audit_conflict() {
+        let database_url = std::env::var("API_TEST_DATABASE_URL")
+            .expect("API_TEST_DATABASE_URL must point to an isolated migrated database");
+        let repository = PostgresRepository::connect(&database_url, [0; 32])
+            .await
+            .expect("connect PostgreSQL repository");
+        let suffix = crate::security::random_uuid_v4();
+        let account_id = format!("login-trust-audit-account-{suffix}");
+        let email = format!("login-trust-audit-{suffix}@example.com");
+        let device_id = format!("login-trust-audit-device-{suffix}");
+        let public_key_id = format!("login-trust-audit-key-{suffix}");
+        let factor_id = format!("login-trust-audit-factor-{suffix}");
+        let old_trusted_device_id = format!("login-trust-audit-old-{suffix}");
+        let recovery_code_id = format!("login-trust-audit-recovery-{suffix}");
+        let recovery_code = format!("recovery-code-{suffix}");
+        let device_public_key = [41_u8; 32];
+        let device_fingerprint = sha256(&device_public_key);
+        let created_at = now_epoch_millis();
+        let factor = MfaFactor {
+            factor_id: factor_id.clone(),
+            account_id: account_id.clone(),
+            secret_base32: "JBSWY3DPEHPK3PXP".into(),
+            active: true,
+            last_used_counter: None,
+            created_at_epoch_millis: created_at,
+        };
+        let encrypted_factor = encrypt_mfa(&[0; 32], &factor).expect("encrypt test MFA factor");
+        let recovery_hash = sha256(recovery_code.as_bytes());
+        {
+            let client = repository.client.lock().await;
+            client
+                .execute(
+                    "INSERT INTO accounts (account_id, email, display_name, password_hash,
+                        status, created_at_epoch_millis, updated_at_epoch_millis)
+                     VALUES ($1,$2,'Login Trust Audit Test','test-password-hash','active',$3,$3)",
+                    &[&account_id, &email, &to_i64_lossless(created_at)],
+                )
+                .await
+                .expect("insert login trust audit account");
+            client
+                .execute(
+                    "INSERT INTO devices (device_id, account_id, display_name, platform,
+                        os_version, arch, public_key_id, public_key, public_key_version,
+                        public_key_revoked_at_epoch_millis, status, unattended_enabled,
+                        last_seen_epoch_millis, created_at_epoch_millis,
+                        updated_at_epoch_millis)
+                     VALUES ($1,$2,'Login Trust Audit Device','ubuntu','26.04','x86_64',$3,$4,1,
+                        NULL,'online',FALSE,$5,$5,$5)",
+                    &[
+                        &device_id,
+                        &account_id,
+                        &public_key_id,
+                        &&device_public_key[..],
+                        &to_i64_lossless(created_at),
+                    ],
+                )
+                .await
+                .expect("insert login trust audit device");
+            client
+                .execute(
+                    "INSERT INTO account_mfa_factors (factor_id, account_id, factor_type,
+                        encrypted_secret, status, last_used_at_epoch_millis,
+                        created_at_epoch_millis, disabled_at_epoch_millis)
+                     VALUES ($1,$2,'totp',$3,'active',NULL,$4,NULL)",
+                    &[
+                        &factor_id,
+                        &account_id,
+                        &encrypted_factor,
+                        &to_i64_lossless(created_at),
+                    ],
+                )
+                .await
+                .expect("insert login trust audit MFA factor");
+            client
+                .execute(
+                    "INSERT INTO account_recovery_codes (recovery_code_id, account_id,
+                        code_hash, status, used_at_epoch_millis, created_at_epoch_millis,
+                        expires_at_epoch_millis)
+                     VALUES ($1,$2,$3,'active',NULL,$4,NULL)",
+                    &[
+                        &recovery_code_id,
+                        &account_id,
+                        &&recovery_hash[..],
+                        &to_i64_lossless(created_at),
+                    ],
+                )
+                .await
+                .expect("insert login trust audit recovery code");
+            client
+                .execute(
+                    "INSERT INTO trusted_controller_devices (trusted_device_id, account_id,
+                        controller_device_id, device_fingerprint_hash, trust_level, status,
+                        trust_proof_type, created_at_epoch_millis, last_used_at_epoch_millis,
+                        expires_at_epoch_millis, revoked_at_epoch_millis)
+                     VALUES ($1,$2,$3,$4,'standard','active','device_signature_and_mfa',
+                        $5,NULL,$6,NULL)",
+                    &[
+                        &old_trusted_device_id,
+                        &account_id,
+                        &device_id,
+                        &&device_fingerprint[..],
+                        &to_i64_lossless(created_at),
+                        &to_i64_lossless(created_at + 2_592_000_000),
+                    ],
+                )
+                .await
+                .expect("insert old active trusted device");
+        }
+
+        let challenge_issued_at = created_at.saturating_add(1);
+        let finish_at = challenge_issued_at.saturating_add(1);
+        let challenge_id = format!("login-trust-audit-challenge-{suffix}");
+        let authority = registered_login_authority(
+            &challenge_id,
+            &account_id,
+            created_at,
+            &device_id,
+            &public_key_id,
+            device_public_key,
+            [42; 32],
+            challenge_issued_at,
+        );
+        repository
+            .create_login_challenge(
+                &authority,
+                &login_audit(
+                    format!("login-trust-audit-issued-{suffix}"),
+                    &account_id,
+                    "mfa_challenge_issued",
+                    "success",
+                    challenge_issued_at,
+                ),
+            )
+            .await
+            .expect("create login trust refresh challenge");
+        let session_id = format!("login-trust-audit-session-{suffix}");
+        let new_trusted_device_id = format!("login-trust-audit-new-{suffix}");
+        let audit_prefix = format!("login-trust-audit-success-{suffix}");
+        let command = recovery_login_finish_command(
+            &authority,
+            &recovery_code,
+            &session_id,
+            &new_trusted_device_id,
+            &audit_prefix,
+            finish_at,
+        );
+        assert_eq!(
+            repository.finish_login(&command).await,
+            Ok(LoginFinishOutcome::Completed)
+        );
+        let trust_source = command
+            .audit_entries
+            .iter()
+            .find(|audit| audit.action == "trusted_device_added")
+            .expect("trusted-device source audit");
+        let revocation_audit = trusted_device_revocation_audit(
+            trust_source,
+            &old_trusted_device_id,
+            &device_id,
+            "refreshed",
+        );
+        {
+            let client = repository.client.lock().await;
+            let row = client
+                .query_one(
+                    "SELECT
+                        (SELECT status FROM trusted_controller_devices
+                         WHERE trusted_device_id=$1) AS old_status,
+                        (SELECT count(*) FROM trusted_controller_devices
+                         WHERE trusted_device_id=$2 AND status='active') AS new_active,
+                        (SELECT action FROM audit_logs WHERE audit_id=$3) AS object_action,
+                        (SELECT reason FROM audit_logs WHERE audit_id=$3) AS object_reason,
+                        (SELECT metadata->>'trusted_device_id' FROM audit_logs
+                         WHERE audit_id=$3) AS audited_trust_id,
+                        (SELECT count(*) FROM audit_logs WHERE audit_id=$4) AS top_level_count",
+                    &[
+                        &old_trusted_device_id,
+                        &new_trusted_device_id,
+                        &revocation_audit.audit_id,
+                        &trust_source.audit_id,
+                    ],
+                )
+                .await
+                .expect("query successful login trust refresh transaction");
+            assert_eq!(
+                row.get::<_, Option<String>>("old_status").as_deref(),
+                Some("revoked")
+            );
+            assert_eq!(row.get::<_, i64>("new_active"), 1);
+            assert_eq!(
+                row.get::<_, Option<String>>("object_action").as_deref(),
+                Some("trusted_device_revoked")
+            );
+            assert_eq!(
+                row.get::<_, Option<String>>("object_reason").as_deref(),
+                Some("refreshed")
+            );
+            assert_eq!(
+                row.get::<_, Option<String>>("audited_trust_id").as_deref(),
+                Some(old_trusted_device_id.as_str())
+            );
+            assert_eq!(row.get::<_, i64>("top_level_count"), 1);
+        }
+
+        let conflict_recovery_code_id = format!("login-trust-conflict-recovery-{suffix}");
+        let conflict_recovery_code = format!("conflict-recovery-code-{suffix}");
+        let conflict_recovery_hash = sha256(conflict_recovery_code.as_bytes());
+        let conflict_challenge_issued_at = finish_at.saturating_add(1);
+        {
+            let client = repository.client.lock().await;
+            client
+                .execute(
+                    "INSERT INTO account_recovery_codes (recovery_code_id, account_id,
+                        code_hash, status, used_at_epoch_millis, created_at_epoch_millis,
+                        expires_at_epoch_millis)
+                     VALUES ($1,$2,$3,'active',NULL,$4,NULL)",
+                    &[
+                        &conflict_recovery_code_id,
+                        &account_id,
+                        &&conflict_recovery_hash[..],
+                        &to_i64_lossless(conflict_challenge_issued_at),
+                    ],
+                )
+                .await
+                .expect("insert conflict recovery code");
+        }
+        let conflict_challenge_id = format!("login-trust-conflict-challenge-{suffix}");
+        let conflict_authority = registered_login_authority(
+            &conflict_challenge_id,
+            &account_id,
+            created_at,
+            &device_id,
+            &public_key_id,
+            device_public_key,
+            [43; 32],
+            conflict_challenge_issued_at,
+        );
+        repository
+            .create_login_challenge(
+                &conflict_authority,
+                &login_audit(
+                    format!("login-trust-conflict-issued-{suffix}"),
+                    &account_id,
+                    "mfa_challenge_issued",
+                    "success",
+                    conflict_challenge_issued_at,
+                ),
+            )
+            .await
+            .expect("create conflicting login trust refresh challenge");
+        let conflict_finish_at = conflict_challenge_issued_at.saturating_add(1);
+        let conflict_session_id = format!("login-trust-conflict-session-{suffix}");
+        let conflict_new_trust_id = format!("login-trust-conflict-new-{suffix}");
+        let conflict_audit_prefix = format!("login-trust-conflict-{suffix}");
+        let conflict_command = recovery_login_finish_command(
+            &conflict_authority,
+            &conflict_recovery_code,
+            &conflict_session_id,
+            &conflict_new_trust_id,
+            &conflict_audit_prefix,
+            conflict_finish_at,
+        );
+        let conflict_trust_source = conflict_command
+            .audit_entries
+            .iter()
+            .find(|audit| audit.action == "trusted_device_added")
+            .expect("conflict trusted-device source audit");
+        let conflicting_object_audit = trusted_device_revocation_audit(
+            conflict_trust_source,
+            &new_trusted_device_id,
+            &device_id,
+            "refreshed",
+        );
+        {
+            let mut client = repository.client.lock().await;
+            let transaction = client
+                .transaction()
+                .await
+                .expect("start audit seed transaction");
+            insert_audit_entry_strict(&transaction, &conflicting_object_audit)
+                .await
+                .expect("seed conflicting trusted-device object audit");
+            transaction
+                .commit()
+                .await
+                .expect("commit conflicting trusted-device object audit");
+        }
+        assert_eq!(
+            repository.finish_login(&conflict_command).await,
+            Err(StoreError::Conflict)
+        );
+        {
+            let client = repository.client.lock().await;
+            let row = client
+                .query_one(
+                    "SELECT
+                        (SELECT status FROM account_risk_challenges
+                         WHERE risk_challenge_id=$1) AS challenge_status,
+                        (SELECT status FROM account_recovery_codes
+                         WHERE recovery_code_id=$2) AS recovery_status,
+                        (SELECT count(*) FROM account_sessions
+                         WHERE account_session_id=$3) AS session_count,
+                        (SELECT count(*) FROM trusted_controller_devices
+                         WHERE trusted_device_id=$4 AND status='active'
+                           AND revoked_at_epoch_millis IS NULL) AS old_active,
+                        (SELECT count(*) FROM trusted_controller_devices
+                         WHERE trusted_device_id=$5) AS new_trust_count,
+                        (SELECT count(*) FROM audit_logs WHERE audit_id=$6) AS object_audit_count,
+                        (SELECT count(*) FROM audit_logs
+                         WHERE audit_id IN ($7,$8,$9,$10)) AS top_level_count",
+                    &[
+                        &conflict_challenge_id,
+                        &conflict_recovery_code_id,
+                        &conflict_session_id,
+                        &new_trusted_device_id,
+                        &conflict_new_trust_id,
+                        &conflicting_object_audit.audit_id,
+                        &conflict_command.audit_entries[0].audit_id,
+                        &conflict_command.audit_entries[1].audit_id,
+                        &conflict_command.audit_entries[2].audit_id,
+                        &conflict_command.audit_entries[3].audit_id,
+                    ],
+                )
+                .await
+                .expect("query rolled back login trust refresh transaction");
+            assert_eq!(
+                row.get::<_, Option<String>>("challenge_status").as_deref(),
+                Some("issued")
+            );
+            assert_eq!(
+                row.get::<_, Option<String>>("recovery_status").as_deref(),
+                Some("active")
+            );
+            assert_eq!(row.get::<_, i64>("session_count"), 0);
+            assert_eq!(row.get::<_, i64>("old_active"), 1);
+            assert_eq!(row.get::<_, i64>("new_trust_count"), 0);
+            assert_eq!(row.get::<_, i64>("object_audit_count"), 1);
+            assert_eq!(row.get::<_, i64>("top_level_count"), 0);
+
+            client
+                .execute(
+                    "DELETE FROM audit_logs WHERE actor_account_id=$1",
+                    &[&account_id],
+                )
+                .await
+                .expect("delete login trust audit test audits");
+            client
+                .execute(
+                    "DELETE FROM trusted_controller_devices WHERE account_id=$1",
+                    &[&account_id],
+                )
+                .await
+                .expect("delete login trust audit test trusts");
+            client
+                .execute(
+                    "DELETE FROM account_recovery_codes WHERE account_id=$1",
+                    &[&account_id],
+                )
+                .await
+                .expect("delete login trust audit test recovery codes");
+            client
+                .execute(
+                    "DELETE FROM account_mfa_factors WHERE account_id=$1",
+                    &[&account_id],
+                )
+                .await
+                .expect("delete login trust audit test MFA factor");
+            client
+                .execute(
+                    "DELETE FROM account_risk_challenges WHERE account_id=$1",
+                    &[&account_id],
+                )
+                .await
+                .expect("delete login trust audit test challenges");
+            client
+                .execute(
+                    "DELETE FROM account_sessions WHERE account_id=$1",
+                    &[&account_id],
+                )
+                .await
+                .expect("delete login trust audit test sessions");
+            client
+                .execute("DELETE FROM devices WHERE device_id=$1", &[&device_id])
+                .await
+                .expect("delete login trust audit test device");
+            client
+                .execute("DELETE FROM accounts WHERE account_id=$1", &[&account_id])
+                .await
+                .expect("delete login trust audit test account");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
+    async fn refresh_rotation_audits_revocation_and_rolls_back_on_audit_conflict() {
+        let database_url = std::env::var("API_TEST_DATABASE_URL")
+            .expect("API_TEST_DATABASE_URL must point to an isolated migrated database");
+        let repository = PostgresRepository::connect(&database_url, [0; 32])
+            .await
+            .expect("connect PostgreSQL repository");
+        let suffix = crate::security::random_uuid_v4();
+        let account_id = format!("refresh-audit-account-{suffix}");
+        let email = format!("refresh-audit-{suffix}@example.com");
+        let old_session_id = format!("refresh-audit-old-{suffix}");
+        let replacement_session_id = format!("refresh-audit-new-{suffix}");
+        let created_at = now_epoch_millis();
+        let rotated_at = created_at.saturating_add(1);
+        let old_refresh_hash = sha256(format!("old-refresh-{suffix}").as_bytes());
+        {
+            let client = repository.client.lock().await;
+            client
+                .execute(
+                    "INSERT INTO accounts (account_id, email, display_name, password_hash,
+                        status, created_at_epoch_millis, updated_at_epoch_millis)
+                     VALUES ($1,$2,'Refresh Audit Test','test-password-hash','active',$3,$3)",
+                    &[&account_id, &email, &to_i64_lossless(created_at)],
+                )
+                .await
+                .expect("insert refresh audit account");
+            client
+                .execute(
+                    "INSERT INTO account_sessions (account_session_id, account_id,
+                        refresh_token_hash, device_label, mfa_verified,
+                        expires_at_epoch_millis, revoked_at_epoch_millis, revoked_reason,
+                        created_at_epoch_millis, updated_at_epoch_millis)
+                     VALUES ($1,$2,$3,'refresh-audit-test',TRUE,$4,NULL,NULL,$5,$5)",
+                    &[
+                        &old_session_id,
+                        &account_id,
+                        &&old_refresh_hash[..],
+                        &to_i64_lossless(created_at + 600_000),
+                        &to_i64_lossless(created_at),
+                    ],
+                )
+                .await
+                .expect("insert old refresh session");
+        }
+
+        let replacement = AccountSession {
+            account_session_id: replacement_session_id.clone(),
+            account_id: account_id.clone(),
+            refresh_token_hash: sha256(format!("new-refresh-{suffix}").as_bytes()),
+            mfa_verified: true,
+            expires_at_epoch_millis: rotated_at + 600_000,
+            revoked_at_epoch_millis: None,
+            revoked_reason: None,
+        };
+        let refresh_audit = login_audit(
+            format!("refresh-success-{suffix}"),
+            &account_id,
+            "token_refreshed",
+            "success",
+            rotated_at,
+        );
+        assert_eq!(
+            repository
+                .rotate_refresh_session(
+                    &old_refresh_hash,
+                    &replacement,
+                    &refresh_audit,
+                    rotated_at,
+                )
+                .await,
+            Ok(true)
+        );
+        let revocation_audit =
+            account_session_revocation_audit(&refresh_audit, &old_session_id, "refresh_replay");
+        {
+            let client = repository.client.lock().await;
+            let row = client
+                .query_one(
+                    "SELECT
+                        (SELECT revoked_reason FROM account_sessions
+                         WHERE account_session_id=$1) AS revoked_reason,
+                        (SELECT count(*) FROM account_sessions
+                         WHERE account_session_id=$2 AND revoked_at_epoch_millis IS NULL) AS replacement_count,
+                        (SELECT action FROM audit_logs WHERE audit_id=$3) AS object_action,
+                        (SELECT reason FROM audit_logs WHERE audit_id=$3) AS object_reason,
+                        (SELECT metadata->>'account_session_id' FROM audit_logs
+                         WHERE audit_id=$3) AS audited_session_id,
+                        (SELECT count(*) FROM audit_logs WHERE audit_id=$4) AS top_level_count",
+                    &[
+                        &old_session_id,
+                        &replacement_session_id,
+                        &revocation_audit.audit_id,
+                        &refresh_audit.audit_id,
+                    ],
+                )
+                .await
+                .expect("query successful refresh audit transaction");
+            assert_eq!(
+                row.get::<_, Option<String>>("revoked_reason").as_deref(),
+                Some("refresh_replay")
+            );
+            assert_eq!(row.get::<_, i64>("replacement_count"), 1);
+            assert_eq!(
+                row.get::<_, Option<String>>("object_action").as_deref(),
+                Some("account_session_revoked")
+            );
+            assert_eq!(
+                row.get::<_, Option<String>>("object_reason").as_deref(),
+                Some("refresh_replay")
+            );
+            assert_eq!(
+                row.get::<_, Option<String>>("audited_session_id")
+                    .as_deref(),
+                Some(old_session_id.as_str())
+            );
+            assert_eq!(row.get::<_, i64>("top_level_count"), 1);
+        }
+
+        let conflict_old_session_id = format!("refresh-conflict-old-{suffix}");
+        let conflict_replacement_session_id = format!("refresh-conflict-new-{suffix}");
+        let conflict_refresh_hash = sha256(format!("conflict-old-refresh-{suffix}").as_bytes());
+        let conflict_at = rotated_at.saturating_add(1);
+        let conflict_audit = login_audit(
+            format!("refresh-conflict-{suffix}"),
+            &account_id,
+            "token_refreshed",
+            "success",
+            conflict_at,
+        );
+        let conflicting_object_audit = account_session_revocation_audit(
+            &conflict_audit,
+            &conflict_old_session_id,
+            "refresh_replay",
+        );
+        {
+            let mut client = repository.client.lock().await;
+            client
+                .execute(
+                    "INSERT INTO account_sessions (account_session_id, account_id,
+                        refresh_token_hash, device_label, mfa_verified,
+                        expires_at_epoch_millis, revoked_at_epoch_millis, revoked_reason,
+                        created_at_epoch_millis, updated_at_epoch_millis)
+                     VALUES ($1,$2,$3,'refresh-conflict-test',TRUE,$4,NULL,NULL,$5,$5)",
+                    &[
+                        &conflict_old_session_id,
+                        &account_id,
+                        &&conflict_refresh_hash[..],
+                        &to_i64_lossless(conflict_at + 600_000),
+                        &to_i64_lossless(conflict_at),
+                    ],
+                )
+                .await
+                .expect("insert conflict refresh session");
+            let transaction = client
+                .transaction()
+                .await
+                .expect("start audit seed transaction");
+            insert_audit_entry_strict(&transaction, &conflicting_object_audit)
+                .await
+                .expect("seed conflicting refresh object audit");
+            transaction
+                .commit()
+                .await
+                .expect("commit conflicting refresh object audit");
+        }
+        let conflict_replacement = AccountSession {
+            account_session_id: conflict_replacement_session_id.clone(),
+            account_id: account_id.clone(),
+            refresh_token_hash: sha256(format!("conflict-new-refresh-{suffix}").as_bytes()),
+            mfa_verified: true,
+            expires_at_epoch_millis: conflict_at + 600_000,
+            revoked_at_epoch_millis: None,
+            revoked_reason: None,
+        };
+        assert_eq!(
+            repository
+                .rotate_refresh_session(
+                    &conflict_refresh_hash,
+                    &conflict_replacement,
+                    &conflict_audit,
+                    conflict_at,
+                )
+                .await,
+            Err(StoreError::Conflict)
+        );
+        {
+            let client = repository.client.lock().await;
+            let row = client
+                .query_one(
+                    "SELECT
+                        (SELECT count(*) FROM account_sessions WHERE account_session_id=$1
+                         AND revoked_at_epoch_millis IS NULL AND revoked_reason IS NULL) AS old_active,
+                        (SELECT count(*) FROM account_sessions WHERE account_session_id=$2) AS replacement_count,
+                        (SELECT count(*) FROM audit_logs WHERE audit_id=$3) AS object_audit_count,
+                        (SELECT count(*) FROM audit_logs WHERE audit_id=$4) AS top_level_count",
+                    &[
+                        &conflict_old_session_id,
+                        &conflict_replacement_session_id,
+                        &conflicting_object_audit.audit_id,
+                        &conflict_audit.audit_id,
+                    ],
+                )
+                .await
+                .expect("query rolled back refresh audit transaction");
+            assert_eq!(row.get::<_, i64>("old_active"), 1);
+            assert_eq!(row.get::<_, i64>("replacement_count"), 0);
+            assert_eq!(row.get::<_, i64>("object_audit_count"), 1);
+            assert_eq!(row.get::<_, i64>("top_level_count"), 0);
+
+            client
+                .execute(
+                    "DELETE FROM audit_logs WHERE actor_account_id=$1",
+                    &[&account_id],
+                )
+                .await
+                .expect("delete refresh audit test audits");
+            client
+                .execute(
+                    "DELETE FROM account_sessions WHERE account_id=$1",
+                    &[&account_id],
+                )
+                .await
+                .expect("delete refresh audit test sessions");
+            client
+                .execute("DELETE FROM accounts WHERE account_id=$1", &[&account_id])
+                .await
+                .expect("delete refresh audit test account");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
+    async fn device_authority_mutations_audit_every_returned_object() -> Result<(), String> {
+        let database_url = std::env::var("API_TEST_DATABASE_URL")
+            .map_err(|_| "API_TEST_DATABASE_URL must point to an isolated migrated database")?;
+
+        let unbind_fixture = PostgresDeviceAuthorityFixture::random("device-unbind-count");
+        seed_postgres_device_authority_fixture(&database_url, &unbind_fixture, 2, true).await?;
+        let unbind_repository = PostgresRepository::connect(&database_url, [0; 32]).await?;
+        let unbound_at = unbind_fixture.created_at_epoch_millis.saturating_add(10);
+        let unbind = device_management_test_command(
+            &unbind_fixture,
+            DeviceManagementAction::Unbind,
+            format!("unbind-count-{}", unbind_fixture.account_id),
+            unbound_at,
+        );
+        let unbind_outcome = unbind_repository
+            .manage_device(&unbind)
+            .await
+            .map_err(|error| format!("unbind device: {error:?}"))?;
+        if !matches!(unbind_outcome, DeviceManagementOutcome::Updated(_)) {
+            return Err(format!("unexpected unbind outcome: {unbind_outcome:?}"));
+        }
+        {
+            let client = unbind_repository.client.lock().await;
+            let row = client
+                .query_one(
+                    "SELECT
+                        count(*) FILTER (WHERE action='account_session_revoked') AS session_audits,
+                        count(*) FILTER (WHERE action='trusted_device_revoked') AS trust_audits,
+                        count(*) FILTER (WHERE action='device_unregistered') AS top_level_audits,
+                        count(*) FILTER (WHERE action='device_public_key_revoked'
+                            AND reason='device_unbound'
+                            AND metadata ? 'old_public_key_id'
+                            AND metadata ? 'old_public_key_version'
+                            AND metadata ? 'old_public_key_fingerprint'
+                            AND metadata ? 'revoked_at_epoch_millis'
+                            AND metadata ? 'revocation_reason'
+                            AND metadata ? 'affected_session_ids_hash') AS key_snapshot_audits,
+                        (SELECT count(*) FROM account_sessions WHERE account_id=$1
+                            AND revoked_at_epoch_millis=$2
+                            AND revoked_reason='device_unbound') AS revoked_sessions,
+                        (SELECT count(*) FROM trusted_controller_devices WHERE account_id=$1
+                            AND status='revoked' AND revoked_at_epoch_millis=$2) AS revoked_trusts
+                     FROM audit_logs WHERE actor_account_id=$1",
+                    &[&unbind_fixture.account_id, &to_i64_lossless(unbound_at)],
+                )
+                .await
+                .map_err(|error| format!("query unbind object audits: {error}"))?;
+            if row.get::<_, i64>("session_audits") != 2
+                || row.get::<_, i64>("trust_audits") != 1
+                || row.get::<_, i64>("top_level_audits") != 1
+                || row.get::<_, i64>("key_snapshot_audits") != 1
+                || row.get::<_, i64>("revoked_sessions") != 2
+                || row.get::<_, i64>("revoked_trusts") != 1
+            {
+                return Err("unbind did not audit every returned authority object".into());
+            }
+        }
+        {
+            let published = unbind_repository.database.read().await;
+            if published
+                .account_sessions
+                .values()
+                .filter(|session| session.account_id == unbind_fixture.account_id)
+                .any(|session| session.revoked_at_epoch_millis != Some(unbound_at))
+                || published
+                    .trusted_controller_devices
+                    .get(&unbind_fixture.trusted_device_id)
+                    .is_none_or(|trusted| {
+                        trusted.status != TrustedDeviceStatus::Revoked
+                            || trusted.revoked_at_epoch_millis != Some(unbound_at)
+                    })
+            {
+                return Err("unbind cache was not published from returned objects".into());
+            }
+        }
+        drop(unbind_repository);
+        cleanup_postgres_login_fixture(&database_url, &unbind_fixture.account_id).await?;
+
+        let rotation_fixture = PostgresDeviceAuthorityFixture::random("device-rotation-count");
+        seed_postgres_device_authority_fixture(&database_url, &rotation_fixture, 1, true).await?;
+        let operation_binding_hash = [81; 32];
+        let challenge_id = format!("rotation-count-{}", rotation_fixture.account_id);
+        seed_postgres_rotation_challenge(
+            &database_url,
+            &rotation_fixture,
+            &challenge_id,
+            &operation_binding_hash,
+        )
+        .await?;
+        let rotation_repository = PostgresRepository::connect(&database_url, [0; 32]).await?;
+        let rotated_at = rotation_fixture.created_at_epoch_millis.saturating_add(10);
+        let rotation = device_rotation_test_command(
+            &rotation_fixture,
+            &challenge_id,
+            operation_binding_hash,
+            format!("rotation-count-{}", rotation_fixture.account_id),
+            rotated_at,
+        );
+        rotation_repository
+            .rotate_device_key(&rotation)
+            .await
+            .map_err(|error| format!("rotate device key: {error:?}"))?;
+        {
+            let client = rotation_repository.client.lock().await;
+            let row = client
+                .query_one(
+                    "SELECT
+                        count(*) FILTER (WHERE action='trusted_device_revoked'
+                            AND reason='device_key_rotated') AS trust_audits,
+                        count(*) FILTER (WHERE action='device_public_key_rotated'
+                            AND metadata ? 'old_public_key_id'
+                            AND metadata ? 'old_public_key_version'
+                            AND metadata ? 'old_public_key_fingerprint'
+                            AND metadata ? 'new_public_key_id'
+                            AND metadata ? 'new_public_key_version'
+                            AND metadata ? 'new_public_key_fingerprint'
+                            AND metadata ? 'revoked_at_epoch_millis'
+                            AND metadata ? 'rotation_reason'
+                            AND metadata ? 'step_up_challenge_id') AS rotation_audits,
+                        (SELECT count(*) FROM account_sessions WHERE account_id=$1
+                            AND revoked_at_epoch_millis IS NULL
+                            AND revoked_reason IS NULL) AS active_sessions
+                     FROM audit_logs WHERE actor_account_id=$1",
+                    &[&rotation_fixture.account_id],
+                )
+                .await
+                .map_err(|error| format!("query rotation object audits: {error}"))?;
+            if row.get::<_, i64>("trust_audits") != 1
+                || row.get::<_, i64>("rotation_audits") != 1
+                || row.get::<_, i64>("active_sessions") != 1
+            {
+                return Err("rotation audit count or account session preservation is wrong".into());
+            }
+        }
+        {
+            let published = rotation_repository.database.read().await;
+            if published
+                .account_sessions
+                .get(&rotation_fixture.account_session_id(0))
+                .is_none_or(|session| session.revoked_at_epoch_millis.is_some())
+                || published
+                    .trusted_controller_devices
+                    .get(&rotation_fixture.trusted_device_id)
+                    .is_none_or(|trusted| trusted.status != TrustedDeviceStatus::Revoked)
+            {
+                return Err(
+                    "rotation cache did not preserve session and revoke returned trust".into(),
+                );
+            }
+        }
+        drop(rotation_repository);
+        cleanup_postgres_login_fixture(&database_url, &rotation_fixture.account_id).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
+    async fn device_authority_audit_conflicts_roll_back_entire_transactions() -> Result<(), String>
+    {
+        let database_url = std::env::var("API_TEST_DATABASE_URL")
+            .map_err(|_| "API_TEST_DATABASE_URL must point to an isolated migrated database")?;
+
+        let unbind_fixture = PostgresDeviceAuthorityFixture::random("device-unbind-conflict");
+        seed_postgres_device_authority_fixture(&database_url, &unbind_fixture, 1, true).await?;
+        let unbound_at = unbind_fixture.created_at_epoch_millis.saturating_add(10);
+        let unbind = device_management_test_command(
+            &unbind_fixture,
+            DeviceManagementAction::Unbind,
+            format!("unbind-conflict-{}", unbind_fixture.account_id),
+            unbound_at,
+        );
+        let conflicting_session_audit = account_session_revocation_audit(
+            &unbind.audit_entry,
+            &unbind_fixture.account_session_id(0),
+            "device_unbound",
+        );
+        seed_postgres_audit(&database_url, &conflicting_session_audit).await?;
+        let unbind_repository = PostgresRepository::connect(&database_url, [0; 32]).await?;
+        if unbind_repository.manage_device(&unbind).await != Err(StoreError::Conflict) {
+            return Err("unbind audit conflict did not fail closed".into());
+        }
+        {
+            let client = unbind_repository.client.lock().await;
+            let row = client
+                .query_one(
+                    "SELECT
+                        (SELECT status FROM devices WHERE device_id=$1) AS device_status,
+                        (SELECT public_key_revoked_at_epoch_millis FROM devices
+                            WHERE device_id=$1) AS key_revoked_at,
+                        (SELECT count(*) FROM account_sessions WHERE account_id=$2
+                            AND revoked_at_epoch_millis IS NULL) AS active_sessions,
+                        (SELECT count(*) FROM trusted_controller_devices WHERE account_id=$2
+                            AND status='active') AS active_trusts,
+                        (SELECT count(*) FROM audit_logs WHERE audit_id=$3) AS conflict_audits,
+                        (SELECT count(*) FROM audit_logs WHERE audit_id=$4) AS top_level_audits,
+                        (SELECT count(*) FROM audit_logs WHERE audit_id=$5) AS key_audits",
+                    &[
+                        &unbind_fixture.device_id,
+                        &unbind_fixture.account_id,
+                        &conflicting_session_audit.audit_id,
+                        &unbind.audit_entry.audit_id,
+                        &format!("{}:public-key", unbind.audit_entry.audit_id),
+                    ],
+                )
+                .await
+                .map_err(|error| format!("query unbind audit rollback: {error}"))?;
+            if row.get::<_, Option<String>>("device_status").as_deref() != Some("online")
+                || row.get::<_, Option<i64>>("key_revoked_at").is_some()
+                || row.get::<_, i64>("active_sessions") != 1
+                || row.get::<_, i64>("active_trusts") != 1
+                || row.get::<_, i64>("conflict_audits") != 1
+                || row.get::<_, i64>("top_level_audits") != 0
+                || row.get::<_, i64>("key_audits") != 0
+            {
+                return Err("unbind audit conflict left partial authority state".into());
+            }
+        }
+        drop(unbind_repository);
+        cleanup_postgres_login_fixture(&database_url, &unbind_fixture.account_id).await?;
+
+        let rotation_fixture = PostgresDeviceAuthorityFixture::random("device-rotation-conflict");
+        seed_postgres_device_authority_fixture(&database_url, &rotation_fixture, 1, true).await?;
+        let operation_binding_hash = [82; 32];
+        let challenge_id = format!("rotation-conflict-{}", rotation_fixture.account_id);
+        seed_postgres_rotation_challenge(
+            &database_url,
+            &rotation_fixture,
+            &challenge_id,
+            &operation_binding_hash,
+        )
+        .await?;
+        let rotated_at = rotation_fixture.created_at_epoch_millis.saturating_add(10);
+        let rotation = device_rotation_test_command(
+            &rotation_fixture,
+            &challenge_id,
+            operation_binding_hash,
+            format!("rotation-conflict-{}", rotation_fixture.account_id),
+            rotated_at,
+        );
+        let rotation_audit =
+            device_key_rotation_authority_audit(&rotation, &rotation_fixture.device())
+                .map_err(|error| format!("construct rotation authority audit: {error:?}"))?;
+        let conflicting_trust_audit = trusted_device_revocation_audit(
+            &rotation_audit,
+            &rotation_fixture.trusted_device_id,
+            &rotation_fixture.device_id,
+            "device_key_rotated",
+        );
+        seed_postgres_audit(&database_url, &conflicting_trust_audit).await?;
+        let rotation_repository = PostgresRepository::connect(&database_url, [0; 32]).await?;
+        if rotation_repository.rotate_device_key(&rotation).await != Err(StoreError::Conflict) {
+            return Err("rotation audit conflict did not fail closed".into());
+        }
+        {
+            let client = rotation_repository.client.lock().await;
+            let row = client
+                .query_one(
+                    "SELECT
+                        (SELECT public_key_id FROM devices WHERE device_id=$1) AS public_key_id,
+                        (SELECT status FROM account_risk_challenges
+                            WHERE risk_challenge_id=$2) AS challenge_status,
+                        (SELECT consumed_at_epoch_millis FROM account_risk_challenges
+                            WHERE risk_challenge_id=$2) AS challenge_consumed_at,
+                        (SELECT count(*) FROM trusted_controller_devices WHERE account_id=$3
+                            AND status='active') AS active_trusts,
+                        (SELECT count(*) FROM account_sessions WHERE account_id=$3
+                            AND revoked_at_epoch_millis IS NULL) AS active_sessions,
+                        (SELECT count(*) FROM audit_logs WHERE audit_id=$4) AS conflict_audits,
+                        (SELECT count(*) FROM audit_logs WHERE audit_id=$5) AS rotation_audits",
+                    &[
+                        &rotation_fixture.device_id,
+                        &challenge_id,
+                        &rotation_fixture.account_id,
+                        &conflicting_trust_audit.audit_id,
+                        &rotation.audit_entry.audit_id,
+                    ],
+                )
+                .await
+                .map_err(|error| format!("query rotation audit rollback: {error}"))?;
+            if row.get::<_, Option<String>>("public_key_id").as_deref()
+                != Some(rotation_fixture.public_key_id.as_str())
+                || row.get::<_, Option<String>>("challenge_status").as_deref() != Some("verified")
+                || row.get::<_, Option<i64>>("challenge_consumed_at").is_some()
+                || row.get::<_, i64>("active_trusts") != 1
+                || row.get::<_, i64>("active_sessions") != 1
+                || row.get::<_, i64>("conflict_audits") != 1
+                || row.get::<_, i64>("rotation_audits") != 0
+            {
+                return Err("rotation audit conflict left partial authority state".into());
+            }
+        }
+        drop(rotation_repository);
+        cleanup_postgres_login_fixture(&database_url, &rotation_fixture.account_id).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
+    async fn refresh_racing_unbind_or_key_revoke_cannot_leave_active_session() -> Result<(), String>
+    {
+        let database_url = std::env::var("API_TEST_DATABASE_URL")
+            .map_err(|_| "API_TEST_DATABASE_URL must point to an isolated migrated database")?;
+        for (name, action) in [
+            ("unbind", DeviceManagementAction::Unbind),
+            ("revoke-key", DeviceManagementAction::RevokePublicKey),
+        ] {
+            let fixture = PostgresDeviceAuthorityFixture::random(name);
+            let refresh_hashes =
+                seed_postgres_device_authority_fixture(&database_url, &fixture, 1, true).await?;
+            let refresh_repository = PostgresRepository::connect(&database_url, [0; 32]).await?;
+            let management_repository = PostgresRepository::connect(&database_url, [0; 32]).await?;
+            let now = fixture.created_at_epoch_millis.saturating_add(10);
+            let replacement = AccountSession {
+                account_session_id: format!("{}-replacement", fixture.account_session_id(0)),
+                account_id: fixture.account_id.clone(),
+                refresh_token_hash: sha256(
+                    format!("replacement-refresh-{}", fixture.account_id).as_bytes(),
+                ),
+                mfa_verified: true,
+                expires_at_epoch_millis: now + 600_000,
+                revoked_at_epoch_millis: None,
+                revoked_reason: None,
+            };
+            let refresh_audit = login_audit(
+                format!("refresh-race-{}", fixture.account_id),
+                &fixture.account_id,
+                "token_refreshed",
+                "success",
+                now,
+            );
+            let management = device_management_test_command(
+                &fixture,
+                action,
+                format!("management-race-{}", fixture.account_id),
+                now,
+            );
+            let (refresh_result, management_result) = tokio::join!(
+                refresh_repository.rotate_refresh_session(
+                    &refresh_hashes[0],
+                    &replacement,
+                    &refresh_audit,
+                    now,
+                ),
+                management_repository.manage_device(&management),
+            );
+            if !matches!(refresh_result, Ok(true) | Ok(false)) {
+                return Err(format!("{name} race refresh failed: {refresh_result:?}"));
+            }
+            if !matches!(management_result, Ok(DeviceManagementOutcome::Updated(_))) {
+                return Err(format!(
+                    "{name} race device management failed: {management_result:?}"
+                ));
+            }
+            let client = postgres_test_client(&database_url).await?;
+            let row = client
+                .query_one(
+                    "SELECT count(*) FILTER (WHERE revoked_at_epoch_millis IS NULL
+                        AND revoked_reason IS NULL) AS active_sessions
+                     FROM account_sessions WHERE account_id=$1",
+                    &[&fixture.account_id],
+                )
+                .await
+                .map_err(|error| format!("query {name} refresh race result: {error}"))?;
+            if row.get::<_, i64>("active_sessions") != 0 {
+                return Err(format!("{name} race left an active account session"));
+            }
+            drop(client);
+            drop(refresh_repository);
+            drop(management_repository);
+            cleanup_postgres_login_fixture(&database_url, &fixture.account_id).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
+    async fn device_registration_replay_survives_lifecycle_and_key_changes() -> Result<(), String> {
+        let database_url = std::env::var("API_TEST_DATABASE_URL")
+            .map_err(|_| "API_TEST_DATABASE_URL must point to an isolated migrated database")?;
+        let suffix = crate::security::random_uuid_v4();
+        let account_id = format!("registration-replay-account-{suffix}");
+        let account_session_id = format!("registration-replay-session-{suffix}");
+        let challenge_id = format!("registration-replay-challenge-{suffix}");
+        let grant_id = format!("registration-replay-grant-{suffix}");
+        let device_id = format!("registration-replay-device-{suffix}");
+        let initial_public_key_id = format!("registration-replay-key-{suffix}");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sha256(
+            format!("registration-replay-signing-key-{suffix}").as_bytes(),
+        ));
+        let public_key = signing_key.verifying_key().to_bytes();
+        let public_key_fingerprint = sha256(&public_key);
+        let grant_secret_hash = sha256(format!("registration-replay-secret-{suffix}").as_bytes());
+        let login_binding_hash = sha256(format!("registration-login-binding-{suffix}").as_bytes());
+        let now = now_epoch_millis();
+        let created = to_i64_lossless(now);
+
+        let client = postgres_test_client(&database_url).await?;
+        client
+            .execute(
+                "INSERT INTO accounts (account_id, email, display_name, password_hash,
+                    status, created_at_epoch_millis, updated_at_epoch_millis)
+                 VALUES ($1,$2,'Registration Replay Test','test-password-hash','active',$3,$3)",
+                &[
+                    &account_id,
+                    &format!("registration-replay-{suffix}@example.com"),
+                    &created,
+                ],
+            )
+            .await
+            .map_err(|error| format!("insert registration replay account: {error}"))?;
+        client
+            .execute(
+                "INSERT INTO account_sessions (account_session_id, account_id,
+                    refresh_token_hash, device_label, mfa_verified,
+                    expires_at_epoch_millis, revoked_at_epoch_millis, revoked_reason,
+                    created_at_epoch_millis, updated_at_epoch_millis)
+                 VALUES ($1,$2,$3,'registration-replay',FALSE,$4,NULL,NULL,$5,$5)",
+                &[
+                    &account_session_id,
+                    &account_id,
+                    &&sha256(format!("registration-replay-refresh-{suffix}").as_bytes())[..],
+                    &to_i64_lossless(now + 600_000),
+                    &created,
+                ],
+            )
+            .await
+            .map_err(|error| format!("insert registration replay session: {error}"))?;
+        client
+            .execute(
+                "INSERT INTO account_risk_challenges (risk_challenge_id, account_id,
+                    device_id, purpose, operation_binding_hash, risk_level, required_methods,
+                    status, attempts_remaining, expires_at_epoch_millis,
+                    created_at_epoch_millis, verified_at_epoch_millis,
+                    consumed_at_epoch_millis, login_device_state, login_device_id,
+                    login_device_public_key, login_device_public_key_fingerprint,
+                    login_public_key_id, login_public_key_version, login_client_nonce,
+                    login_server_nonce, login_request_binding_hash, login_ip_address_hash,
+                    login_user_agent_hash, login_trusted_device_id, login_protocol_version,
+                    login_attempts_limit, login_account_updated_at_epoch_millis)
+                 VALUES ($1,$2,NULL,'login_mfa',$3,'low','[]'::JSONB,'consumed',5,$4,
+                    $5,$5,$5,'pending_enrollment',$6,$7,$8,NULL,0,$9,$10,$11,$12,$13,
+                    NULL,1,5,$5)",
+                &[
+                    &challenge_id,
+                    &account_id,
+                    &&login_binding_hash[..],
+                    &to_i64_lossless(now + 300_000),
+                    &created,
+                    &device_id,
+                    &&public_key[..],
+                    &&public_key_fingerprint[..],
+                    &&[9_u8; 32][..],
+                    &&[10_u8; 32][..],
+                    &&[11_u8; 32][..],
+                    &&[12_u8; 32][..],
+                    &&[13_u8; 32][..],
+                ],
+            )
+            .await
+            .map_err(|error| format!("insert registration replay challenge: {error}"))?;
+        client
+            .execute(
+                "INSERT INTO device_enrollment_grants (grant_id, grant_secret_hash,
+                    account_id, device_id, device_public_key_fingerprint,
+                    login_challenge_id, login_challenge_binding_hash, trust_proof_type,
+                    trust_level, establish_trust, protocol_version,
+                    issued_account_session_id, issued_at_epoch_millis,
+                    expires_at_epoch_millis, consumed_at_epoch_millis,
+                    registration_request_binding_hash, registered_public_key_id,
+                    registered_trusted_device_id, created_at_epoch_millis)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,NULL,FALSE,1,$8,$9,$10,
+                    NULL,NULL,NULL,NULL,$9)",
+                &[
+                    &grant_id,
+                    &&grant_secret_hash[..],
+                    &account_id,
+                    &device_id,
+                    &&public_key_fingerprint[..],
+                    &challenge_id,
+                    &&login_binding_hash[..],
+                    &account_session_id,
+                    &created,
+                    &to_i64_lossless(now + 300_000),
+                ],
+            )
+            .await
+            .map_err(|error| format!("insert registration replay grant: {error}"))?;
+        drop(client);
+
+        let original_device = Device {
+            device_id: device_id.clone(),
+            account_id: account_id.clone(),
+            display_name: "Original registration name".into(),
+            platform: Platform::Ubuntu,
+            os_version: "26.04".into(),
+            arch: Architecture::X86_64,
+            capabilities: DeviceCapabilities {
+                controller: true,
+                controlled: false,
+                file_transfer: false,
+                unattended: false,
+            },
+            public_key_id: initial_public_key_id.clone(),
+            public_key,
+            public_key_version: 1,
+            public_key_revoked_at_epoch_millis: None,
+            status: DeviceLifecycleStatus::Offline,
+            last_seen_epoch_millis: None,
+            created_at_epoch_millis: now + 1,
+            updated_at_epoch_millis: now + 1,
+        };
+        let registration_request_binding_hash = device_registration_binding_hash(
+            &account_id,
+            &account_session_id,
+            &grant_id,
+            &device_id,
+            &original_device.display_name,
+            "ubuntu",
+            &original_device.os_version,
+            "x86_64",
+            true,
+            false,
+            false,
+            false,
+            &public_key_fingerprint,
+            1,
+        );
+        let registration_command = |request_suffix: &str,
+                                    generated_public_key_id: &str,
+                                    request_at: u64| {
+            let request_id = format!("registration-replay-request-{request_suffix}-{suffix}");
+            let audit_entry = AuditEntry {
+                audit_id: format!("registration-replay-audit-{request_suffix}-{suffix}"),
+                actor_type: "device".into(),
+                actor_account_id: Some(account_id.clone()),
+                actor_device_id: Some(device_id.clone()),
+                actor_role: Some("none".into()),
+                actor_service: None,
+                target_device_id: Some(device_id.clone()),
+                session_id: None,
+                action: "device_registered".into(),
+                result: "success".into(),
+                reason: None,
+                metadata: BTreeMap::new(),
+                request_id: request_id.clone(),
+                created_at_epoch_millis: request_at,
+            };
+            let mut device = original_device.clone();
+            device.public_key_id = generated_public_key_id.to_owned();
+            device.created_at_epoch_millis = request_at;
+            device.updated_at_epoch_millis = request_at;
+            DeviceRegistrationCommand {
+                grant_id: grant_id.clone(),
+                grant_secret_hash,
+                account_id: account_id.clone(),
+                account_session_id: account_session_id.clone(),
+                protocol_version: 1,
+                registration_request_binding_hash,
+                device,
+                trusted_device_id: Some(format!("ignored-trust-{request_suffix}-{suffix}")),
+                registration_audit_entry: audit_entry.clone(),
+                grant_audit_entry: AuditEntry {
+                    audit_id: format!("registration-replay-grant-audit-{request_suffix}-{suffix}"),
+                    action: "device_enrollment_grant_consumed".into(),
+                    ..audit_entry.clone()
+                },
+                trusted_device_audit_entry: Some(AuditEntry {
+                    audit_id: format!("registration-replay-trust-audit-{request_suffix}-{suffix}"),
+                    action: "trusted_device_added".into(),
+                    ..audit_entry
+                }),
+                signature_proof: crate::store::InitialDeviceSignatureProof {
+                    target: "/v1/devices".into(),
+                    content_type: Some("application/json".into()),
+                    request_id: request_id.clone(),
+                    timestamp_epoch_millis: request_at,
+                    nonce: format!("registration-replay-nonce-{request_suffix}-{suffix}"),
+                    signature: crate::security::sign_device_request_for_test(
+                        &signing_key,
+                        "POST",
+                        "/v1/devices",
+                        b"{}",
+                        &request_id,
+                        &device_id,
+                        &account_id,
+                        request_at,
+                        &format!("registration-replay-nonce-{request_suffix}-{suffix}"),
+                    ),
+                    canonical_body: b"{}".to_vec(),
+                },
+                now_epoch_millis: request_at,
+            }
+        };
+
+        let result = async {
+            let repository = PostgresRepository::connect(&database_url, [0; 32]).await?;
+            let first = registration_command("first", &initial_public_key_id, now + 1);
+            if repository.register_device(&first).await
+                != Ok(DeviceRegistrationOutcome::Created(original_device.clone()))
+            {
+                return Err(
+                    "initial PostgreSQL registration did not return the created device".into(),
+                );
+            }
+            drop(repository);
+
+            let client = postgres_test_client(&database_url).await?;
+            let rotated_public_key =
+                sha256(format!("registration-rotated-key-{suffix}").as_bytes());
+            client
+                .execute(
+                    "UPDATE devices SET display_name='Renamed after registration',
+                        public_key_id=$2, public_key=$3, public_key_version=2,
+                        public_key_revoked_at_epoch_millis=$4, status='unbound',
+                        updated_at_epoch_millis=$4 WHERE device_id=$1",
+                    &[
+                        &device_id,
+                        &format!("registration-rotated-key-id-{suffix}"),
+                        &&rotated_public_key[..],
+                        &to_i64_lossless(now + 3),
+                    ],
+                )
+                .await
+                .map_err(|error| format!("mutate registered PostgreSQL device: {error}"))?;
+            drop(client);
+
+            let restarted = PostgresRepository::connect(&database_url, [0; 32]).await?;
+            let replay = registration_command(
+                "retry",
+                &format!("registration-retry-generated-key-{suffix}"),
+                now + 4,
+            );
+            if restarted.register_device(&replay).await
+                != Ok(DeviceRegistrationOutcome::Replayed(original_device.clone()))
+            {
+                return Err(
+                    "PostgreSQL registration replay did not return the first device".into(),
+                );
+            }
+            let client = postgres_test_client(&database_url).await?;
+            let row = client
+                .query_one(
+                    "SELECT display_name, status, public_key_version,
+                        (SELECT count(*) FROM audit_logs WHERE actor_account_id=$2)
+                            AS audit_count
+                     FROM devices WHERE device_id=$1",
+                    &[&device_id, &account_id],
+                )
+                .await
+                .map_err(|error| format!("query registration replay result: {error}"))?;
+            if row.get::<_, String>("display_name") != "Renamed after registration"
+                || row.get::<_, String>("status") != "unbound"
+                || row.get::<_, i32>("public_key_version") != 2
+                || row.get::<_, i64>("audit_count") != 2
+            {
+                return Err(
+                    "registration replay changed authority state or added audit rows".into(),
+                );
+            }
+            let mut changed = registration_command(
+                "changed",
+                &format!("registration-changed-generated-key-{suffix}"),
+                now + 5,
+            );
+            changed.device.display_name = "Changed registration request".into();
+            changed.registration_request_binding_hash = device_registration_binding_hash(
+                &account_id,
+                &account_session_id,
+                &grant_id,
+                &device_id,
+                &changed.device.display_name,
+                "ubuntu",
+                &changed.device.os_version,
+                "x86_64",
+                true,
+                false,
+                false,
+                false,
+                &public_key_fingerprint,
+                1,
+            );
+            if restarted.register_device(&changed).await != Err(StoreError::Conflict) {
+                return Err("changed PostgreSQL registration fields did not conflict".into());
+            }
+            Ok(())
+        }
+        .await;
+
+        let cleanup = cleanup_postgres_login_fixture(&database_url, &account_id).await;
+        cleanup?;
+        result
     }
 
     #[test]

@@ -616,6 +616,13 @@ pub async fn rotate_device_key(
 }
 
 async fn notify_forced_session_closures(state: &AppState, events: &[SessionEvent]) {
+    for (device_id, notification) in forced_session_close_notifications(events) {
+        state.notifier.push(&device_id, notification).await;
+    }
+}
+
+fn forced_session_close_notifications(events: &[SessionEvent]) -> Vec<(String, Value)> {
+    let mut notifications = Vec::with_capacity(events.len().saturating_mul(2));
     for event in events {
         let Some(session) = event.result_session.as_ref() else {
             continue;
@@ -632,15 +639,10 @@ async fn notify_forced_session_closures(state: &AppState, events: &[SessionEvent
             "event_id": event.event_id,
             "session": SessionView::from(session),
         });
-        state
-            .notifier
-            .push(&session.controller_device_id, notification.clone())
-            .await;
-        state
-            .notifier
-            .push(&session.controlled_device_id, notification)
-            .await;
+        notifications.push((session.controller_device_id.clone(), notification.clone()));
+        notifications.push((session.controlled_device_id.clone(), notification));
     }
+    notifications
 }
 
 fn validate_device_request(request: &RegisterDeviceRequest, request_id: &str) -> ApiResult<()> {
@@ -676,6 +678,13 @@ fn validate_device_request(request: &RegisterDeviceRequest, request_id: &str) ->
         return Err(ApiError::bad_request(
             "invalid_platform_capability",
             "registration capabilities do not match the platform enrollment policy",
+            request_id,
+        ));
+    }
+    if request.platform == Platform::Ubuntu && request.arch != Architecture::X86_64 {
+        return Err(ApiError::bad_request(
+            "unsupported_platform_architecture",
+            "Ubuntu 26.04 registration requires x86_64",
             request_id,
         ));
     }
@@ -851,6 +860,7 @@ fn parse_enrollment_grant<'a>(value: &'a str, request_id: &str) -> ApiResult<(&'
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{AuthMethod, Session, SessionPermissions, SessionStatus};
 
     fn device(status: DeviceLifecycleStatus) -> Device {
         Device {
@@ -926,6 +936,10 @@ mod tests {
             "request"
         )
         .is_ok());
+        let mut unsupported_ubuntu_arch = request(Platform::Ubuntu, true, true, false, false);
+        unsupported_ubuntu_arch.arch = Architecture::Aarch64;
+        let error = validate_device_request(&unsupported_ubuntu_arch, "request").unwrap_err();
+        assert_eq!(error.code, "unsupported_platform_architecture");
         for invalid in [
             request(Platform::Ubuntu, false, true, false, false),
             request(Platform::Ubuntu, true, true, true, false),
@@ -934,6 +948,53 @@ mod tests {
         ] {
             let error = validate_device_request(&invalid, "request").unwrap_err();
             assert_eq!(error.code, "invalid_platform_capability");
+        }
+    }
+
+    #[test]
+    fn forced_session_close_ack_targets_both_devices_with_the_same_event_id() {
+        let session = Session {
+            session_id: "session-1".to_owned(),
+            controller_account_id: "account-1".to_owned(),
+            controller_device_id: "controller-1".to_owned(),
+            controlled_device_id: "controlled-1".to_owned(),
+            auth_method: AuthMethod::AccountPrompt,
+            status: SessionStatus::Closed,
+            permissions: SessionPermissions::default(),
+            permissions_digest: "digest".to_owned(),
+            policy_evaluation_id: "policy-1".to_owned(),
+            relay_token_epoch: 2,
+            session_expires_at_epoch_millis: 10,
+            created_at_epoch_millis: 1,
+            updated_at_epoch_millis: 2,
+            ended_at_epoch_millis: Some(2),
+        };
+        let event = SessionEvent {
+            event_id: "event-1".to_owned(),
+            session_id: session.session_id.clone(),
+            event_type: "closed".to_owned(),
+            from_status: Some(SessionStatus::Connected),
+            to_status: SessionStatus::Closed,
+            actor_type: "system".to_owned(),
+            actor_account_id: None,
+            actor_device_id: None,
+            actor_role: None,
+            reason: Some("device_unbound".to_owned()),
+            idempotency_key_hash: "idempotency-1".to_owned(),
+            request_id: "request-1".to_owned(),
+            created_at_epoch_millis: 2,
+            result_session: Some(session),
+        };
+
+        let notifications = forced_session_close_notifications(&[event]);
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[0].0, "controller-1");
+        assert_eq!(notifications[1].0, "controlled-1");
+        for (_, message) in notifications {
+            assert_eq!(message["type"], "session_close_ack");
+            assert_eq!(message["event_id"], "event-1");
+            assert_eq!(message["session_id"], "session-1");
+            assert_eq!(message["reason"], "device_unbound");
         }
     }
 }

@@ -29,9 +29,9 @@ use crate::security::{
     verify_step_up_token, verify_totp, AccessClaims, StepUpClaims,
 };
 use crate::store::{
-    RiskChallengeCreationOutcome, RiskChallengeVerification, RiskChallengeVerificationOutcome,
-    StepUpAction, StepUpExpectation, StoreError, TotpEnrollmentCompletion,
-    TotpEnrollmentReplayLookup, TotpEnrollmentReplayOutcome,
+    totp_enrollment_finish_binding_hash, RiskChallengeCreationOutcome, RiskChallengeVerification,
+    RiskChallengeVerificationOutcome, StepUpAction, StepUpExpectation, StoreError,
+    TotpEnrollmentCompletion, TotpEnrollmentReplayLookup, TotpEnrollmentReplayOutcome,
 };
 use crate::{AppState, RequestId};
 
@@ -203,18 +203,13 @@ pub async fn totp_finish(
         .map_err(|_| ApiError::unauthorized(&request_id.0))?;
     let idempotency_key = required_idempotency_key(&headers, &request_id.0)?;
     let idempotency_key_hash = sha256(idempotency_key.as_bytes());
-    let finish_request_binding_hash = totp_finish_binding_hash(
-        &claims.account_id,
-        &claims.account_session_id,
-        &request.factor_id,
-        &idempotency_key_hash,
-    );
     let replay_lookup = TotpEnrollmentReplayLookup {
         account_id: claims.account_id.clone(),
         account_session_id: claims.account_session_id.clone(),
         factor_id: request.factor_id.clone(),
         idempotency_key_hash,
-        finish_request_binding_hash,
+        finish_request_binding_hash: None,
+        client_ephemeral_public_key: None,
         access_token_expires_at_epoch_millis: claims.expires_at_epoch_millis,
         now_epoch_millis: now,
     };
@@ -265,6 +260,18 @@ pub async fn totp_finish(
     };
 
     let (mut recovery_codes, records) = generate_recovery_codes(&claims.account_id);
+    let finish_request_binding_hash = totp_enrollment_finish_binding_hash(
+        &claims.account_id,
+        &claims.account_session_id,
+        &request.factor_id,
+        &idempotency_key_hash,
+        &attempt.enrollment.recovery_delivery_public_key,
+    );
+    let bound_replay_lookup = TotpEnrollmentReplayLookup {
+        finish_request_binding_hash: Some(finish_request_binding_hash),
+        client_ephemeral_public_key: Some(attempt.enrollment.recovery_delivery_public_key),
+        ..replay_lookup.clone()
+    };
     let delivery = build_recovery_delivery(
         &claims,
         &attempt.enrollment,
@@ -312,7 +319,7 @@ pub async fn totp_finish(
             .await;
         return match error {
             StoreError::Conflict => {
-                replay_totp_delivery(&state, &replay_lookup, &request_id.0).await
+                replay_totp_delivery(&state, &bound_replay_lookup, &request_id.0).await
             }
             StoreError::Unavailable => Err(ApiError::internal(&request_id.0)),
         };
@@ -874,7 +881,7 @@ fn challenge_audit_entry(
         audit_id: random_uuid_v4(),
         actor_type: "account".to_owned(),
         actor_account_id: Some(challenge.account_id.clone()),
-        actor_device_id: challenge.device_id.clone(),
+        actor_device_id: None,
         actor_role: None,
         actor_service: None,
         target_device_id: challenge.device_id.clone(),
@@ -1126,23 +1133,6 @@ fn validate_x25519_public_key(public_key: &[u8; 32], request_id: &str) -> ApiRes
     Ok(())
 }
 
-fn totp_finish_binding_hash(
-    account_id: &str,
-    account_session_id: &str,
-    factor_id: &str,
-    idempotency_key_hash: &[u8; 32],
-) -> [u8; 32] {
-    sha256(&canonical_fields(
-        "rctl-totp-enrollment-finish-v1",
-        &[
-            ("account_id", account_id.as_bytes()),
-            ("account_session_id", account_session_id.as_bytes()),
-            ("factor_id", factor_id.as_bytes()),
-            ("idempotency_key_hash", idempotency_key_hash),
-        ],
-    ))
-}
-
 fn build_recovery_delivery(
     claims: &AccessClaims,
     enrollment: &PendingTotpEnrollment,
@@ -1299,8 +1289,414 @@ fn generate_recovery_codes(account_id: &str) -> (Vec<String>, Vec<RecoveryCode>)
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use super::*;
-    use crate::security::{sha256, sign_step_up_token};
+    use crate::ephemeral::FailingEphemeralState;
+    use crate::model::{
+        Account, AccountSession, AccountStatus, Architecture, Device, DeviceCapabilities,
+        DeviceLifecycleStatus, Platform,
+    };
+    use crate::security::{sha256, sign_access_token, sign_step_up_token};
+    use crate::{AppConfig, MemoryRepository, SignalNotifier};
+
+    #[derive(Debug)]
+    struct StepUpFixture {
+        account_id: String,
+        account_session_id: String,
+        device_id: String,
+        factor_id: String,
+        recovery_code_id: String,
+        recovery_code: String,
+        email: String,
+        operation_path: String,
+        operation_request_id: String,
+    }
+
+    impl StepUpFixture {
+        fn new(suffix: &str) -> Self {
+            let account_id = format!("step-up-account-{suffix}");
+            let device_id = format!("step-up-device-{suffix}");
+            let factor_id = format!("step-up-factor-{suffix}");
+            Self {
+                account_session_id: format!("step-up-session-{suffix}"),
+                recovery_code_id: format!("step-up-recovery-{suffix}"),
+                recovery_code: format!("RECOVERY-{suffix}"),
+                email: format!("step-up-{suffix}@example.com"),
+                operation_path: format!("/v1/me/mfa/factors/{factor_id}"),
+                operation_request_id: format!("step-up-operation-{suffix}"),
+                account_id,
+                device_id,
+                factor_id,
+            }
+        }
+
+        fn access_headers(&self, state: &AppState, now_epoch_millis: u64) -> HeaderMap {
+            let token = sign_access_token(
+                &AccessClaims {
+                    account_id: self.account_id.clone(),
+                    account_session_id: self.account_session_id.clone(),
+                    issued_at_epoch_millis: now_epoch_millis,
+                    expires_at_epoch_millis: now_epoch_millis + 300_000,
+                    mfa_verified: true,
+                    token_type: "access".to_owned(),
+                },
+                &state.config.token_secret,
+            )
+            .expect("sign access token");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}")
+                    .parse()
+                    .expect("authorization header"),
+            );
+            headers
+        }
+    }
+
+    async fn seed_step_up_fixture(
+        state: &AppState,
+        fixture: &StepUpFixture,
+        now_epoch_millis: u64,
+    ) {
+        state
+            .repository
+            .transact(&mut |database| {
+                database.accounts.insert(
+                    fixture.account_id.clone(),
+                    Account {
+                        account_id: fixture.account_id.clone(),
+                        email: fixture.email.clone(),
+                        display_name: "Step-up Test".to_owned(),
+                        password_hash: "unused-password-hash".to_owned(),
+                        status: AccountStatus::Active,
+                        created_at_epoch_millis: now_epoch_millis.saturating_sub(1),
+                        updated_at_epoch_millis: now_epoch_millis.saturating_sub(1),
+                    },
+                );
+                database
+                    .account_by_email
+                    .insert(fixture.email.clone(), fixture.account_id.clone());
+                database.account_sessions.insert(
+                    fixture.account_session_id.clone(),
+                    AccountSession {
+                        account_session_id: fixture.account_session_id.clone(),
+                        account_id: fixture.account_id.clone(),
+                        refresh_token_hash: sha256(fixture.account_session_id.as_bytes()),
+                        mfa_verified: true,
+                        expires_at_epoch_millis: now_epoch_millis + 300_000,
+                        revoked_at_epoch_millis: None,
+                        revoked_reason: None,
+                    },
+                );
+                database.devices.insert(
+                    fixture.device_id.clone(),
+                    Device {
+                        device_id: fixture.device_id.clone(),
+                        account_id: fixture.account_id.clone(),
+                        display_name: "Step-up Device".to_owned(),
+                        platform: Platform::Windows,
+                        os_version: "11".to_owned(),
+                        arch: Architecture::X86_64,
+                        capabilities: DeviceCapabilities {
+                            controller: true,
+                            controlled: true,
+                            file_transfer: false,
+                            unattended: false,
+                        },
+                        public_key_id: format!("key-{}", fixture.device_id),
+                        public_key: [7; 32],
+                        public_key_version: 1,
+                        public_key_revoked_at_epoch_millis: None,
+                        status: DeviceLifecycleStatus::Offline,
+                        last_seen_epoch_millis: None,
+                        created_at_epoch_millis: now_epoch_millis.saturating_sub(1),
+                        updated_at_epoch_millis: now_epoch_millis.saturating_sub(1),
+                    },
+                );
+                database.mfa_factors.insert(
+                    fixture.factor_id.clone(),
+                    MfaFactor {
+                        factor_id: fixture.factor_id.clone(),
+                        account_id: fixture.account_id.clone(),
+                        secret_base32: "JBSWY3DPEHPK3PXP".to_owned(),
+                        active: true,
+                        last_used_counter: None,
+                        created_at_epoch_millis: now_epoch_millis.saturating_sub(1),
+                    },
+                );
+                database.recovery_codes.insert(
+                    fixture.recovery_code_id.clone(),
+                    RecoveryCode {
+                        recovery_code_id: fixture.recovery_code_id.clone(),
+                        account_id: fixture.account_id.clone(),
+                        code_hash: sha256(fixture.recovery_code.as_bytes()),
+                        used_at_epoch_millis: None,
+                        expires_at_epoch_millis: None,
+                    },
+                );
+                Ok(())
+            })
+            .await
+            .expect("seed step-up authority");
+    }
+
+    async fn assert_authoritative_step_up_retry_gate(
+        state: &AppState,
+        failing_ephemeral: &FailingEphemeralState,
+        fixture: &StepUpFixture,
+    ) -> String {
+        let now = now_epoch_millis();
+        let headers = fixture.access_headers(state, now);
+        let create_body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "device_id": fixture.device_id,
+                "purpose": "mfa_factor_change",
+                "method": "DELETE",
+                "path": fixture.operation_path,
+                "body_hash": hex_encode(&sha256(&[])),
+                "request_id": fixture.operation_request_id,
+            }))
+            .expect("serialize create challenge request"),
+        );
+        let (status, Json(created)) = create_risk_challenge(
+            State(state.clone()),
+            Extension(RequestId("create-step-up".to_owned())),
+            headers.clone(),
+            create_body,
+        )
+        .await
+        .expect("PostgreSQL creation must survive ephemeral put failure");
+        assert_eq!(status, StatusCode::CREATED);
+        let challenge_id = created["risk_challenge_id"]
+            .as_str()
+            .expect("challenge id")
+            .to_owned();
+        assert_eq!(failing_ephemeral.calls().put_challenge, 1);
+
+        let verify_body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "factor": "recovery_code",
+                "code": fixture.recovery_code,
+            }))
+            .expect("serialize challenge verification"),
+        );
+        let Json(first) = verify_risk_challenge(
+            State(state.clone()),
+            Extension(RequestId("verify-step-up-first".to_owned())),
+            Path(challenge_id.clone()),
+            headers.clone(),
+            verify_body.clone(),
+        )
+        .await
+        .expect("authoritative verification");
+        let first_token = first["step_up_token"]
+            .as_str()
+            .expect("first step-up token")
+            .to_owned();
+
+        let Json(retry) = verify_risk_challenge(
+            State(state.clone()),
+            Extension(RequestId("verify-step-up-retry".to_owned())),
+            Path(challenge_id.clone()),
+            headers.clone(),
+            verify_body.clone(),
+        )
+        .await
+        .expect("verified challenge retry");
+        assert_eq!(
+            retry["step_up_token"].as_str(),
+            Some(first_token.as_str()),
+            "the same PostgreSQL authority must deterministically sign the same semantic token"
+        );
+
+        let mut verified_snapshot = None;
+        state
+            .repository
+            .read(&mut |database| {
+                let challenge = &database.risk_challenges[&challenge_id];
+                verified_snapshot = Some((
+                    challenge.status,
+                    challenge.consumed_at_epoch_millis,
+                    database.recovery_codes[&fixture.recovery_code_id].used_at_epoch_millis,
+                    database
+                        .audit_logs
+                        .iter()
+                        .filter(|entry| {
+                            entry.actor_account_id.as_deref() == Some(&fixture.account_id)
+                                && entry.action == "risk_challenge_succeeded"
+                        })
+                        .count(),
+                    database
+                        .audit_logs
+                        .iter()
+                        .filter(|entry| {
+                            entry.actor_account_id.as_deref() == Some(&fixture.account_id)
+                                && entry.action == "mfa_recovery_code_used"
+                        })
+                        .count(),
+                ));
+            })
+            .await;
+        let (status, consumed_at, recovery_used_at, success_audits, recovery_audits) =
+            verified_snapshot.expect("verified authority snapshot");
+        assert_eq!(status, RiskChallengeStatus::Verified);
+        assert_eq!(consumed_at, None);
+        assert!(recovery_used_at.is_some());
+        assert_eq!(success_audits, 1);
+        assert_eq!(recovery_audits, 1);
+
+        let calls = failing_ephemeral.calls();
+        assert_eq!(calls.begin_challenge_attempt, 0);
+        assert_eq!(calls.finish_challenge_attempt, 0);
+        assert_eq!(calls.consume_step_up, 0);
+
+        let mut step_up_headers = HeaderMap::new();
+        step_up_headers.insert("x-rctl-risk-challenge-id", challenge_id.parse().unwrap());
+        step_up_headers.insert("x-rctl-step-up-token", first_token.parse().unwrap());
+        let operation_uri: Uri = fixture.operation_path.parse().expect("operation URI");
+        let mismatched = consume_step_up_for_request(
+            state,
+            &AccessClaims {
+                account_id: fixture.account_id.clone(),
+                account_session_id: fixture.account_session_id.clone(),
+                issued_at_epoch_millis: now,
+                expires_at_epoch_millis: now + 300_000,
+                mfa_verified: true,
+                token_type: "access".to_owned(),
+            },
+            &step_up_headers,
+            &Method::DELETE,
+            &operation_uri,
+            b"different binding",
+            Some(&fixture.device_id),
+            "mfa_factor_change",
+            &fixture.operation_request_id,
+        )
+        .await
+        .expect_err("a different operation binding must be rejected");
+        assert_eq!(mismatched.code, "step_up_binding_mismatch");
+        assert_eq!(
+            state
+                .repository
+                .load_risk_challenge_authority(&challenge_id)
+                .await
+                .expect("load challenge after binding mismatch")
+                .expect("challenge after binding mismatch")
+                .status,
+            RiskChallengeStatus::Verified
+        );
+
+        consume_step_up_for_request(
+            state,
+            &AccessClaims {
+                account_id: fixture.account_id.clone(),
+                account_session_id: fixture.account_session_id.clone(),
+                issued_at_epoch_millis: now,
+                expires_at_epoch_millis: now + 300_000,
+                mfa_verified: true,
+                token_type: "access".to_owned(),
+            },
+            &step_up_headers,
+            &Method::DELETE,
+            &operation_uri,
+            &[],
+            Some(&fixture.device_id),
+            "mfa_factor_change",
+            &fixture.operation_request_id,
+        )
+        .await
+        .expect("PostgreSQL consumption must not depend on ephemeral finalize");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while failing_ephemeral.calls().consume_step_up == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ephemeral finalize attempt");
+        assert_eq!(failing_ephemeral.calls().consume_step_up, 1);
+
+        let consumed = state
+            .repository
+            .load_risk_challenge_authority(&challenge_id)
+            .await
+            .expect("load consumed challenge")
+            .expect("consumed challenge");
+        assert_eq!(consumed.status, RiskChallengeStatus::Consumed);
+        assert!(consumed.consumed_at_epoch_millis.is_some());
+        let reopened = verify_risk_challenge(
+            State(state.clone()),
+            Extension(RequestId("verify-step-up-consumed".to_owned())),
+            Path(challenge_id.clone()),
+            headers,
+            verify_body,
+        )
+        .await
+        .expect_err("ephemeral failure must not reopen a consumed PostgreSQL challenge");
+        assert_eq!(reopened.code, "mfa_verification_failed");
+
+        let mut final_counts = None;
+        state
+            .repository
+            .read(&mut |database| {
+                final_counts = Some((
+                    database
+                        .audit_logs
+                        .iter()
+                        .filter(|entry| {
+                            entry.actor_account_id.as_deref() == Some(&fixture.account_id)
+                                && entry.action == "risk_challenge_succeeded"
+                        })
+                        .count(),
+                    database
+                        .audit_logs
+                        .iter()
+                        .filter(|entry| {
+                            entry.actor_account_id.as_deref() == Some(&fixture.account_id)
+                                && entry.action == "mfa_recovery_code_used"
+                        })
+                        .count(),
+                ));
+            })
+            .await;
+        assert_eq!(final_counts, Some((1, 1)));
+        challenge_id
+    }
+
+    async fn cleanup_postgres_step_up_fixture(database_url: &str, fixture: &StepUpFixture) {
+        let (mut client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect PostgreSQL cleanup client");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let transaction = client
+            .transaction()
+            .await
+            .expect("start cleanup transaction");
+        transaction
+            .batch_execute("SET CONSTRAINTS ALL DEFERRED")
+            .await
+            .expect("defer cleanup constraints");
+        for statement in [
+            "DELETE FROM audit_logs WHERE actor_account_id=$1",
+            "DELETE FROM account_risk_challenges WHERE account_id=$1",
+            "DELETE FROM account_recovery_codes WHERE account_id=$1",
+            "DELETE FROM account_mfa_factors WHERE account_id=$1",
+            "DELETE FROM account_sessions WHERE account_id=$1",
+            "DELETE FROM device_policies WHERE device_id IN (SELECT device_id FROM devices WHERE account_id=$1)",
+            "DELETE FROM devices WHERE account_id=$1",
+            "DELETE FROM accounts WHERE account_id=$1",
+        ] {
+            transaction
+                .execute(statement, &[&fixture.account_id])
+                .await
+                .unwrap_or_else(|error| panic!("cleanup statement failed ({statement}): {error}"));
+        }
+        transaction.commit().await.expect("commit fixture cleanup");
+    }
 
     #[test]
     fn operation_paths_are_canonicalized_and_absolute_targets_are_rejected() {
@@ -1469,5 +1865,156 @@ mod tests {
             })
             .await;
         assert!(consumed);
+    }
+
+    #[tokio::test]
+    async fn verified_step_up_retry_and_terminal_state_ignore_ephemeral_failures() {
+        let repository = Arc::new(MemoryRepository::default());
+        let failing_ephemeral = Arc::new(FailingEphemeralState::default());
+        let state = AppState::with_ephemeral(
+            repository,
+            failing_ephemeral.clone(),
+            AppConfig::for_test(),
+            SignalNotifier::disabled(),
+        );
+        let fixture = StepUpFixture::new("memory-redis-failure");
+        seed_step_up_fixture(&state, &fixture, now_epoch_millis()).await;
+
+        assert_authoritative_step_up_retry_gate(&state, &failing_ephemeral, &fixture).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database in API_TEST_DATABASE_URL"]
+    async fn postgres_verified_step_up_retry_survives_ephemeral_failures() {
+        let database_url = std::env::var("API_TEST_DATABASE_URL")
+            .expect("API_TEST_DATABASE_URL must point to an isolated migrated database");
+        let repository = Arc::new(
+            crate::PostgresRepository::connect(&database_url, [0; 32])
+                .await
+                .expect("connect PostgreSQL repository"),
+        );
+        let failing_ephemeral = Arc::new(FailingEphemeralState::default());
+        let state = AppState::with_ephemeral(
+            repository,
+            failing_ephemeral.clone(),
+            AppConfig::for_test(),
+            SignalNotifier::disabled(),
+        );
+        let fixture = StepUpFixture::new(&format!("postgres-{}", random_uuid_v4()));
+        seed_step_up_fixture(&state, &fixture, now_epoch_millis()).await;
+
+        assert_authoritative_step_up_retry_gate(&state, &failing_ephemeral, &fixture).await;
+        cleanup_postgres_step_up_fixture(&database_url, &fixture).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_step_up_keeps_only_the_frozen_failure_audit() {
+        let repository = Arc::new(MemoryRepository::default());
+        let failing_ephemeral = Arc::new(FailingEphemeralState::default());
+        let state = AppState::with_ephemeral(
+            repository,
+            failing_ephemeral.clone(),
+            AppConfig::for_test(),
+            SignalNotifier::disabled(),
+        );
+        let fixture = StepUpFixture::new("cancelled");
+        let now = now_epoch_millis();
+        seed_step_up_fixture(&state, &fixture, now).await;
+        let challenge = RiskChallenge {
+            risk_challenge_id: "cancelled-risk-challenge".to_owned(),
+            account_id: fixture.account_id.clone(),
+            device_id: Some(fixture.device_id.clone()),
+            purpose: "mfa_factor_change".to_owned(),
+            operation_binding_hash: [11; 32],
+            risk_level: "high".to_owned(),
+            required_methods: vec!["totp".to_owned(), "recovery_code".to_owned()],
+            status: RiskChallengeStatus::Issued,
+            attempts_remaining: 5,
+            ip_address: None,
+            user_agent: None,
+            expires_at_epoch_millis: now + 60_000,
+            created_at_epoch_millis: now,
+            verified_at_epoch_millis: None,
+            consumed_at_epoch_millis: None,
+        };
+        state
+            .repository
+            .transact(&mut |database| {
+                database
+                    .risk_challenges
+                    .insert(challenge.risk_challenge_id.clone(), challenge.clone());
+                Ok(())
+            })
+            .await
+            .expect("seed cancellable challenge");
+        let cancelled_audit = challenge_audit_entry(
+            "cancel-step-up",
+            &challenge,
+            "risk_challenge_failed",
+            "failure",
+            Some("cancelled"),
+            now,
+        );
+        assert!(state
+            .repository
+            .cancel_risk_challenge(&challenge.risk_challenge_id, &cancelled_audit)
+            .await
+            .expect("cancel issued challenge"));
+        assert!(!state
+            .repository
+            .cancel_risk_challenge(&challenge.risk_challenge_id, &cancelled_audit)
+            .await
+            .expect("cancelled challenge is terminal"));
+
+        let rejected = verify_challenge_factor(
+            &state,
+            &challenge.risk_challenge_id,
+            "recovery_code",
+            &fixture.recovery_code,
+            ChallengeKind::StepUp,
+            Some(&fixture.account_id),
+            "verify-cancelled-step-up",
+        )
+        .await
+        .expect_err("cancelled challenge cannot issue a new action token");
+        assert_eq!(rejected.code, "mfa_verification_failed");
+
+        let mut snapshot = None;
+        state
+            .repository
+            .read(&mut |database| {
+                snapshot = Some((
+                    database.risk_challenges[&challenge.risk_challenge_id].status,
+                    database.recovery_codes[&fixture.recovery_code_id].used_at_epoch_millis,
+                    database
+                        .audit_logs
+                        .iter()
+                        .filter(|entry| {
+                            entry.actor_account_id.as_deref() == Some(&fixture.account_id)
+                        })
+                        .map(|entry| {
+                            (
+                                entry.action.clone(),
+                                entry.result.clone(),
+                                entry.reason.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ));
+            })
+            .await;
+        assert_eq!(
+            snapshot,
+            Some((
+                RiskChallengeStatus::Cancelled,
+                None,
+                vec![(
+                    "risk_challenge_failed".to_owned(),
+                    "failure".to_owned(),
+                    Some("cancelled".to_owned()),
+                )],
+            ))
+        );
+        assert_eq!(failing_ephemeral.calls(), Default::default());
     }
 }

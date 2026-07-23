@@ -2,8 +2,24 @@ use std::collections::HashMap;
 
 use remote_protocol::{DeviceStatus, Permissions, PlatformKind, VerificationCode};
 
+mod clipboard;
+mod display;
+mod file_transfer;
+mod input;
+mod media;
+mod policy;
+mod privacy;
+mod reboot;
 mod session_crypto;
 
+pub use clipboard::*;
+pub use display::*;
+pub use file_transfer::*;
+pub use input::*;
+pub use media::*;
+pub use policy::*;
+pub use privacy::*;
+pub use reboot::*;
 pub use session_crypto::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
