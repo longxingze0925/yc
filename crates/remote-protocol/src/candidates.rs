@@ -22,7 +22,9 @@ impl CandidateSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionCandidateDto {
+    #[serde(with = "crate::serde_hex_u128")]
     pub candidate_id: u128,
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub device_id: String,
     pub role: SessionRole,
@@ -46,6 +48,7 @@ pub struct CandidateAuthorization {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObserveTokenRequest {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub device_id: String,
     pub role: SessionRole,
@@ -55,6 +58,7 @@ pub struct ObserveTokenRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObserveTokenIssued {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub device_id: String,
     pub role: SessionRole,
@@ -66,6 +70,7 @@ pub struct ObserveTokenIssued {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObserveResult {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub device_id: String,
     pub role: SessionRole,
@@ -78,9 +83,11 @@ pub struct ObserveResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateTokenRequest {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub device_id: String,
     pub role: SessionRole,
+    #[serde(with = "crate::serde_hex_u128")]
     pub candidate_id: u128,
     pub kind: TransportPath,
     pub endpoint: String,
@@ -99,9 +106,11 @@ pub struct CandidateTokenRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateTokenIssued {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub device_id: String,
     pub role: SessionRole,
+    #[serde(with = "crate::serde_hex_u128")]
     pub candidate_id: u128,
     pub candidate_token: Vec<u8>,
     pub candidate_token_binding_hash: [u8; 32],
@@ -110,6 +119,7 @@ pub struct CandidateTokenIssued {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayAllocation {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub device_id: String,
     pub role: SessionRole,
@@ -129,6 +139,7 @@ pub struct RelayAllocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayOpen {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub device_id: String,
     pub role: SessionRole,

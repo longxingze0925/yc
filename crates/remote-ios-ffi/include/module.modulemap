@@ -1,0 +1,4 @@
+module RemoteIOSFFI {
+    header "remote_ios_ffi.h"
+    export *
+}

@@ -95,6 +95,14 @@ impl SecureSession {
         }
     }
 
+    pub const fn session_id(&self) -> u128 {
+        self.session_id
+    }
+
+    pub const fn local_role(&self) -> SessionRole {
+        self.local_role
+    }
+
     pub fn create_local_key_confirm(
         &mut self,
         device_id: String,

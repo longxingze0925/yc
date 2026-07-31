@@ -207,6 +207,80 @@ final class ProtocolModelTests: XCTestCase {
         XCTAssertEqual(permissions["require_prompt"] as? Bool, true)
     }
 
+    func testSignalCandidateAuthorizationUsesFrozenStringIdentifiers() throws {
+        let sessionID = try XCTUnwrap(UUID(uuidString: "00000000-0000-4000-8000-000000000001"))
+        let request = SignalCandidateTokenRequest(
+            sessionID: sessionID,
+            deviceID: "ios-1",
+            role: .controller,
+            candidateID: "00000000000000000000000000000002",
+            kind: .lanDirect,
+            endpoint: "192.168.1.20:50001",
+            source: .localInterface,
+            localInterfaceClaimHash: [UInt8](repeating: 1, count: 32),
+            localInterfaceSignature: [UInt8](repeating: 2, count: 64),
+            interfaceNameHash: [UInt8](repeating: 3, count: 32),
+            interfaceIndexHash: [UInt8](repeating: 4, count: 32),
+            localSocketNonce: [UInt8](repeating: 5, count: 32),
+            timestampEpochMillis: 1_000,
+            requestedTTLMillis: 30_000
+        )
+        let encoded = try jsonObject(request)
+        XCTAssertEqual(encoded["session_id"] as? String, sessionID.uuidString.lowercased())
+        XCTAssertEqual(encoded["candidate_id"] as? String, "00000000000000000000000000000002")
+        XCTAssertEqual(encoded["kind"] as? String, "lan_direct")
+        XCTAssertEqual(encoded["source"] as? String, "local_interface")
+        XCTAssertNil(encoded["relay_node_id"])
+
+        let response = try JSONDecoder().decode(SignalCandidateTokenIssued.self, from: Data(
+            #"{"session_id":"00000000-0000-4000-8000-000000000001","device_id":"ios-1","role":"controller","candidate_id":"00000000000000000000000000000002","candidate_token":[7,8,9],"candidate_token_binding_hash":[6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6],"expires_at_epoch_millis":4102444800000}"#.utf8
+        ))
+        XCTAssertEqual(response.sessionID, sessionID)
+        XCTAssertEqual(response.candidateID, "00000000000000000000000000000002")
+        XCTAssertEqual(response.candidateToken, [7, 8, 9])
+        XCTAssertEqual(response.candidateTokenBindingHash.count, 32)
+    }
+
+    func testSessionResponseBuildsStrictDescriptor() throws {
+        let response = try JSONDecoder().decode(SessionCreateResponse.self, from: Data(
+            #"{"session_id":"00000000-0000-4000-8000-000000000001","status":"accepted","controlled_device_id":"ubuntu-1","controlled_device_name":"Workstation","permissions":{"remote_desktop":true,"input_control":true,"clipboard":false,"file_transfer":false,"unattended":false,"privacy_screen":false,"block_local_input":false,"require_prompt":false,"allow_relay":true},"permissions_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","session_expires_at_epoch_millis":4102444800000}"#.utf8
+        ))
+
+        let descriptor = try response.descriptor(
+            accountID: "account-1",
+            controllerDeviceID: "ios-1",
+            nowEpochMillis: 1
+        )
+
+        XCTAssertEqual(descriptor.sessionID, response.sessionID)
+        XCTAssertEqual(descriptor.controlledDeviceID, "ubuntu-1")
+        XCTAssertEqual(descriptor.permissionsDigest, Data(repeating: 0xaa, count: 32))
+    }
+
+    func testSessionDescriptorRejectsMissingOrExpiredBindings() throws {
+        let missingDigest = try JSONDecoder().decode(SessionCreateResponse.self, from: Data(
+            #"{"session_id":"00000000-0000-4000-8000-000000000001","status":"accepted","controlled_device_id":"ubuntu-1","permissions":{"remote_desktop":true,"input_control":true,"clipboard":false,"file_transfer":false,"unattended":false,"privacy_screen":false,"block_local_input":false,"require_prompt":false,"allow_relay":true},"session_expires_at_epoch_millis":4102444800000}"#.utf8
+        ))
+        XCTAssertThrowsError(try missingDigest.descriptor(
+            accountID: "account-1",
+            controllerDeviceID: "ios-1",
+            nowEpochMillis: 1
+        )) { error in
+            XCTAssertEqual(error as? SessionDescriptorError, .invalidPermissionsDigest)
+        }
+
+        let expired = try JSONDecoder().decode(SessionCreateResponse.self, from: Data(
+            #"{"session_id":"00000000-0000-4000-8000-000000000001","status":"accepted","controlled_device_id":"ubuntu-1","permissions":{"remote_desktop":true,"input_control":true,"clipboard":false,"file_transfer":false,"unattended":false,"privacy_screen":false,"block_local_input":false,"require_prompt":false,"allow_relay":true},"permissions_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","session_expires_at_epoch_millis":10}"#.utf8
+        ))
+        XCTAssertThrowsError(try expired.descriptor(
+            accountID: "account-1",
+            controllerDeviceID: "ios-1",
+            nowEpochMillis: 10
+        )) { error in
+            XCTAssertEqual(error as? SessionDescriptorError, .expired)
+        }
+    }
+
     func testIOSCapabilitiesDoNotAdvertiseControlledOrEncoding() throws {
         let capabilities = iosCapabilities()
         let object = try jsonObject(capabilities)
@@ -289,13 +363,14 @@ final class ProtocolModelTests: XCTestCase {
 
     func testSignalOnlineDeviceDecodesPresenceShape() throws {
         let data = Data(
-            #"{"account_id":"account-1","device_id":"windows-1","public_key_id":"key-1","public_key_version":1,"client_capabilities_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"online","last_seen_epoch_millis":1234,"connection_id":"connection-1"}"#.utf8
+            #"{"account_id":"account-1","device_id":"windows-1","public_key_id":"key-1","public_key_version":1,"public_key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc","client_capabilities_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"online","last_seen_epoch_millis":1234,"connection_id":"connection-1"}"#.utf8
         )
         let presence = try JSONDecoder().decode(SignalOnlineDevice.self, from: data)
 
         XCTAssertEqual(presence.deviceID, "windows-1")
         XCTAssertEqual(presence.status, .online)
         XCTAssertEqual(presence.publicKeyVersion, 1)
+        XCTAssertEqual(Data(base64URLEncoded: presence.publicKey), Data(repeating: 7, count: 32))
     }
 
     func testSignalBase64URLRoundTripHasNoPadding() throws {

@@ -75,6 +75,7 @@ impl TrafficDirection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionContext {
     pub account_id: String,
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub controller_device_id: String,
     pub controlled_device_id: String,
@@ -103,6 +104,7 @@ impl SessionContext {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedKeyExchangePayload {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub device_id: String,
     pub role: SessionRole,
@@ -112,6 +114,7 @@ pub struct SignedKeyExchangePayload {
     pub ephemeral_public_key: [u8; 32],
     pub key_exchange_nonce: [u8; 32],
     pub selected_transport_path: TransportPath,
+    #[serde(with = "crate::serde_hex_u128")]
     pub selected_candidate_pair_id: u128,
     pub relay_node_id: Option<String>,
     pub timestamp_epoch_millis: u64,
@@ -164,6 +167,7 @@ impl SignedKeyExchange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyConfirm {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub device_id: String,
     pub role: SessionRole,

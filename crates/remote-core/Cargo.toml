@@ -8,8 +8,10 @@ authors.workspace = true
 [dependencies]
 remote-crypto = { path = "../remote-crypto" }
 remote-protocol = { path = "../remote-protocol" }
+serde_json = { workspace = true }
 sha2 = "0.10"
 subtle = "2"
+uuid = { workspace = true }
 
 [lints]
 workspace = true

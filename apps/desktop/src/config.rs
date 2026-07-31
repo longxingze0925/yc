@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use url::Url;
 
 const CONFIG_FILE_VERSION: u16 = 1;
+const CONTROLLED_ACCESS_FILE_VERSION: u16 = 1;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -13,6 +14,8 @@ pub struct ServiceConfig {
     pub signal_url: String,
     pub relay_url: String,
     server_key_fingerprint: String,
+    #[serde(default)]
+    official: bool,
 }
 
 impl ServiceConfig {
@@ -27,6 +30,7 @@ impl ServiceConfig {
             signal_url: signal_url.into().trim().to_owned(),
             relay_url: relay_url.into().trim().to_owned(),
             server_key_fingerprint: server_key_fingerprint.into().trim().to_owned(),
+            official: false,
         };
         config.validate()?;
         Ok(config)
@@ -37,6 +41,9 @@ impl ServiceConfig {
     }
 
     pub fn environment_label(&self) -> &'static str {
+        if self.official {
+            return "官方服务";
+        }
         match Url::parse(&self.api_base_url)
             .ok()
             .and_then(|url| url.host_str().map(ToOwned::to_owned))
@@ -45,6 +52,31 @@ impl ServiceConfig {
             Some("localhost" | "127.0.0.1" | "::1") => "本地开发服务",
             _ => "自定义服务",
         }
+    }
+
+    pub fn official() -> Result<Self, ConfigError> {
+        let (api, signal, relay) = if cfg!(debug_assertions) {
+            (
+                option_env!("RCTL_OFFICIAL_API_URL").unwrap_or("http://127.0.0.1:18080"),
+                option_env!("RCTL_OFFICIAL_SIGNAL_URL").unwrap_or("ws://127.0.0.1:18081/ws"),
+                option_env!("RCTL_OFFICIAL_RELAY_URL").unwrap_or("127.0.0.1:18443"),
+            )
+        } else {
+            (
+                option_env!("RCTL_OFFICIAL_API_URL").ok_or_else(|| {
+                    ConfigError::Invalid("Release 构建缺少 RCTL_OFFICIAL_API_URL".into())
+                })?,
+                option_env!("RCTL_OFFICIAL_SIGNAL_URL").ok_or_else(|| {
+                    ConfigError::Invalid("Release 构建缺少 RCTL_OFFICIAL_SIGNAL_URL".into())
+                })?,
+                option_env!("RCTL_OFFICIAL_RELAY_URL").ok_or_else(|| {
+                    ConfigError::Invalid("Release 构建缺少 RCTL_OFFICIAL_RELAY_URL".into())
+                })?,
+            )
+        };
+        let mut config = Self::new(api, signal, relay, "official-managed")?;
+        config.official = true;
+        Ok(config)
     }
 
     pub fn from_environment() -> Result<Option<Self>, ConfigError> {
@@ -202,6 +234,77 @@ impl ServiceConfigStore for JsonFileServiceConfigStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ControlledAccessPreferences {
+    pub allow_account_devices: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonFileControlledAccessStore {
+    path: PathBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlledAccessFile {
+    version: u16,
+    allow_account_devices: bool,
+}
+
+impl JsonFileControlledAccessStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn for_current_user() -> Result<Self, ConfigError> {
+        let mut path = default_config_path()?;
+        path.set_file_name("controlled-access.json");
+        Ok(Self::new(path))
+    }
+
+    pub fn load(&self) -> Result<ControlledAccessPreferences, ConfigError> {
+        let mut file = match OpenOptions::new().read(true).open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ControlledAccessPreferences::default())
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let persisted: ControlledAccessFile = serde_json::from_slice(&bytes)?;
+        if persisted.version != CONTROLLED_ACCESS_FILE_VERSION {
+            return Err(ConfigError::Invalid(format!(
+                "不支持被控访问配置版本 {}",
+                persisted.version
+            )));
+        }
+        Ok(ControlledAccessPreferences {
+            allow_account_devices: persisted.allow_account_devices,
+        })
+    }
+
+    pub fn save(&self, preferences: ControlledAccessPreferences) -> Result<(), ConfigError> {
+        let parent = self.path.parent().ok_or(ConfigError::UnsupportedLocation)?;
+        fs::create_dir_all(parent)?;
+        tighten_directory_permissions(parent)?;
+        let temporary = self.path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(&ControlledAccessFile {
+            version: CONTROLLED_ACCESS_FILE_VERSION,
+            allow_account_devices: preferences.allow_account_devices,
+        })?;
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        configure_private_file(&mut options);
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(temporary, &self.path)?;
+        tighten_file_permissions(&self.path)?;
+        Ok(())
+    }
+}
+
 fn validate_url(value: &str, schemes: &[&str], label: &str) -> Result<(), ConfigError> {
     let url =
         Url::parse(value).map_err(|_| ConfigError::Invalid(format!("{label} 地址格式无效")))?;
@@ -329,5 +432,30 @@ mod tests {
         )
         .expect_err("credentials must be rejected");
         assert!(matches!(error, ConfigError::Invalid(_)));
+    }
+
+    #[test]
+    fn debug_official_configuration_needs_no_user_input() {
+        let config = ServiceConfig::official().expect("debug official config");
+        assert_eq!(config.environment_label(), "官方服务");
+        assert!(!config.api_base_url.is_empty());
+        assert!(!config.signal_url.is_empty());
+        assert!(!config.relay_url.is_empty());
+    }
+
+    #[test]
+    fn controlled_access_defaults_off_and_persists_explicit_enable() {
+        let root = std::env::temp_dir().join(format!("rctl-access-{}", uuid::Uuid::new_v4()));
+        let store = JsonFileControlledAccessStore::new(root.join("controlled-access.json"));
+        assert_eq!(
+            store.load().expect("default"),
+            ControlledAccessPreferences::default()
+        );
+        let enabled = ControlledAccessPreferences {
+            allow_account_devices: true,
+        };
+        store.save(enabled).expect("save");
+        assert_eq!(store.load().expect("load"), enabled);
+        fs::remove_dir_all(root).expect("remove test config");
     }
 }

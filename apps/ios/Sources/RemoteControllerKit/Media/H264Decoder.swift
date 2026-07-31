@@ -387,3 +387,14 @@ public final class H264Decoder: @unchecked Sendable {
         }
     }
 }
+
+public protocol RemoteH264Decoding: AnyObject, Sendable {
+    func setHandlers(
+        onFrame: H264Decoder.FrameHandler?,
+        onFailure: H264Decoder.FailureHandler?
+    )
+    func decode(_ accessUnit: H264AccessUnit)
+    func invalidate()
+}
+
+extension H264Decoder: RemoteH264Decoding {}

@@ -73,12 +73,12 @@ mod tests {
 
     fn key(kind: KeyEventKind, code: u32) -> InputEvent {
         InputEvent {
-            session_id: 1,
-            event_id: code as u128,
+            session_id: uuid::Uuid::from_u128(1),
+            event_id: uuid::Uuid::from_u128(code as u128),
             display_id: "primary".into(),
             input_kind: InputKind::PhysicalKey,
             key_event_kind: Some(kind),
-            physical_code: Some("KeyA".into()),
+            physical_code: Some(code),
             scan_code: None,
             virtual_key: None,
             logical_key: Some("a".into()),
@@ -86,9 +86,9 @@ mod tests {
             y_norm: None,
             button: None,
             key_code: code,
-            modifiers: 0,
-            wheel_delta_x: 0,
-            wheel_delta_y: 0,
+            modifiers: Vec::new(),
+            wheel_delta_x: 0.0,
+            wheel_delta_y: 0.0,
             text: None,
             composition_text: None,
             composition_state: None,

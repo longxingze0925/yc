@@ -113,6 +113,15 @@ pub async fn create_session(
             &request_id.0,
         ));
     }
+    if request.auth_method == AuthMethod::AccountPrompt
+        && controlled.account_id != claims.account_id
+    {
+        return Err(ApiError::not_found(
+            "controlled_device_not_found",
+            "the controlled device does not exist",
+            &request_id.0,
+        ));
+    }
     if !controlled.capabilities.controlled {
         return Err(ApiError::forbidden(
             "controlled_capability_disabled",

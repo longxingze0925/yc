@@ -49,7 +49,11 @@ public struct RustCoreSessionTransportFactory: SessionTransportFactory {
     private let bridge: (any RustCoreSessionBridging)?
 
     public init(bridge: (any RustCoreSessionBridging)? = nil) {
+#if REMOTE_CORE_FFI
+        self.bridge = bridge ?? NativeRustCoreSessionBridge.shared
+#else
         self.bridge = bridge
+#endif
     }
 
     public func makeTransport(for descriptor: SessionDescriptor) async throws -> any SessionTransport {
@@ -60,18 +64,24 @@ public struct RustCoreSessionTransportFactory: SessionTransportFactory {
 
 public enum SessionTransportError: LocalizedError, Equatable {
     case rustCoreUnavailable
+    case transportDriverUnavailable
     case secureSessionNotEstablished
     case permissionDenied(String)
+    case commandUnavailable(String)
     case invalidState
 
     public var errorDescription: String? {
         switch self {
         case .rustCoreUnavailable:
             return "Rust Core 的 QUIC、OPAQUE 与端到端加密 FFI 尚未接入"
+        case .transportDriverUnavailable:
+            return "Rust Core 已加载，但底层 QUIC/Signal driver 尚未注册"
         case .secureSessionNotEstablished:
             return "端到端加密会话尚未建立"
         case let .permissionDenied(capability):
             return "当前会话未授权\(capability)"
+        case let .commandUnavailable(command):
+            return "当前 Rust 传输尚未接入\(command)命令"
         case .invalidState:
             return "当前会话状态不允许此操作"
         }

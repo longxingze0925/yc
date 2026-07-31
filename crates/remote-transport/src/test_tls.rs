@@ -1,3 +1,5 @@
+//! Fixed localhost certificate helpers for cross-crate transport tests only.
+
 use std::sync::Arc;
 
 use rustls::{

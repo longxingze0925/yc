@@ -65,6 +65,8 @@ public struct RemoteInputOverlay: UIViewRepresentable {
 }
 
 public final class RemoteInputSurfaceView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
+    private static let wheelPointsPerStep: CGFloat = 24
+
     private var sessionID = UUID()
     private var displayID = "primary"
     private var remoteSize = CGSize(width: 1, height: 1)
@@ -239,8 +241,8 @@ public final class RemoteInputSurfaceView: UIView, UIKeyInput, UIGestureRecogniz
         onEvent?(.wheel(
             sessionID: sessionID,
             displayID: displayID,
-            deltaX: Double(-delta.x),
-            deltaY: Double(-delta.y)
+            deltaX: Double(-delta.x / Self.wheelPointsPerStep),
+            deltaY: Double(-delta.y / Self.wheelPointsPerStep)
         ))
     }
 
@@ -309,7 +311,7 @@ public final class RemoteInputSurfaceView: UIView, UIKeyInput, UIGestureRecogniz
     private func emitPhysicalKey(
         hidUsage: UInt32,
         logicalKey: String,
-        modifiers: [String],
+        modifiers: [InputModifier],
         state: KeyEventKind,
         isRepeat: Bool
     ) {
@@ -327,13 +329,13 @@ public final class RemoteInputSurfaceView: UIView, UIKeyInput, UIGestureRecogniz
         ))
     }
 
-    private func modifierNames(_ flags: UIKeyModifierFlags) -> [String] {
-        var values: [String] = []
-        if flags.contains(.control) { values.append("ctrl") }
-        if flags.contains(.alternate) { values.append("alt") }
-        if flags.contains(.shift) { values.append("shift") }
-        if flags.contains(.command) { values.append("meta") }
-        if flags.contains(.alphaShift) { values.append("caps_lock") }
+    private func modifierNames(_ flags: UIKeyModifierFlags) -> [InputModifier] {
+        var values: [InputModifier] = []
+        if flags.contains(.control) { values.append(.ctrl) }
+        if flags.contains(.alternate) { values.append(.alt) }
+        if flags.contains(.shift) { values.append(.shift) }
+        if flags.contains(.command) { values.append(.meta) }
+        if flags.contains(.alphaShift) { values.append(.capsLock) }
         return values
     }
 }

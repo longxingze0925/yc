@@ -503,6 +503,8 @@ component PermissionLine inherits Rectangle {
 
 component ControlledPage inherits Rectangle {
     in property <string> privacy-status;
+    in property <bool> allow-account-remote;
+    callback set-allow-account-remote(bool);
     callback disconnect();
     background: Theme.canvas;
     VerticalLayout {
@@ -539,7 +541,26 @@ component ControlledPage inherits Rectangle {
             VerticalLayout {
                 padding: 18px;
                 spacing: 4px;
-                PermissionLine { name: "允许远程连接此设备"; detail: "本地权限持久化与系统授权适配器未接入"; state: "unsupported"; active: false; }
+                Rectangle {
+                    height: 62px;
+                    HorizontalLayout {
+                        padding-left: 4px;
+                        padding-right: 4px;
+                        spacing: 12px;
+                        alignment: center;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 2px;
+                            Text { text: "允许我的设备远程访问"; color: Theme.text; font-size: 13px; font-weight: 620; }
+                            Text { text: "开启后，同账号设备的一键连接不再逐次确认"; color: Theme.muted; font-size: 10px; }
+                        }
+                        allow-account := CheckBox {
+                            checked: root.allow-account-remote;
+                            toggled => { root.set-allow-account-remote(self.checked); }
+                        }
+                    }
+                    Rectangle { x: 0px; y: parent.height - 1px; width: parent.width; height: 1px; background: #e8ebee; }
+                }
                 PermissionLine { name: "屏幕查看"; detail: "受系统采集授权和会话权限共同限制"; state: "unsupported"; }
                 PermissionLine { name: "鼠标与键盘"; detail: "断开、失焦或超时时必须 release-all"; state: "unsupported"; }
                 PermissionLine { name: "剪贴板 / 文件传输"; detail: "独立授权，不保存内容到日志"; state: "默认关闭"; }
@@ -655,6 +676,7 @@ export component AppWindow inherits Window {
     in-out property <string> relay-url: "";
     in-out property <string> server-key-fingerprint: "";
     in-out property <string> device-summary: "0 台账号设备";
+    in-out property <bool> allow-account-remote: false;
     in-out property <[DeviceListItem]> devices: [];
 
     callback login(string, string);
@@ -666,6 +688,7 @@ export component AppWindow inherits Window {
     callback save-server(string, string, string, string);
     callback open-session(string);
     callback disconnect();
+    callback set-allow-account-remote(bool);
 
     if !root.logged-in: LoginView {
         platform-label: root.platform-label;
@@ -711,10 +734,8 @@ export component AppWindow inherits Window {
                         spacing: 4px;
                         Text { text: "工作台"; color: Theme.faint; font-size: 11px; font-weight: 650; }
                         NavItem { glyph: "DE"; label: "我的设备"; target-page: 0; active: root.page == 0; activated(page) => { root.navigate(page); } }
-                        NavItem { glyph: "RA"; label: "远程协助"; target-page: 1; active: root.page == 1; activated(page) => { root.navigate(page); } }
                         Rectangle { height: 12px; background: transparent; }
                         Text { text: "设备与环境"; color: Theme.faint; font-size: 11px; font-weight: 650; }
-                        NavItem { glyph: "SV"; label: "自建服务器"; target-page: 2; active: root.page == 2; activated(page) => { root.navigate(page); } }
                         NavItem { glyph: "CT"; label: "被控授权状态"; target-page: 3; active: root.page == 3; activated(page) => { root.navigate(page); } }
                         Rectangle { vertical-stretch: 1; background: transparent; }
                         Rectangle { height: 1px; background: Theme.border; }
@@ -761,7 +782,12 @@ export component AppWindow inherits Window {
                         test(api, signal, relay, key) => { root.test-server(api, signal, relay, key); }
                         save(api, signal, relay, key) => { root.save-server(api, signal, relay, key); }
                     }
-                    if root.page == 3: ControlledPage { privacy-status: root.privacy-status; disconnect => { root.disconnect(); } }
+                    if root.page == 3: ControlledPage {
+                        privacy-status: root.privacy-status;
+                        allow-account-remote: root.allow-account-remote;
+                        set-allow-account-remote(value) => { root.set-allow-account-remote(value); }
+                        disconnect => { root.disconnect(); }
+                    }
                     if root.page == 4: SessionPage { status: root.session-status; render-status: root.render-status; disconnect => { root.disconnect(); } }
                 }
             }

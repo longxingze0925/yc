@@ -4,7 +4,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use remote_crypto::sha256;
-use remote_protocol::{canonical_json_bytes, CanonicalWriter, PROTOCOL_VERSION};
+use remote_protocol::{
+    canonical_json_bytes, CandidateAuthorization, CandidateTokenIssued, CandidateTokenRequest,
+    CanonicalWriter, ConnectionCandidateDto, KeyConfirm, SessionRole, SignedKeyExchange,
+    PROTOCOL_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -28,6 +32,8 @@ const PROTOCOL_VERSIONS_HEADER: HeaderName = HeaderName::from_static("x-rctl-pro
 const MIN_PROTOCOL_VERSION_HEADER: HeaderName =
     HeaderName::from_static("x-rctl-min-protocol-version");
 const NOTIFICATION_QUEUE_CAPACITY: usize = 64;
+const OUTBOUND_QUEUE_CAPACITY: usize = 64;
+const MAX_SESSION_CERTIFICATE_DER_BYTES: usize = 16 * 1024;
 
 type SignalSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type SharedMachine = Arc<Mutex<SignalStateMachine>>;
@@ -75,6 +81,8 @@ pub enum SignalError {
     WorkerUnavailable,
     NotificationQueueFull,
     NotificationReceiverUnavailable,
+    OutboundQueueFull,
+    InvalidSessionMessage,
 }
 
 impl SignalError {
@@ -107,6 +115,8 @@ impl fmt::Display for SignalError {
             Self::WorkerUnavailable => formatter.write_str("Signal 工作线程不可用"),
             Self::NotificationQueueFull => formatter.write_str("Signal 通知队列已满"),
             Self::NotificationReceiverUnavailable => formatter.write_str("Signal 通知接收器不可用"),
+            Self::OutboundQueueFull => formatter.write_str("Signal 发送队列已满"),
+            Self::InvalidSessionMessage => formatter.write_str("Signal 会话消息绑定无效"),
         }
     }
 }
@@ -157,12 +167,63 @@ pub struct SessionStateNotification {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignalNotification {
+    OnlineDevices(Vec<SignalOnlineDevice>),
     SessionInvite(SessionInviteNotification),
     SessionAcceptAck(SessionStateNotification),
     SessionRejectAck(SessionStateNotification),
     SessionCancelAck(SessionStateNotification),
     SessionCloseAck(SessionStateNotification),
     ConnectionState(SessionStateNotification),
+    CandidateTokenIssued(CandidateTokenIssued),
+    SessionMessage(SessionPeerMessage),
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SignalOnlineDevice {
+    pub account_id: String,
+    pub device_id: String,
+    pub public_key_id: String,
+    pub public_key_version: u32,
+    pub public_key: String,
+    pub client_capabilities_hash: String,
+    pub status: remote_protocol::DeviceStatus,
+    pub last_seen_epoch_millis: u64,
+    pub connection_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSignalMessageKind {
+    ConnectionCandidate,
+    KeyExchangeMessage,
+    KeyConfirm,
+}
+
+impl SessionSignalMessageKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectionCandidate => "connection_candidate",
+            Self::KeyExchangeMessage => "key_exchange_message",
+            Self::KeyConfirm => "key_confirm",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "connection_candidate" => Some(Self::ConnectionCandidate),
+            "key_exchange_message" => Some(Self::KeyExchangeMessage),
+            "key_confirm" => Some(Self::KeyConfirm),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPeerMessage {
+    pub kind: SessionSignalMessageKind,
+    pub session_id: String,
+    pub role: SessionRole,
+    pub from_device_id: String,
+    pub payload: Value,
 }
 
 pub struct SignalConnectContext {
@@ -263,6 +324,7 @@ impl SignalClientOptions {
 
 struct SignalWorker {
     cancel: watch::Sender<bool>,
+    outbound: tokio::sync::mpsc::Sender<String>,
     thread: JoinHandle<()>,
 }
 
@@ -271,6 +333,7 @@ pub struct SignalWebSocketClient {
     worker: Option<SignalWorker>,
     notifications: Option<Receiver<SignalNotification>>,
     options: SignalClientOptions,
+    local_device_id: Option<String>,
 }
 
 impl Default for SignalWebSocketClient {
@@ -296,6 +359,7 @@ impl SignalWebSocketClient {
             worker: None,
             notifications: None,
             options,
+            local_device_id: None,
         }
     }
 
@@ -311,11 +375,54 @@ impl SignalWebSocketClient {
         }
     }
 
+    pub fn send_session_message(
+        &self,
+        kind: SessionSignalMessageKind,
+        session_id: &str,
+        role: SessionRole,
+        payload: Value,
+    ) -> Result<(), SignalError> {
+        let worker = self.worker.as_ref().ok_or(SignalError::WorkerUnavailable)?;
+        let local_device_id = self
+            .local_device_id
+            .as_deref()
+            .ok_or(SignalError::WorkerUnavailable)?;
+        let message =
+            encode_outbound_session_message(kind, session_id, role, local_device_id, payload)?;
+        worker
+            .outbound
+            .try_send(message)
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => SignalError::OutboundQueueFull,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => SignalError::WorkerUnavailable,
+            })
+    }
+
+    pub fn request_candidate_token(
+        &self,
+        request: &CandidateTokenRequest,
+    ) -> Result<(), SignalError> {
+        let worker = self.worker.as_ref().ok_or(SignalError::WorkerUnavailable)?;
+        let local_device_id = self
+            .local_device_id
+            .as_deref()
+            .ok_or(SignalError::WorkerUnavailable)?;
+        let message = encode_candidate_token_request(local_device_id, request)?;
+        worker
+            .outbound
+            .try_send(message)
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => SignalError::OutboundQueueFull,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => SignalError::WorkerUnavailable,
+            })
+    }
+
     fn stop_worker(&mut self) {
         if let Some(worker) = self.worker.take() {
             let _ = worker.cancel.send(true);
             let _ = worker.thread.join();
         }
+        self.local_device_id = None;
     }
 
     #[cfg(test)]
@@ -340,17 +447,29 @@ impl SignalClient for SignalWebSocketClient {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (notification_tx, notification_rx) = mpsc::sync_channel(NOTIFICATION_QUEUE_CAPACITY);
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        self.local_device_id = Some(context.device_id.clone());
         let machine = Arc::clone(&self.machine);
         let options = self.options.clone();
         let thread = thread::Builder::new()
             .name("desktop-signal-ws".to_owned())
-            .spawn(move || run_signal_worker(machine, context, options, cancel_rx, notification_tx))
+            .spawn(move || {
+                run_signal_worker(
+                    machine,
+                    context,
+                    options,
+                    cancel_rx,
+                    notification_tx,
+                    outbound_rx,
+                )
+            })
             .map_err(|_| {
                 lock_machine(&self.machine).fail();
                 SignalError::WorkerUnavailable
             })?;
         self.worker = Some(SignalWorker {
             cancel: cancel_tx,
+            outbound: outbound_tx,
             thread,
         });
         self.notifications = Some(notification_rx);
@@ -382,6 +501,7 @@ fn run_signal_worker(
     options: SignalClientOptions,
     mut cancel: watch::Receiver<bool>,
     notifications: SyncSender<SignalNotification>,
+    mut outbound: tokio::sync::mpsc::Receiver<String>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -415,6 +535,7 @@ fn run_signal_worker(
                 &mut cancel,
                 &notifications,
                 &context.device_id,
+                &mut outbound,
             )
             .await
             {
@@ -626,6 +747,7 @@ async fn run_online(
     cancel: &mut watch::Receiver<bool>,
     notifications: &SyncSender<SignalNotification>,
     device_id: &str,
+    outbound: &mut tokio::sync::mpsc::Receiver<String>,
 ) -> Result<(), SignalError> {
     let mut heartbeat = tokio::time::interval(options.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -644,6 +766,15 @@ async fn run_online(
                 }
                 socket
                     .send(Message::Ping(Vec::new().into()))
+                    .await
+                    .map_err(|_| SignalError::Transport)?;
+            }
+            outbound_message = outbound.recv() => {
+                let Some(outbound_message) = outbound_message else {
+                    return Err(SignalError::WorkerUnavailable);
+                };
+                socket
+                    .send(Message::Text(outbound_message.into()))
                     .await
                     .map_err(|_| SignalError::Transport)?;
             }
@@ -740,12 +871,49 @@ struct SessionStateWire {
     session: Value,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionMessageWire {
+    #[serde(rename = "type")]
+    kind: String,
+    session_id: String,
+    role: SessionRole,
+    from_device_id: String,
+    payload: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OnlineDevicesWire {
+    #[serde(rename = "type")]
+    kind: String,
+    devices: Vec<SignalOnlineDevice>,
+}
+
 fn decode_server_notification(
     text: &str,
     message_type: &str,
     device_id: &str,
 ) -> Result<Option<SignalNotification>, SignalError> {
     let notification = match message_type {
+        "online_devices" => {
+            let wire: OnlineDevicesWire =
+                serde_json::from_str(text).map_err(|_| SignalError::InvalidServerMessage)?;
+            if wire.kind != message_type
+                || wire.devices.iter().any(|online| {
+                    online.device_id.is_empty()
+                        || online.public_key_id.is_empty()
+                        || online.public_key_version == 0
+                        || URL_SAFE_NO_PAD
+                            .decode(&online.public_key)
+                            .ok()
+                            .is_none_or(|public_key| public_key.len() != 32)
+                })
+            {
+                return Err(SignalError::InvalidServerMessage);
+            }
+            SignalNotification::OnlineDevices(wire.devices)
+        }
         "session_invite" => {
             let wire: SessionInviteWire = decode_notification_wire(text, message_type)?;
             SignalNotification::SessionInvite(SessionInviteNotification {
@@ -782,9 +950,174 @@ fn decode_server_notification(
             device_id,
             false,
         )?),
+        "candidate_token_issued" => {
+            let issued: CandidateTokenIssued =
+                serde_json::from_str(text).map_err(|_| SignalError::InvalidServerMessage)?;
+            if issued.device_id != device_id
+                || issued.candidate_token.is_empty()
+                || issued.expires_at_epoch_millis <= now_epoch_millis()
+            {
+                return Err(SignalError::InvalidServerMessage);
+            }
+            SignalNotification::CandidateTokenIssued(issued)
+        }
+        "connection_candidate" | "key_exchange_message" | "key_confirm" => {
+            SignalNotification::SessionMessage(decode_session_message(text, message_type)?)
+        }
         _ => return Ok(None),
     };
     Ok(Some(notification))
+}
+
+fn encode_candidate_token_request(
+    local_device_id: &str,
+    request: &CandidateTokenRequest,
+) -> Result<String, SignalError> {
+    if local_device_id.is_empty()
+        || request.device_id != local_device_id
+        || request.requested_ttl_millis == 0
+    {
+        return Err(SignalError::InvalidSessionMessage);
+    }
+    serde_json::to_string(&serde_json::json!({
+        "type": "request_candidate_token",
+        "payload": request,
+    }))
+    .map_err(|_| SignalError::InvalidSessionMessage)
+}
+
+fn decode_session_message(
+    text: &str,
+    expected_type: &str,
+) -> Result<SessionPeerMessage, SignalError> {
+    let wire: SessionMessageWire =
+        serde_json::from_str(text).map_err(|_| SignalError::InvalidServerMessage)?;
+    let kind =
+        SessionSignalMessageKind::parse(expected_type).ok_or(SignalError::InvalidServerMessage)?;
+    if wire.kind != expected_type
+        || wire.session_id.is_empty()
+        || wire.from_device_id.is_empty()
+        || !validate_session_message_payload(
+            kind,
+            &wire.session_id,
+            &wire.from_device_id,
+            wire.role,
+            &wire.payload,
+        )
+    {
+        return Err(SignalError::InvalidServerMessage);
+    }
+    Ok(SessionPeerMessage {
+        kind,
+        session_id: wire.session_id,
+        role: wire.role,
+        from_device_id: wire.from_device_id,
+        payload: wire.payload,
+    })
+}
+
+fn encode_outbound_session_message(
+    kind: SessionSignalMessageKind,
+    session_id: &str,
+    role: SessionRole,
+    local_device_id: &str,
+    payload: Value,
+) -> Result<String, SignalError> {
+    if !validate_session_message_payload(kind, session_id, local_device_id, role, &payload) {
+        return Err(SignalError::InvalidSessionMessage);
+    }
+    serde_json::to_string(&serde_json::json!({
+        "type": kind.as_str(),
+        "session_id": session_id,
+        "role": role,
+        "payload": payload,
+    }))
+    .map_err(|_| SignalError::InvalidSessionMessage)
+}
+
+fn validate_session_message_payload(
+    kind: SessionSignalMessageKind,
+    session_id: &str,
+    device_id: &str,
+    role: SessionRole,
+    payload: &Value,
+) -> bool {
+    let Some(session_id) = Uuid::parse_str(session_id)
+        .ok()
+        .map(|value| value.as_u128())
+    else {
+        return false;
+    };
+    match kind {
+        SessionSignalMessageKind::ConnectionCandidate => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct CandidatePayload {
+                candidate: ConnectionCandidateDto,
+                authorization: CandidateAuthorization,
+                transport_certificate_der: Option<String>,
+                server_name: Option<String>,
+            }
+            serde_json::from_value::<CandidatePayload>(payload.clone())
+                .ok()
+                .is_some_and(|value| {
+                    let transport_identity_valid = match role {
+                        SessionRole::Controller => {
+                            value.transport_certificate_der.is_none() && value.server_name.is_none()
+                        }
+                        SessionRole::Controlled => {
+                            value
+                                .transport_certificate_der
+                                .as_deref()
+                                .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
+                                .is_some_and(|certificate| {
+                                    !certificate.is_empty()
+                                        && certificate.len() <= MAX_SESSION_CERTIFICATE_DER_BYTES
+                                })
+                                && value
+                                    .server_name
+                                    .as_deref()
+                                    .is_some_and(valid_session_server_name)
+                        }
+                    };
+                    transport_identity_valid
+                        && value.candidate.session_id == session_id
+                        && value.candidate.device_id == device_id
+                        && value.candidate.role == role
+                        && !value.authorization.candidate_token.is_empty()
+                        && value.authorization.expires_at_epoch_millis > now_epoch_millis()
+                })
+        }
+        SessionSignalMessageKind::KeyExchangeMessage => {
+            serde_json::from_value::<SignedKeyExchange>(payload.clone())
+                .ok()
+                .is_some_and(|value| {
+                    value.payload.session_id == session_id
+                        && value.payload.device_id == device_id
+                        && value.payload.role == role
+                        && value.payload.validate_path_binding()
+                        && value.signature_bytes().is_some()
+                })
+        }
+        SessionSignalMessageKind::KeyConfirm => {
+            serde_json::from_value::<KeyConfirm>(payload.clone())
+                .ok()
+                .is_some_and(|value| {
+                    value.session_id == session_id
+                        && value.device_id == device_id
+                        && value.role == role
+                })
+        }
+    }
+}
+
+fn valid_session_server_name(value: &str) -> bool {
+    value.len() <= 253
+        && value.starts_with("rctl-")
+        && value.ends_with(".invalid")
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+        })
 }
 
 fn decode_notification_wire<T>(text: &str, expected_type: &str) -> Result<T, SignalError>
@@ -1287,6 +1620,242 @@ mod tests {
             initial_reconnect_delay: Duration::from_millis(10),
             max_reconnect_delay: Duration::from_millis(20),
         }
+    }
+
+    fn key_confirm_payload(session_id: &str, device_id: &str, role: SessionRole) -> Value {
+        serde_json::to_value(KeyConfirm {
+            session_id: Uuid::parse_str(session_id).unwrap().as_u128(),
+            device_id: device_id.to_owned(),
+            role,
+            key_exchange_transcript_hash: [3; 32],
+            confirm_mac: [5; 32],
+            timestamp_epoch_millis: now_epoch_millis(),
+        })
+        .expect("key confirm payload")
+    }
+
+    fn candidate_token_request(device_id: &str) -> CandidateTokenRequest {
+        use remote_protocol::{CandidateSource, TransportPath};
+
+        CandidateTokenRequest {
+            session_id: Uuid::parse_str("00000000-0000-4000-8000-000000000001")
+                .expect("session UUID")
+                .as_u128(),
+            device_id: device_id.to_owned(),
+            role: SessionRole::Controlled,
+            candidate_id: 2,
+            kind: TransportPath::LanDirect,
+            endpoint: "192.168.1.10:50000".to_owned(),
+            source: CandidateSource::LocalInterface,
+            relay_node_id: None,
+            observe_result_id: None,
+            observe_result_binding_hash: None,
+            local_interface_claim_hash: Some([1; 32]),
+            local_interface_signature: Some(vec![2; 64]),
+            interface_name_hash: Some([3; 32]),
+            interface_index_hash: Some([4; 32]),
+            local_socket_nonce: Some([5; 32]),
+            timestamp_epoch_millis: Some(now_epoch_millis()),
+            requested_ttl_millis: 30_000,
+        }
+    }
+
+    #[test]
+    fn candidate_token_request_and_response_are_bound_to_the_local_device() {
+        let request = candidate_token_request("ubuntu-1");
+        let encoded =
+            encode_candidate_token_request("ubuntu-1", &request).expect("encode token request");
+        let value: Value = serde_json::from_str(&encoded).expect("request JSON");
+        assert_eq!(value["type"], "request_candidate_token");
+        assert_eq!(value["payload"]["device_id"], "ubuntu-1");
+        assert_eq!(
+            encode_candidate_token_request("substituted", &request),
+            Err(SignalError::InvalidSessionMessage)
+        );
+
+        let response = serde_json::json!({
+            "type": "candidate_token_issued",
+            "session_id": "00000000-0000-4000-8000-000000000001",
+            "device_id": "ubuntu-1",
+            "role": "controlled",
+            "candidate_id": "00000000000000000000000000000002",
+            "candidate_token": [7, 8, 9],
+            "candidate_token_binding_hash": vec![6; 32],
+            "expires_at_epoch_millis": now_epoch_millis() + 30_000,
+        })
+        .to_string();
+        let decoded = decode_server_notification(&response, "candidate_token_issued", "ubuntu-1")
+            .expect("decode token response")
+            .expect("token notification");
+        let SignalNotification::CandidateTokenIssued(issued) = decoded else {
+            panic!("candidate token notification expected");
+        };
+        assert_eq!(issued.device_id, "ubuntu-1");
+        assert_eq!(issued.candidate_id, 2);
+        assert_eq!(issued.candidate_token, [7, 8, 9]);
+
+        assert_eq!(
+            decode_server_notification(&response, "candidate_token_issued", "substituted",),
+            Err(SignalError::InvalidServerMessage)
+        );
+    }
+
+    #[test]
+    fn controlled_candidate_requires_and_preserves_single_session_transport_identity() {
+        use remote_protocol::{CandidateSource, TransportPath};
+
+        let session_id = "00000000-0000-4000-8000-000000000001";
+        let candidate = ConnectionCandidateDto {
+            candidate_id: 2,
+            session_id: Uuid::parse_str(session_id).unwrap().as_u128(),
+            device_id: "ubuntu-1".to_owned(),
+            role: SessionRole::Controlled,
+            kind: TransportPath::LanDirect,
+            endpoint: "192.168.1.10:50000".to_owned(),
+            source: CandidateSource::LocalInterface,
+            observe_result_id: None,
+            priority: 0,
+            rtt_ms: None,
+            loss_ppm: None,
+            jitter_ms: None,
+            relay_node_id: None,
+        };
+        let authorization = CandidateAuthorization {
+            candidate_token: vec![7; 32],
+            candidate_token_binding_hash: [8; 32],
+            expires_at_epoch_millis: now_epoch_millis() + 30_000,
+        };
+        let certificate = URL_SAFE_NO_PAD.encode([0x30, 0x01, 0x00]);
+        let server_name = format!("rctl-{session_id}.invalid");
+        let payload = serde_json::json!({
+            "candidate": candidate,
+            "authorization": authorization,
+            "transport_certificate_der": certificate,
+            "server_name": server_name,
+        });
+        let encoded = encode_outbound_session_message(
+            SessionSignalMessageKind::ConnectionCandidate,
+            session_id,
+            SessionRole::Controlled,
+            "ubuntu-1",
+            payload,
+        )
+        .expect("encode controlled candidate");
+        let value: Value = serde_json::from_str(&encoded).expect("candidate JSON");
+        assert_eq!(value["payload"]["transport_certificate_der"], certificate);
+        assert_eq!(value["payload"]["server_name"], server_name);
+
+        let missing_identity = serde_json::json!({
+            "candidate": candidate,
+            "authorization": authorization,
+        });
+        assert_eq!(
+            encode_outbound_session_message(
+                SessionSignalMessageKind::ConnectionCandidate,
+                session_id,
+                SessionRole::Controlled,
+                "ubuntu-1",
+                missing_identity,
+            ),
+            Err(SignalError::InvalidSessionMessage)
+        );
+    }
+
+    #[test]
+    fn online_device_public_key_is_available_for_peer_key_exchange_verification() {
+        let message = serde_json::json!({
+            "type": "online_devices",
+            "devices": [{
+                "account_id": "account-1",
+                "device_id": "ios-1",
+                "public_key_id": "key-1",
+                "public_key_version": 1,
+                "public_key": URL_SAFE_NO_PAD.encode([7; 32]),
+                "client_capabilities_hash": "aa".repeat(32),
+                "status": "online",
+                "last_seen_epoch_millis": 1_000,
+                "connection_id": "connection-1"
+            }]
+        })
+        .to_string();
+        let notification = decode_server_notification(&message, "online_devices", "ubuntu-1")
+            .expect("decode online devices")
+            .expect("online devices notification");
+        let SignalNotification::OnlineDevices(devices) = notification else {
+            panic!("online device notification expected");
+        };
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, "ios-1");
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(&devices[0].public_key)
+                .expect("peer public key"),
+            [7; 32]
+        );
+    }
+
+    #[test]
+    fn outbound_key_confirm_is_strictly_bound_and_omits_sender_field() {
+        let session_id = "00000000-0000-4000-8000-000000000001";
+        let encoded = encode_outbound_session_message(
+            SessionSignalMessageKind::KeyConfirm,
+            session_id,
+            SessionRole::Controlled,
+            "ubuntu-1",
+            key_confirm_payload(session_id, "ubuntu-1", SessionRole::Controlled),
+        )
+        .expect("encode outbound key confirm");
+        let value: Value = serde_json::from_str(&encoded).expect("outbound JSON");
+        assert_eq!(value["type"], "key_confirm");
+        assert_eq!(value["session_id"], session_id);
+        assert_eq!(value["role"], "controlled");
+        assert!(value.get("from_device_id").is_none());
+
+        assert_eq!(
+            encode_outbound_session_message(
+                SessionSignalMessageKind::KeyConfirm,
+                session_id,
+                SessionRole::Controlled,
+                "ubuntu-1",
+                key_confirm_payload(session_id, "substituted", SessionRole::Controlled),
+            ),
+            Err(SignalError::InvalidSessionMessage)
+        );
+    }
+
+    #[test]
+    fn inbound_key_confirm_preserves_sender_and_rejects_role_substitution() {
+        let session_id = "00000000-0000-4000-8000-000000000001";
+        let message = serde_json::json!({
+            "type": "key_confirm",
+            "session_id": session_id,
+            "role": "controller",
+            "from_device_id": "ios-1",
+            "payload": key_confirm_payload(session_id, "ios-1", SessionRole::Controller),
+        })
+        .to_string();
+        let decoded = decode_server_notification(&message, "key_confirm", "ubuntu-1")
+            .expect("decode notification")
+            .expect("session notification");
+        let SignalNotification::SessionMessage(decoded) = decoded else {
+            panic!("expected session message");
+        };
+        assert_eq!(decoded.kind, SessionSignalMessageKind::KeyConfirm);
+        assert_eq!(decoded.from_device_id, "ios-1");
+        assert_eq!(decoded.role, SessionRole::Controller);
+
+        let substituted = serde_json::json!({
+            "type": "key_confirm",
+            "session_id": session_id,
+            "role": "controlled",
+            "from_device_id": "ios-1",
+            "payload": key_confirm_payload(session_id, "ios-1", SessionRole::Controller),
+        })
+        .to_string();
+        assert_eq!(
+            decode_server_notification(&substituted, "key_confirm", "ubuntu-1"),
+            Err(SignalError::InvalidServerMessage)
+        );
     }
 
     fn spawn_test_server(public_key: [u8; 32], mode: TestServerMode) -> TestServer {

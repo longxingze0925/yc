@@ -3,6 +3,7 @@ import Foundation
 
 public struct SessionLaunch: Identifiable, Sendable {
     public let response: SessionCreateResponse
+    public let descriptor: SessionDescriptor
     public let deviceName: String
 
     public var id: UUID { response.sessionID }
@@ -40,6 +41,7 @@ public final class ControllerAppModel: ObservableObject {
     private var api: (any RemoteAPI)?
     private var signal: SignalClient?
     private var signalEventsTask: Task<Void, Never>?
+    private let signalSessionRouter = SignalSessionEventRouter()
     private var pendingLoginChallenge: LoginChallenge?
     private var authenticationFlowID = UUID()
     private var bootstrapped = false
@@ -297,7 +299,7 @@ public final class ControllerAppModel: ObservableObject {
     }
 
     public func connectWithTemporaryCode(deviceID: String, code: String) async {
-        guard let api, let controllerDeviceID else { return }
+        guard let api, let accountID, let controllerDeviceID else { return }
         let secret = OneTimeSecret(code)
         defer { secret.wipe() }
         do {
@@ -309,7 +311,14 @@ public final class ControllerAppModel: ObservableObject {
                 idempotencyKey: UUID()
             ))
             try await proofClient.verifyTemporaryCode(session: response, secret: secret, api: api)
-            activeSession = SessionLaunch(response: response, deviceName: response.controlledDeviceName ?? deviceID)
+            activeSession = SessionLaunch(
+                response: response,
+                descriptor: try response.descriptor(
+                    accountID: accountID,
+                    controllerDeviceID: controllerDeviceID
+                ),
+                deviceName: response.controlledDeviceName ?? deviceID
+            )
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -339,9 +348,17 @@ public final class ControllerAppModel: ObservableObject {
     }
 
     private func createSession(request: SessionCreateRequest, deviceName: String) async {
-        guard let api else { return }
+        guard let api, let accountID, let controllerDeviceID else { return }
         do {
-            activeSession = SessionLaunch(response: try await api.createSession(request), deviceName: deviceName)
+            let response = try await api.createSession(request)
+            activeSession = SessionLaunch(
+                response: response,
+                descriptor: try response.descriptor(
+                    accountID: accountID,
+                    controllerDeviceID: controllerDeviceID
+                ),
+                deviceName: deviceName
+            )
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -466,6 +483,15 @@ public final class ControllerAppModel: ObservableObject {
         guard self.authenticationFlowID == authenticationFlowID else { return }
         let client = SignalClient(configuration: configuration)
         signal = client
+#if REMOTE_CORE_FFI
+        NativeRustCoreSessionBridge.shared.install(
+            driverFactory: SignalNativeSecureTransportDriverFactory(
+                signal: client,
+                router: signalSessionRouter,
+                identityStore: identityStore
+            )
+        )
+#endif
         signalEventsTask = Task { [weak self] in
             for await event in client.events {
                 guard let self else { return }
@@ -473,6 +499,7 @@ public final class ControllerAppModel: ObservableObject {
                     await client.stop()
                     return
                 }
+                await signalSessionRouter.route(event)
                 switch event {
                 case .connecting:
                     signalStatus = "连接中"
@@ -491,6 +518,10 @@ public final class ControllerAppModel: ObservableObject {
                     errorMessage = reason
                 case let .authenticationFailed(reason):
                     signalStatus = "鉴权失败"
+#if REMOTE_CORE_FFI
+                    NativeRustCoreSessionBridge.shared.uninstallDriverFactory()
+#endif
+                    await signalSessionRouter.removeAll()
                     await client.stop()
                     signal = nil
                     signalEventsTask = nil
@@ -503,7 +534,7 @@ public final class ControllerAppModel: ObservableObject {
                     phase = .signedOut
                     errorMessage = reason
                     return
-                case .sessionState:
+                case .sessionState, .candidateTokenIssued, .sessionMessage:
                     break
                 }
             }
@@ -524,7 +555,16 @@ public final class ControllerAppModel: ObservableObject {
                     if tokens.accessTokenIsValid {
                         return tokens.accessToken
                     }
-                    let response = try await api.refresh(using: tokens.refreshToken)
+                    let response: LoginResponse
+                    do {
+                        response = try await api.refresh(using: tokens.refreshToken)
+                    } catch let error as APIClientError {
+                        if case let .server(_, _, status) = error,
+                           status == 401 || status == 403 {
+                            throw APIClientError.authenticationRequired
+                        }
+                        throw error
+                    }
                     guard response.accountID == tokens.accountID else {
                         throw APIClientError.invalidResponse
                     }
@@ -535,6 +575,10 @@ public final class ControllerAppModel: ObservableObject {
             )
         } catch {
             guard self.authenticationFlowID == authenticationFlowID else { return }
+#if REMOTE_CORE_FFI
+            NativeRustCoreSessionBridge.shared.uninstallDriverFactory()
+#endif
+            await signalSessionRouter.removeAll()
             signalEventsTask?.cancel()
             signalEventsTask = nil
             signal = nil
@@ -564,6 +608,10 @@ public final class ControllerAppModel: ObservableObject {
     }
 
     private func stopSignal() async {
+#if REMOTE_CORE_FFI
+        NativeRustCoreSessionBridge.shared.uninstallDriverFactory()
+#endif
+        await signalSessionRouter.removeAll()
         signalEventsTask?.cancel()
         signalEventsTask = nil
         if let signal { await signal.stop() }

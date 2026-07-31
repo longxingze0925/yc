@@ -5,7 +5,7 @@ mod security;
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -16,9 +16,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use backend::{PresenceMutation, ReplayRecord, StateBackend, PRESENCE_TTL_MILLIS};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use notify::{ConnectionRegistry, EnqueueError};
 use rand::random;
-use remote_protocol::{DeviceStatus, ErrorCode, PROTOCOL_VERSION};
+use remote_protocol::{
+    CandidateAuthorization, CandidateTokenRequest, ConnectionCandidateDto, DeviceStatus, ErrorCode,
+    KeyConfirm, SessionRole, SignedKeyExchange, PROTOCOL_VERSION,
+};
+use remote_transport::{candidate_token_binding_hash, LanCandidateGuard};
 use security::{
     client_capabilities_hash, decode_array, decode_hex_array, encode, encode_hex,
     ensure_timestamp_in_window, hello_signature_input, parse_protocol_headers,
@@ -34,6 +40,7 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:18081";
 const HELLO_TTL_MILLIS: u64 = 30_000;
 const PRESENCE_REFRESH_MILLIS: u64 = PRESENCE_TTL_MILLIS / 3;
 const MAX_INTERNAL_PUSH_BODY_BYTES: usize = 64 * 1024;
+const MAX_SESSION_CERTIFICATE_DER_BYTES: usize = 16 * 1024;
 const NOTIFICATION_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
@@ -165,6 +172,131 @@ enum DeviceAuthenticator {
     Memory(Arc<DeviceDirectory>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionAuthorization {
+    session_id: String,
+    controller_device_id: String,
+    controlled_device_id: String,
+    permissions_digest: String,
+    relay_token_epoch: u64,
+}
+
+impl SessionAuthorization {
+    fn peer_for(&self, device_id: &str, role: SessionRole) -> Option<&str> {
+        match role {
+            SessionRole::Controller if self.controller_device_id == device_id => {
+                Some(&self.controlled_device_id)
+            }
+            SessionRole::Controlled if self.controlled_device_id == device_id => {
+                Some(&self.controller_device_id)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum SessionAuthorizer {
+    Api(ApiSessionAuthorizer),
+    Memory(Arc<StdRwLock<HashMap<String, SessionAuthorization>>>),
+}
+
+impl SessionAuthorizer {
+    async fn authorize(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        session_id: &str,
+        role: SessionRole,
+    ) -> Result<SessionAuthorization, String> {
+        match self {
+            Self::Api(api) => api.authorize(account_id, device_id, session_id, role).await,
+            Self::Memory(sessions) => {
+                let authorization = sessions
+                    .read()
+                    .map_err(|_| "session authorization lock poisoned".to_owned())?
+                    .get(session_id)
+                    .cloned()
+                    .ok_or_else(|| "session was not authorized".to_owned())?;
+                authorization
+                    .peer_for(device_id, role)
+                    .ok_or_else(|| "session role binding mismatch".to_owned())?;
+                Ok(authorization)
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ApiSessionAuthorizer {
+    client: reqwest::Client,
+    endpoint: String,
+    service_token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionAuthRequest<'a> {
+    account_id: &'a str,
+    device_id: &'a str,
+    session_id: &'a str,
+    role: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionAuthResponse {
+    authorized: bool,
+    session_id: String,
+    controller_device_id: String,
+    controlled_device_id: String,
+    permissions_digest: String,
+    relay_token_epoch: u64,
+}
+
+impl ApiSessionAuthorizer {
+    async fn authorize(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        session_id: &str,
+        role: SessionRole,
+    ) -> Result<SessionAuthorization, String> {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .bearer_auth(&self.service_token)
+            .json(&SessionAuthRequest {
+                account_id,
+                device_id,
+                session_id,
+                role: role.as_str(),
+            })
+            .send()
+            .await
+            .map_err(|_| "session authorization service unavailable".to_owned())?;
+        if !response.status().is_success() {
+            return Err("session authorization rejected".to_owned());
+        }
+        let response: SessionAuthResponse = response
+            .json()
+            .await
+            .map_err(|_| "invalid session authorization response".to_owned())?;
+        if !response.authorized || response.session_id != session_id {
+            return Err("session authorization binding mismatch".to_owned());
+        }
+        let authorization = SessionAuthorization {
+            session_id: response.session_id,
+            controller_device_id: response.controller_device_id,
+            controlled_device_id: response.controlled_device_id,
+            permissions_digest: response.permissions_digest,
+            relay_token_epoch: response.relay_token_epoch,
+        };
+        authorization
+            .peer_for(device_id, role)
+            .ok_or_else(|| "session authorization role mismatch".to_owned())?;
+        Ok(authorization)
+    }
+}
+
 impl DeviceAuthenticator {
     async fn authorize(&self, request: DeviceAuthRequest) -> Result<TrustedDevice, String> {
         match self {
@@ -262,6 +394,7 @@ pub struct OnlineDevice {
     pub device_id: String,
     pub public_key_id: String,
     pub public_key_version: u32,
+    pub public_key: String,
     pub client_capabilities_hash: String,
     pub status: DeviceStatus,
     pub last_seen_epoch_millis: u64,
@@ -272,8 +405,10 @@ pub struct OnlineDevice {
 pub struct AppState {
     config: AppConfig,
     device_authenticator: DeviceAuthenticator,
+    session_authorizer: SessionAuthorizer,
     backend: StateBackend,
     connections: ConnectionRegistry,
+    lan_candidate_guard: Arc<StdMutex<LanCandidateGuard>>,
 }
 
 type UpgradeValidation = Result<(AccessClaims, String, ProtocolNegotiation), Box<Response>>;
@@ -287,19 +422,30 @@ impl AppState {
     }
 
     fn with_backend(config: AppConfig, backend: StateBackend) -> Self {
-        let endpoint = format!(
+        let device_endpoint = format!(
             "{}/internal/v1/signal/device-auth",
             config.internal_api_url.trim_end_matches('/')
         );
+        let session_endpoint = format!(
+            "{}/internal/v1/signal/session-authorize",
+            config.internal_api_url.trim_end_matches('/')
+        );
+        let client = reqwest::Client::new();
         Self {
             device_authenticator: DeviceAuthenticator::Api(ApiDeviceAuthenticator {
-                client: reqwest::Client::new(),
-                endpoint,
+                client: client.clone(),
+                endpoint: device_endpoint,
+                service_token: config.service_token.clone(),
+            }),
+            session_authorizer: SessionAuthorizer::Api(ApiSessionAuthorizer {
+                client,
+                endpoint: session_endpoint,
                 service_token: config.service_token.clone(),
             }),
             config,
             backend,
             connections: ConnectionRegistry::default(),
+            lan_candidate_guard: Arc::new(StdMutex::new(LanCandidateGuard::default())),
         }
     }
 
@@ -307,8 +453,10 @@ impl AppState {
         Self {
             config: AppConfig::for_test(),
             device_authenticator: DeviceAuthenticator::Memory(Arc::new(devices)),
+            session_authorizer: SessionAuthorizer::Memory(Arc::new(StdRwLock::new(HashMap::new()))),
             backend: StateBackend::memory(),
             connections: ConnectionRegistry::default(),
+            lan_candidate_guard: Arc::new(StdMutex::new(LanCandidateGuard::default())),
         }
     }
 
@@ -319,6 +467,17 @@ impl AppState {
     #[cfg(test)]
     async fn online_count(&self) -> Result<usize, backend::BackendError> {
         self.backend.online_count().await
+    }
+
+    #[cfg(test)]
+    fn add_test_session(&self, authorization: SessionAuthorization) {
+        let SessionAuthorizer::Memory(sessions) = &self.session_authorizer else {
+            panic!("test state must use memory session authorization");
+        };
+        sessions
+            .write()
+            .expect("session authorizations")
+            .insert(authorization.session_id.clone(), authorization);
     }
 }
 
@@ -768,6 +927,7 @@ async fn handle_socket(
                             &state,
                             &claims.account_id,
                             &device_id,
+                            &authenticated.device.public_key,
                             &connection_id,
                             &text,
                         )
@@ -946,12 +1106,31 @@ enum AuthenticatedClientMessage {
         status: DeviceStatus,
         seen_at_epoch_millis: u64,
     },
+    ConnectionCandidate {
+        session_id: String,
+        role: SessionRole,
+        payload: Value,
+    },
+    RequestCandidateToken {
+        payload: Box<CandidateTokenRequest>,
+    },
+    KeyExchangeMessage {
+        session_id: String,
+        role: SessionRole,
+        payload: Value,
+    },
+    KeyConfirm {
+        session_id: String,
+        role: SessionRole,
+        payload: Value,
+    },
 }
 
 async fn handle_authenticated_text(
     state: &AppState,
     account_id: &str,
     authenticated_device_id: &str,
+    authenticated_public_key: &[u8; 32],
     connection_id: &str,
     text: &str,
 ) -> ServerMessage {
@@ -974,12 +1153,12 @@ async fn handle_authenticated_text(
             message: format!("{message_type} is API-only and cannot be written over WebSocket"),
         };
     }
-    let request: AuthenticatedClientMessage = match serde_json::from_value(value) {
+    let request: AuthenticatedClientMessage = match serde_json::from_str(text) {
         Ok(request) => request,
-        Err(_) => {
+        Err(error) => {
             return ServerMessage::Error {
                 code: ErrorCode::UnsupportedMessageKind,
-                message: "unsupported authenticated signaling message".to_owned(),
+                message: format!("unsupported authenticated signaling message: {error}"),
             };
         }
     };
@@ -1040,7 +1219,298 @@ async fn handle_authenticated_text(
                 }
             }
         }
+        AuthenticatedClientMessage::ConnectionCandidate {
+            session_id,
+            role,
+            payload,
+        } => {
+            forward_session_message(
+                state,
+                account_id,
+                authenticated_device_id,
+                "connection_candidate",
+                session_id,
+                role,
+                payload,
+            )
+            .await
+        }
+        AuthenticatedClientMessage::RequestCandidateToken { payload } => {
+            issue_lan_candidate_token(
+                state,
+                account_id,
+                authenticated_device_id,
+                authenticated_public_key,
+                *payload,
+            )
+            .await
+        }
+        AuthenticatedClientMessage::KeyExchangeMessage {
+            session_id,
+            role,
+            payload,
+        } => {
+            forward_session_message(
+                state,
+                account_id,
+                authenticated_device_id,
+                "key_exchange_message",
+                session_id,
+                role,
+                payload,
+            )
+            .await
+        }
+        AuthenticatedClientMessage::KeyConfirm {
+            session_id,
+            role,
+            payload,
+        } => {
+            forward_session_message(
+                state,
+                account_id,
+                authenticated_device_id,
+                "key_confirm",
+                session_id,
+                role,
+                payload,
+            )
+            .await
+        }
     }
+}
+
+async fn issue_lan_candidate_token(
+    state: &AppState,
+    account_id: &str,
+    authenticated_device_id: &str,
+    authenticated_public_key: &[u8; 32],
+    request: CandidateTokenRequest,
+) -> ServerMessage {
+    let session_id = uuid::Uuid::from_u128(request.session_id)
+        .hyphenated()
+        .to_string();
+    if state
+        .session_authorizer
+        .authorize(
+            account_id,
+            authenticated_device_id,
+            &session_id,
+            request.role,
+        )
+        .await
+        .is_err()
+    {
+        return ServerMessage::Error {
+            code: ErrorCode::PermissionDenied,
+            message: "candidate token request was not authorized".to_owned(),
+        };
+    }
+    let now = now_epoch_millis();
+    let candidate = match state
+        .lan_candidate_guard
+        .lock()
+        .map_err(|_| ())
+        .and_then(|mut guard| {
+            guard
+                .validate_request(
+                    &request,
+                    request.session_id,
+                    authenticated_device_id,
+                    request.role,
+                    authenticated_public_key,
+                    now,
+                )
+                .map_err(|_| ())
+        }) {
+        Ok(candidate) => candidate,
+        Err(()) => {
+            return ServerMessage::Error {
+                code: ErrorCode::InvalidPayload,
+                message: "LAN candidate token request binding is invalid".to_owned(),
+            };
+        }
+    };
+    let expires_at_epoch_millis = now.saturating_add(u64::from(request.requested_ttl_millis));
+    let candidate_token_binding_hash =
+        match candidate_token_binding_hash(&candidate, expires_at_epoch_millis) {
+            Ok(binding) => binding,
+            Err(_) => {
+                return ServerMessage::Error {
+                    code: ErrorCode::InvalidPayload,
+                    message: "LAN candidate token binding is invalid".to_owned(),
+                };
+            }
+        };
+    ServerMessage::CandidateTokenIssued {
+        session_id: request.session_id,
+        device_id: request.device_id,
+        role: request.role,
+        candidate_id: request.candidate_id,
+        candidate_token: random::<[u8; 32]>().to_vec(),
+        candidate_token_binding_hash,
+        expires_at_epoch_millis,
+    }
+}
+
+async fn forward_session_message(
+    state: &AppState,
+    account_id: &str,
+    authenticated_device_id: &str,
+    message_type: &'static str,
+    session_id: String,
+    role: SessionRole,
+    payload: Value,
+) -> ServerMessage {
+    let Some(binary_session_id) = uuid::Uuid::parse_str(&session_id)
+        .ok()
+        .map(|value| value.as_u128())
+    else {
+        return ServerMessage::Error {
+            code: ErrorCode::InvalidPayload,
+            message: "session_id must be a UUID".to_owned(),
+        };
+    };
+    if !validate_forward_payload(
+        message_type,
+        &payload,
+        binary_session_id,
+        authenticated_device_id,
+        role,
+    ) {
+        return ServerMessage::Error {
+            code: ErrorCode::InvalidPayload,
+            message: "session message payload binding is invalid".to_owned(),
+        };
+    }
+    let authorization = match state
+        .session_authorizer
+        .authorize(account_id, authenticated_device_id, &session_id, role)
+        .await
+    {
+        Ok(authorization) => authorization,
+        Err(_) => {
+            return ServerMessage::Error {
+                code: ErrorCode::PermissionDenied,
+                message: "session message was not authorized".to_owned(),
+            }
+        }
+    };
+    let Some(peer_device_id) = authorization.peer_for(authenticated_device_id, role) else {
+        return ServerMessage::Error {
+            code: ErrorCode::PermissionDenied,
+            message: "session role binding mismatch".to_owned(),
+        };
+    };
+    let notification = serde_json::json!({
+        "type": message_type,
+        "session_id": session_id,
+        "role": role,
+        "from_device_id": authenticated_device_id,
+        "payload": payload,
+    });
+    let notification = match serde_json::to_string(&notification) {
+        Ok(notification) => notification,
+        Err(_) => {
+            return ServerMessage::Error {
+                code: ErrorCode::InvalidPayload,
+                message: "session message serialization failed".to_owned(),
+            }
+        }
+    };
+    match state
+        .connections
+        .enqueue(peer_device_id, notification)
+        .await
+    {
+        Ok(()) => ServerMessage::SessionMessageForwarded {
+            session_id,
+            message_type,
+            target_device_id: peer_device_id.to_owned(),
+        },
+        Err(EnqueueError::Offline) => ServerMessage::Error {
+            code: ErrorCode::DeviceOffline,
+            message: "session peer is offline".to_owned(),
+        },
+        Err(EnqueueError::Overloaded) => ServerMessage::Error {
+            code: ErrorCode::Internal,
+            message: "session peer queue is full".to_owned(),
+        },
+    }
+}
+
+fn validate_forward_payload(
+    message_type: &str,
+    payload: &Value,
+    session_id: u128,
+    device_id: &str,
+    role: SessionRole,
+) -> bool {
+    match message_type {
+        "connection_candidate" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct CandidatePayload {
+                candidate: ConnectionCandidateDto,
+                authorization: CandidateAuthorization,
+                transport_certificate_der: Option<String>,
+                server_name: Option<String>,
+            }
+            serde_json::from_value::<CandidatePayload>(payload.clone())
+                .ok()
+                .is_some_and(|value| {
+                    let transport_identity_valid = match role {
+                        SessionRole::Controller => {
+                            value.transport_certificate_der.is_none() && value.server_name.is_none()
+                        }
+                        SessionRole::Controlled => {
+                            value
+                                .transport_certificate_der
+                                .as_deref()
+                                .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
+                                .is_some_and(|certificate| {
+                                    !certificate.is_empty()
+                                        && certificate.len() <= MAX_SESSION_CERTIFICATE_DER_BYTES
+                                })
+                                && value
+                                    .server_name
+                                    .as_deref()
+                                    .is_some_and(valid_session_server_name)
+                        }
+                    };
+                    transport_identity_valid
+                        && value.candidate.session_id == session_id
+                        && value.candidate.device_id == device_id
+                        && value.candidate.role == role
+                        && !value.authorization.candidate_token.is_empty()
+                        && value.authorization.expires_at_epoch_millis > now_epoch_millis()
+                })
+        }
+        "key_exchange_message" => serde_json::from_value::<SignedKeyExchange>(payload.clone())
+            .ok()
+            .is_some_and(|value| {
+                value.payload.session_id == session_id
+                    && value.payload.device_id == device_id
+                    && value.payload.role == role
+                    && value.payload.validate_path_binding()
+                    && value.signature.len() == 64
+            }),
+        "key_confirm" => serde_json::from_value::<KeyConfirm>(payload.clone())
+            .ok()
+            .is_some_and(|value| {
+                value.session_id == session_id && value.device_id == device_id && value.role == role
+            }),
+        _ => false,
+    }
+}
+
+fn valid_session_server_name(value: &str) -> bool {
+    value.len() <= 253
+        && value.starts_with("rctl-")
+        && value.ends_with(".invalid")
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+        })
 }
 
 fn is_forbidden_ws_write(message_type: &str) -> bool {
@@ -1084,6 +1554,22 @@ enum ServerMessage {
     },
     OnlineDevices {
         devices: Vec<OnlineDevice>,
+    },
+    CandidateTokenIssued {
+        #[serde(with = "remote_protocol::serde_uuid_u128")]
+        session_id: u128,
+        device_id: String,
+        role: SessionRole,
+        #[serde(with = "remote_protocol::serde_hex_u128")]
+        candidate_id: u128,
+        candidate_token: Vec<u8>,
+        candidate_token_binding_hash: [u8; 32],
+        expires_at_epoch_millis: u64,
+    },
+    SessionMessageForwarded {
+        session_id: String,
+        message_type: &'static str,
+        target_device_id: String,
     },
     AuthFailed {
         code: ErrorCode,
@@ -1132,6 +1618,7 @@ fn online_device(
         device_id: device.device_id.clone(),
         public_key_id: device.public_key_id.clone(),
         public_key_version: device.public_key_version,
+        public_key: encode(&device.public_key),
         client_capabilities_hash: encode_hex(capabilities_hash),
         status,
         last_seen_epoch_millis: now_epoch_millis(),
@@ -1194,6 +1681,10 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use ed25519_dalek::{Signer, SigningKey};
+    use remote_protocol::{CandidateSource, TransportPath};
+    use remote_transport::{
+        candidate_id, local_interface_claim_hash, validate_candidate_authorization,
+    };
     use security::{hello_signature_input, sha256, sign_access_token_for_test, AccessClaims};
 
     fn fixture() -> (AppState, SigningKey, TrustedDevice) {
@@ -1209,6 +1700,117 @@ mod tests {
         let mut directory = DeviceDirectory::default();
         directory.insert(device.clone()).expect("device seed");
         (AppState::for_test(directory), signing_key, device)
+    }
+
+    #[tokio::test]
+    async fn authorized_lan_candidate_token_is_bound_and_replay_is_rejected() {
+        let (state, signing_key, device) = fixture();
+        let session_id = uuid::Uuid::from_u128(0x00000000000040008000000000000001);
+        state.add_test_session(SessionAuthorization {
+            session_id: session_id.hyphenated().to_string(),
+            controller_device_id: "ios-1".to_owned(),
+            controlled_device_id: device.device_id.clone(),
+            permissions_digest: "11".repeat(32),
+            relay_token_epoch: 1,
+        });
+        let mut candidate = ConnectionCandidateDto {
+            candidate_id: 0,
+            session_id: session_id.as_u128(),
+            device_id: device.device_id.clone(),
+            role: SessionRole::Controlled,
+            kind: TransportPath::LanDirect,
+            endpoint: "192.168.1.10:50000".to_owned(),
+            source: CandidateSource::LocalInterface,
+            observe_result_id: None,
+            priority: 0,
+            rtt_ms: None,
+            loss_ppm: None,
+            jitter_ms: None,
+            relay_node_id: None,
+        };
+        candidate.candidate_id = candidate_id(&candidate).expect("candidate ID");
+        let now = now_epoch_millis();
+        let mut request = CandidateTokenRequest {
+            session_id: candidate.session_id,
+            device_id: candidate.device_id.clone(),
+            role: candidate.role,
+            candidate_id: candidate.candidate_id,
+            kind: candidate.kind,
+            endpoint: candidate.endpoint.clone(),
+            source: candidate.source,
+            relay_node_id: None,
+            observe_result_id: None,
+            observe_result_binding_hash: None,
+            local_interface_claim_hash: None,
+            local_interface_signature: None,
+            interface_name_hash: Some([1; 32]),
+            interface_index_hash: Some([2; 32]),
+            local_socket_nonce: Some([3; 32]),
+            timestamp_epoch_millis: Some(now),
+            requested_ttl_millis: 30_000,
+        };
+        let claim = local_interface_claim_hash(&request).expect("interface claim");
+        request.local_interface_claim_hash = Some(claim);
+        request.local_interface_signature = Some(signing_key.sign(&claim).to_bytes().to_vec());
+        let message = serde_json::json!({
+            "type": "request_candidate_token",
+            "payload": request,
+        })
+        .to_string();
+
+        let response = handle_authenticated_text(
+            &state,
+            &device.account_id,
+            &device.device_id,
+            &device.public_key,
+            "controlled-connection",
+            &message,
+        )
+        .await;
+        let ServerMessage::CandidateTokenIssued {
+            session_id: issued_session_id,
+            device_id,
+            role,
+            candidate_id,
+            candidate_token,
+            candidate_token_binding_hash,
+            expires_at_epoch_millis,
+        } = response
+        else {
+            panic!("candidate token response expected");
+        };
+        assert_eq!(issued_session_id, candidate.session_id);
+        assert_eq!(device_id, candidate.device_id);
+        assert_eq!(role, candidate.role);
+        assert_eq!(candidate_id, candidate.candidate_id);
+        assert_eq!(candidate_token.len(), 32);
+        validate_candidate_authorization(
+            &candidate,
+            &CandidateAuthorization {
+                candidate_token,
+                candidate_token_binding_hash,
+                expires_at_epoch_millis,
+            },
+            now,
+        )
+        .expect("issued candidate authorization");
+
+        let replay = handle_authenticated_text(
+            &state,
+            &device.account_id,
+            &device.device_id,
+            &device.public_key,
+            "controlled-connection",
+            &message,
+        )
+        .await;
+        assert!(matches!(
+            replay,
+            ServerMessage::Error {
+                code: ErrorCode::InvalidPayload,
+                ..
+            }
+        ));
     }
 
     fn claims(now: u64) -> AccessClaims {
@@ -1481,6 +2083,7 @@ mod tests {
                 &state,
                 &device.account_id,
                 &device.device_id,
+                &device.public_key,
                 connection_id,
                 &format!(r#"{{"type":"{message_type}"}}"#),
             )
@@ -1491,6 +2094,251 @@ mod tests {
                     code: ErrorCode::PermissionDenied,
                     ..
                 }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_key_confirm_is_forwarded_only_to_the_session_peer() {
+        let (state, _, device) = fixture();
+        let session_id = "00000000-0000-4000-8000-000000000001";
+        state.add_test_session(SessionAuthorization {
+            session_id: session_id.to_owned(),
+            controller_device_id: "ios-1".to_owned(),
+            controlled_device_id: device.device_id.clone(),
+            permissions_digest: "11".repeat(32),
+            relay_token_epoch: 1,
+        });
+        let mut peer = state.connections.register("ios-1", "ios-connection").await;
+        let payload = serde_json::to_value(KeyConfirm {
+            session_id: uuid::Uuid::parse_str(session_id).unwrap().as_u128(),
+            device_id: device.device_id.clone(),
+            role: SessionRole::Controlled,
+            key_exchange_transcript_hash: [3; 32],
+            confirm_mac: [5; 32],
+            timestamp_epoch_millis: now_epoch_millis(),
+        })
+        .expect("key confirm");
+        let response = handle_authenticated_text(
+            &state,
+            &device.account_id,
+            &device.device_id,
+            &device.public_key,
+            "ubuntu-connection",
+            &serde_json::json!({
+                "type": "key_confirm",
+                "session_id": session_id,
+                "role": "controlled",
+                "payload": payload,
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            ServerMessage::SessionMessageForwarded {
+                session_id: forwarded_session,
+                message_type: "key_confirm",
+                target_device_id,
+            } if forwarded_session == session_id && target_device_id == "ios-1"
+        ));
+        let forwarded = peer.notifications.recv().await.expect("forwarded message");
+        let forwarded: Value = serde_json::from_str(&forwarded).expect("forwarded json");
+        assert_eq!(forwarded["type"], "key_confirm");
+        assert_eq!(forwarded["from_device_id"], "ubuntu-1");
+        assert_eq!(forwarded["session_id"], session_id);
+        assert_eq!(forwarded["payload"]["device_id"], "ubuntu-1");
+    }
+
+    #[tokio::test]
+    async fn controlled_candidate_transport_identity_is_forwarded_unchanged_to_controller() {
+        let (state, _, device) = fixture();
+        let session_id = "00000000-0000-4000-8000-000000000001";
+        let binary_session_id = uuid::Uuid::parse_str(session_id).unwrap().as_u128();
+        state.add_test_session(SessionAuthorization {
+            session_id: session_id.to_owned(),
+            controller_device_id: "ios-1".to_owned(),
+            controlled_device_id: device.device_id.clone(),
+            permissions_digest: "11".repeat(32),
+            relay_token_epoch: 1,
+        });
+        let mut peer = state.connections.register("ios-1", "ios-connection").await;
+        let certificate = URL_SAFE_NO_PAD.encode([0x30, 0x01, 0x00]);
+        let server_name = format!("rctl-{session_id}.invalid");
+        let payload = serde_json::json!({
+            "candidate": ConnectionCandidateDto {
+                candidate_id: 1,
+                session_id: binary_session_id,
+                device_id: device.device_id.clone(),
+                role: SessionRole::Controlled,
+                kind: TransportPath::LanDirect,
+                endpoint: "192.168.1.10:50000".to_owned(),
+                source: CandidateSource::LocalInterface,
+                observe_result_id: None,
+                priority: 0,
+                rtt_ms: None,
+                loss_ppm: None,
+                jitter_ms: None,
+                relay_node_id: None,
+            },
+            "authorization": CandidateAuthorization {
+                candidate_token: vec![1; 32],
+                candidate_token_binding_hash: [2; 32],
+                expires_at_epoch_millis: now_epoch_millis() + 30_000,
+            },
+            "transport_certificate_der": certificate,
+            "server_name": server_name,
+        });
+        let response = handle_authenticated_text(
+            &state,
+            &device.account_id,
+            &device.device_id,
+            &device.public_key,
+            "ubuntu-connection",
+            &serde_json::json!({
+                "type": "connection_candidate",
+                "session_id": session_id,
+                "role": "controlled",
+                "payload": payload,
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            ServerMessage::SessionMessageForwarded {
+                session_id: forwarded_session,
+                message_type: "connection_candidate",
+                target_device_id,
+            } if forwarded_session == session_id && target_device_id == "ios-1"
+        ));
+        let forwarded = peer.notifications.recv().await.expect("forwarded message");
+        let forwarded: Value = serde_json::from_str(&forwarded).expect("forwarded json");
+        assert_eq!(forwarded["type"], "connection_candidate");
+        assert_eq!(forwarded["from_device_id"], "ubuntu-1");
+        assert_eq!(
+            forwarded["payload"]["transport_certificate_der"],
+            certificate
+        );
+        assert_eq!(forwarded["payload"]["server_name"], server_name);
+        assert_eq!(forwarded["payload"]["candidate"]["session_id"], session_id);
+    }
+
+    #[tokio::test]
+    async fn session_forward_rejects_payload_device_or_role_substitution() {
+        let (state, _, device) = fixture();
+        let session_id = "00000000-0000-4000-8000-000000000001";
+        state.add_test_session(SessionAuthorization {
+            session_id: session_id.to_owned(),
+            controller_device_id: "ios-1".to_owned(),
+            controlled_device_id: device.device_id.clone(),
+            permissions_digest: "11".repeat(32),
+            relay_token_epoch: 1,
+        });
+        let payload = serde_json::to_value(KeyConfirm {
+            session_id: uuid::Uuid::parse_str(session_id).unwrap().as_u128(),
+            device_id: "substituted-device".to_owned(),
+            role: SessionRole::Controlled,
+            key_exchange_transcript_hash: [3; 32],
+            confirm_mac: [5; 32],
+            timestamp_epoch_millis: now_epoch_millis(),
+        })
+        .expect("key confirm");
+        let response = handle_authenticated_text(
+            &state,
+            &device.account_id,
+            &device.device_id,
+            &device.public_key,
+            "ubuntu-connection",
+            &serde_json::json!({
+                "type": "key_confirm",
+                "session_id": session_id,
+                "role": "controlled",
+                "payload": payload,
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &response,
+                ServerMessage::Error {
+                    code: ErrorCode::InvalidPayload,
+                    ..
+                }
+            ),
+            "unexpected response: {response:?}"
+        );
+    }
+
+    #[test]
+    fn controlled_candidate_requires_a_bounded_session_transport_identity() {
+        let session_id = uuid::Uuid::from_u128(0x00000000000040008000000000000001);
+        let candidate = ConnectionCandidateDto {
+            candidate_id: 1,
+            session_id: session_id.as_u128(),
+            device_id: "ubuntu-1".to_owned(),
+            role: SessionRole::Controlled,
+            kind: TransportPath::LanDirect,
+            endpoint: "192.168.1.10:50000".to_owned(),
+            source: CandidateSource::LocalInterface,
+            observe_result_id: None,
+            priority: 0,
+            rtt_ms: None,
+            loss_ppm: None,
+            jitter_ms: None,
+            relay_node_id: None,
+        };
+        let authorization = CandidateAuthorization {
+            candidate_token: vec![1; 32],
+            candidate_token_binding_hash: [2; 32],
+            expires_at_epoch_millis: now_epoch_millis() + 30_000,
+        };
+        let base = serde_json::json!({
+            "candidate": candidate,
+            "authorization": authorization,
+        });
+        assert!(!validate_forward_payload(
+            "connection_candidate",
+            &base,
+            session_id.as_u128(),
+            "ubuntu-1",
+            SessionRole::Controlled,
+        ));
+
+        let valid = serde_json::json!({
+            "candidate": candidate,
+            "authorization": authorization,
+            "transport_certificate_der": URL_SAFE_NO_PAD.encode([0x30, 0x01, 0x00]),
+            "server_name": format!("rctl-{session_id}.invalid"),
+        });
+        assert!(validate_forward_payload(
+            "connection_candidate",
+            &valid,
+            session_id.as_u128(),
+            "ubuntu-1",
+            SessionRole::Controlled,
+        ));
+
+        for (certificate, server_name) in [
+            ("not-base64!", "rctl-session.invalid"),
+            ("MAEA", "localhost"),
+        ] {
+            let invalid = serde_json::json!({
+                "candidate": candidate,
+                "authorization": authorization,
+                "transport_certificate_der": certificate,
+                "server_name": server_name,
+            });
+            assert!(!validate_forward_payload(
+                "connection_candidate",
+                &invalid,
+                session_id.as_u128(),
+                "ubuntu-1",
+                SessionRole::Controlled,
             ));
         }
     }
@@ -1765,6 +2613,7 @@ mod tests {
             &state,
             &device.account_id,
             &device.device_id,
+            &device.public_key,
             "new-connection",
             r#"{"type":"list_online_devices"}"#,
         )
@@ -1813,6 +2662,7 @@ mod tests {
             &state,
             &device.account_id,
             &device.device_id,
+            &device.public_key,
             connection_id,
             &format!(
                 r#"{{"type":"set_device_status","device_id":"{}","status":"busy","seen_at_epoch_millis":{}}}"#,
@@ -1897,6 +2747,7 @@ mod tests {
             &state,
             &account_id,
             &device_id,
+            &[0; 32],
             "redis-connection",
             &format!(
                 r#"{{"type":"set_device_status","device_id":"{device_id}","status":"busy","seen_at_epoch_millis":{}}}"#,

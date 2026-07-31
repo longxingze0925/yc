@@ -1,0 +1,85 @@
+name: Windows
+
+on:
+  push:
+    paths:
+      - ".github/workflows/windows.yml"
+      - "apps/desktop/**"
+      - "crates/**"
+      - "tools/windows-mobile-mvp.ps1"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  pull_request:
+    paths:
+      - ".github/workflows/windows.yml"
+      - "apps/desktop/**"
+      - "crates/**"
+      - "tools/windows-mobile-mvp.ps1"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  workflow_dispatch:
+    inputs:
+      build_internal_artifact:
+        description: "生成未签名的 Windows 内测 EXE"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-check:
+    name: Native compile and test
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Rust stable
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test Windows desktop
+        shell: pwsh
+        run: cargo test --manifest-path apps/desktop/Cargo.toml --all-targets --locked
+
+  internal-artifact:
+    name: Internal executable
+    if: github.event_name == 'workflow_dispatch' && inputs.build_internal_artifact
+    needs: windows-check
+    runs-on: windows-2022
+    timeout-minutes: 60
+    environment: testflight
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Rust stable
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build internal executable
+        shell: pwsh
+        env:
+          RCTL_OFFICIAL_API_URL: ${{ vars.RCTL_OFFICIAL_API_URL }}
+          RCTL_OFFICIAL_SIGNAL_URL: ${{ vars.RCTL_OFFICIAL_SIGNAL_URL }}
+          RCTL_OFFICIAL_RELAY_URL: ${{ vars.RCTL_OFFICIAL_RELAY_URL }}
+        run: ./tools/windows-mobile-mvp.ps1 -Mode Build -SkipGStreamerCheck
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-desktop-windows-${{ github.run_number }}
+          path: apps/desktop/target/release/remote-desktop.exe
+          if-no-files-found: error
+          retention-days: 7

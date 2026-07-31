@@ -182,6 +182,7 @@ pub struct MessageHeader {
     pub kind: MessageKind,
     pub flags: u16,
     pub channel_id: ChannelId,
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub sequence: u64,
     pub payload_len: u32,

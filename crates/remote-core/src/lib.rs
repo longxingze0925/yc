@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use remote_protocol::{DeviceStatus, Permissions, PlatformKind, VerificationCode};
 
 mod clipboard;
+mod controller;
 mod display;
 mod file_transfer;
 mod input;
@@ -13,6 +14,7 @@ mod reboot;
 mod session_crypto;
 
 pub use clipboard::*;
+pub use controller::*;
 pub use display::*;
 pub use file_transfer::*;
 pub use input::*;

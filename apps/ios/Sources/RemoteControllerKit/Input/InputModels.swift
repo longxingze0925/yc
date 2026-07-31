@@ -24,6 +24,16 @@ public enum MouseButton: String, Codable, Sendable {
     case left
     case right
     case middle
+    case back
+    case forward
+}
+
+public enum InputModifier: String, Codable, Sendable {
+    case ctrl
+    case alt
+    case shift
+    case meta
+    case capsLock = "caps_lock"
 }
 
 public enum RemoteShortcut: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -50,21 +60,21 @@ public struct InputEvent: Codable, Equatable, Sendable {
     public let inputKind: InputKind
     public let keyEventKind: KeyEventKind?
     public let physicalCode: UInt32?
-    public let keyCode: UInt32?
+    public let keyCode: UInt32
     public let scanCode: UInt32?
     public let virtualKey: UInt32?
     public let logicalKey: String?
     public let text: String?
     public let compositionText: String?
     public let compositionState: String?
-    public let modifiers: [String]
+    public let modifiers: [InputModifier]
     public let keyboardLayout: String?
     public let isAutoRepeat: Bool
     public let xNorm: Double?
     public let yNorm: Double?
     public let button: MouseButton?
-    public let wheelDeltaX: Double?
-    public let wheelDeltaY: Double?
+    public let wheelDeltaX: Double
+    public let wheelDeltaY: Double
     public let timestampEpochMillis: Int64
 
     private enum CodingKeys: String, CodingKey {
@@ -98,21 +108,21 @@ public struct InputEvent: Codable, Equatable, Sendable {
         inputKind: InputKind,
         keyEventKind: KeyEventKind? = nil,
         physicalCode: UInt32? = nil,
-        keyCode: UInt32? = nil,
+        keyCode: UInt32 = 0,
         scanCode: UInt32? = nil,
         virtualKey: UInt32? = nil,
         logicalKey: String? = nil,
         text: String? = nil,
         compositionText: String? = nil,
         compositionState: String? = nil,
-        modifiers: [String] = [],
+        modifiers: [InputModifier] = [],
         keyboardLayout: String? = nil,
         isAutoRepeat: Bool = false,
         xNorm: Double? = nil,
         yNorm: Double? = nil,
         button: MouseButton? = nil,
-        wheelDeltaX: Double? = nil,
-        wheelDeltaY: Double? = nil,
+        wheelDeltaX: Double = 0,
+        wheelDeltaY: Double = 0,
         eventID: UUID = UUID(),
         timestampEpochMillis: Int64 = Date.now.epochMillis
     ) {
@@ -138,6 +148,74 @@ public struct InputEvent: Codable, Equatable, Sendable {
         self.wheelDeltaX = wheelDeltaX
         self.wheelDeltaY = wheelDeltaY
         self.timestampEpochMillis = timestampEpochMillis
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let sessionIDValue = try values.decode(String.self, forKey: .sessionID)
+        let eventIDValue = try values.decode(String.self, forKey: .eventID)
+        guard let sessionID = UUID(uuidString: sessionIDValue) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .sessionID,
+                in: values,
+                debugDescription: "session_id must be a UUID string"
+            )
+        }
+        guard let eventID = UUID(uuidString: eventIDValue) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .eventID,
+                in: values,
+                debugDescription: "event_id must be a UUID string"
+            )
+        }
+        self.sessionID = sessionID
+        self.eventID = eventID
+        displayID = try values.decode(String.self, forKey: .displayID)
+        inputKind = try values.decode(InputKind.self, forKey: .inputKind)
+        keyEventKind = try values.decodeIfPresent(KeyEventKind.self, forKey: .keyEventKind)
+        physicalCode = try values.decodeIfPresent(UInt32.self, forKey: .physicalCode)
+        keyCode = try values.decodeIfPresent(UInt32.self, forKey: .keyCode) ?? 0
+        scanCode = try values.decodeIfPresent(UInt32.self, forKey: .scanCode)
+        virtualKey = try values.decodeIfPresent(UInt32.self, forKey: .virtualKey)
+        logicalKey = try values.decodeIfPresent(String.self, forKey: .logicalKey)
+        text = try values.decodeIfPresent(String.self, forKey: .text)
+        compositionText = try values.decodeIfPresent(String.self, forKey: .compositionText)
+        compositionState = try values.decodeIfPresent(String.self, forKey: .compositionState)
+        modifiers = try values.decodeIfPresent([InputModifier].self, forKey: .modifiers) ?? []
+        keyboardLayout = try values.decodeIfPresent(String.self, forKey: .keyboardLayout)
+        isAutoRepeat = try values.decodeIfPresent(Bool.self, forKey: .isAutoRepeat) ?? false
+        xNorm = try values.decodeIfPresent(Double.self, forKey: .xNorm)
+        yNorm = try values.decodeIfPresent(Double.self, forKey: .yNorm)
+        button = try values.decodeIfPresent(MouseButton.self, forKey: .button)
+        wheelDeltaX = try values.decodeIfPresent(Double.self, forKey: .wheelDeltaX) ?? 0
+        wheelDeltaY = try values.decodeIfPresent(Double.self, forKey: .wheelDeltaY) ?? 0
+        timestampEpochMillis = try values.decode(Int64.self, forKey: .timestampEpochMillis)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(sessionID.uuidString.lowercased(), forKey: .sessionID)
+        try values.encode(eventID.uuidString.lowercased(), forKey: .eventID)
+        try values.encode(displayID, forKey: .displayID)
+        try values.encode(inputKind, forKey: .inputKind)
+        try values.encodeIfPresent(keyEventKind, forKey: .keyEventKind)
+        try values.encodeIfPresent(physicalCode, forKey: .physicalCode)
+        try values.encode(keyCode, forKey: .keyCode)
+        try values.encodeIfPresent(scanCode, forKey: .scanCode)
+        try values.encodeIfPresent(virtualKey, forKey: .virtualKey)
+        try values.encodeIfPresent(logicalKey, forKey: .logicalKey)
+        try values.encodeIfPresent(text, forKey: .text)
+        try values.encodeIfPresent(compositionText, forKey: .compositionText)
+        try values.encodeIfPresent(compositionState, forKey: .compositionState)
+        try values.encode(modifiers, forKey: .modifiers)
+        try values.encodeIfPresent(keyboardLayout, forKey: .keyboardLayout)
+        try values.encode(isAutoRepeat, forKey: .isAutoRepeat)
+        try values.encodeIfPresent(xNorm, forKey: .xNorm)
+        try values.encodeIfPresent(yNorm, forKey: .yNorm)
+        try values.encodeIfPresent(button, forKey: .button)
+        try values.encode(wheelDeltaX, forKey: .wheelDeltaX)
+        try values.encode(wheelDeltaY, forKey: .wheelDeltaY)
+        try values.encode(timestampEpochMillis, forKey: .timestampEpochMillis)
     }
 
     public static func pointer(

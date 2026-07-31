@@ -3,12 +3,16 @@ use std::fmt;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "linux")]
 pub use linux::{
     LinuxDesktopSession, PortalCapability, PortalSessionState, UbuntuWaylandPortalCapturer,
     UbuntuX11Capturer, WaylandPortalStatus, X11Capturer,
 };
+#[cfg(target_os = "windows")]
+pub use windows::WindowsCapturer;
 
 pub const MAX_CAPTURE_WIDTH: u32 = 16_384;
 pub const MAX_CAPTURE_HEIGHT: u32 = 16_384;
@@ -609,10 +613,7 @@ impl ScreenCapturer for UnsupportedCapturer {
 
 #[cfg(target_os = "windows")]
 pub fn platform_capturer() -> Box<dyn ScreenCapturer> {
-    Box::new(UnsupportedCapturer::new(
-        CaptureBackend::WindowsGraphicsCapture,
-        "WGC and DXGI bindings are not linked in this milestone",
-    ))
+    Box::new(WindowsCapturer::default())
 }
 
 #[cfg(target_os = "linux")]

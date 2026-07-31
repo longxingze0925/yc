@@ -10,7 +10,10 @@ mod scheduler;
 mod tls_fallback;
 
 #[cfg(test)]
-mod test_tls;
+pub mod test_tls;
+
+#[cfg(all(feature = "test-support", not(test)))]
+pub mod test_tls;
 
 pub use binding::*;
 pub use candidates::*;

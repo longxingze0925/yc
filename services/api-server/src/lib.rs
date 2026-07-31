@@ -1430,6 +1430,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_prompt_session_cannot_target_another_accounts_device() {
+        let state = AppState::for_test();
+        let router = build_router(state.clone());
+        let controller_tokens =
+            register_account(router.clone(), "controller-owner@example.com").await;
+        let controlled_tokens =
+            register_account(router.clone(), "controlled-owner@example.com").await;
+        let controller_access = controller_tokens["access_token"].as_str().unwrap();
+        let controller_account = controller_tokens["account_id"].as_str().unwrap();
+        let controlled_access = controlled_tokens["access_token"].as_str().unwrap();
+        let controlled_account = controlled_tokens["account_id"].as_str().unwrap();
+        let controller_key = SigningKey::from_bytes(&[41_u8; 32]);
+        let controlled_key = SigningKey::from_bytes(&[43_u8; 32]);
+        register_device(
+            &state,
+            router.clone(),
+            controller_access,
+            controller_account,
+            "account-controller",
+            &controller_key,
+        )
+        .await;
+        register_device(
+            &state,
+            router.clone(),
+            controlled_access,
+            controlled_account,
+            "other-account-controlled",
+            &controlled_key,
+        )
+        .await;
+
+        let response = signed_request(
+            router,
+            "POST",
+            "/v1/sessions",
+            controller_access,
+            controller_account,
+            "account-controller",
+            &controller_key,
+            "cross-account-prompt",
+            prompt_session_body(
+                "account-controller",
+                "other-account-controlled",
+                "cross-account-prompt",
+            ),
+        )
+        .await;
+
+        assert_eq!(response.0, StatusCode::NOT_FOUND);
+        assert_eq!(response.1["code"], "controlled_device_not_found");
+    }
+
+    #[tokio::test]
     async fn inactive_devices_cannot_create_remote_sessions() {
         let state = AppState::for_test();
         let router = build_router(state.clone());

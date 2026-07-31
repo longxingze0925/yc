@@ -15,7 +15,7 @@ final class InputAndMediaTests: XCTestCase {
             physicalCode: 4,
             keyCode: 4,
             logicalKey: "a",
-            modifiers: ["ctrl"],
+            modifiers: [.ctrl],
             keyboardLayout: "en-US",
             eventID: eventID,
             timestampEpochMillis: 1_234
@@ -23,12 +23,41 @@ final class InputAndMediaTests: XCTestCase {
         let data = try JSONEncoder().encode(event)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
 
-        XCTAssertEqual(object["session_id"] as? String, sessionID.uuidString.uppercased())
-        XCTAssertEqual(object["event_id"] as? String, eventID.uuidString.uppercased())
+        XCTAssertEqual(object["session_id"] as? String, sessionID.uuidString.lowercased())
+        XCTAssertEqual(object["event_id"] as? String, eventID.uuidString.lowercased())
         XCTAssertEqual(object["input_kind"] as? String, "physical_key")
         XCTAssertEqual(object["physical_code"] as? Int, 4)
+        XCTAssertEqual(object["key_code"] as? Int, 4)
+        XCTAssertEqual(object["modifiers"] as? [String], ["ctrl"])
+        XCTAssertEqual(object["wheel_delta_x"] as? Double, 0)
+        XCTAssertEqual(object["wheel_delta_y"] as? Double, 0)
         XCTAssertEqual(object["is_auto_repeat"] as? Bool, false)
         XCTAssertNil(object["physicalCode"])
+    }
+
+    func testSharedRustInputFixtureDecodesAndReencodes() throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("fixtures/protocol/input_event_v1.json")
+        let fixtureData = try Data(contentsOf: fixtureURL)
+        let event = try JSONDecoder().decode(InputEvent.self, from: fixtureData)
+
+        XCTAssertEqual(event.sessionID.uuidString.lowercased(), "00000000-0000-4000-8000-000000000001")
+        XCTAssertEqual(event.eventID.uuidString.lowercased(), "00000000-0000-4000-8000-000000000002")
+        XCTAssertEqual(event.physicalCode, 4)
+        XCTAssertEqual(event.keyCode, 4)
+        XCTAssertEqual(event.modifiers, [.ctrl])
+        XCTAssertEqual(event.wheelDeltaX, 0)
+        XCTAssertEqual(event.wheelDeltaY, 0)
+
+        let expected = try XCTUnwrap(JSONSerialization.jsonObject(with: fixtureData) as? NSDictionary)
+        let encoded = try JSONEncoder().encode(event)
+        let actual = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? NSDictionary)
+        XCTAssertEqual(actual, expected)
     }
 
     func testReleaseAllEventDoesNotContainText() throws {

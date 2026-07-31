@@ -806,6 +806,82 @@ public struct SessionDescriptor: Identifiable, Equatable, Sendable {
     public var id: UUID { sessionID }
 }
 
+public enum SessionDescriptorError: LocalizedError, Equatable {
+    case missingPermissions
+    case invalidPermissionsDigest
+    case missingExpiration
+    case expired
+    case invalidDeviceBinding
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingPermissions:
+            return "会话响应缺少最终权限"
+        case .invalidPermissionsDigest:
+            return "会话权限摘要无效"
+        case .missingExpiration:
+            return "会话响应缺少过期时间"
+        case .expired:
+            return "会话已过期"
+        case .invalidDeviceBinding:
+            return "会话设备绑定无效"
+        }
+    }
+}
+
+public extension SessionCreateResponse {
+    func descriptor(
+        accountID: String,
+        controllerDeviceID: String,
+        nowEpochMillis: Int64 = Date.now.epochMillis
+    ) throws -> SessionDescriptor {
+        guard !accountID.isEmpty,
+              !controllerDeviceID.isEmpty,
+              !controlledDeviceID.isEmpty,
+              controllerDeviceID != controlledDeviceID else {
+            throw SessionDescriptorError.invalidDeviceBinding
+        }
+        guard let permissions else {
+            throw SessionDescriptorError.missingPermissions
+        }
+        guard let digest = permissionsDigest.flatMap(Data.init(hexEncoded:)), digest.count == 32 else {
+            throw SessionDescriptorError.invalidPermissionsDigest
+        }
+        guard let expiresAtEpochMillis = sessionExpiresAtEpochMillis else {
+            throw SessionDescriptorError.missingExpiration
+        }
+        guard expiresAtEpochMillis > nowEpochMillis else {
+            throw SessionDescriptorError.expired
+        }
+        return SessionDescriptor(
+            sessionID: sessionID,
+            accountID: accountID,
+            controllerDeviceID: controllerDeviceID,
+            controlledDeviceID: controlledDeviceID,
+            controlledDeviceName: controlledDeviceName ?? controlledDeviceID,
+            permissions: permissions,
+            permissionsDigest: digest,
+            expiresAtEpochMillis: expiresAtEpochMillis
+        )
+    }
+}
+
+private extension Data {
+    init?(hexEncoded value: String) {
+        guard value.count == 64 else { return nil }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(32)
+        var index = value.startIndex
+        for _ in 0..<32 {
+            let next = value.index(index, offsetBy: 2)
+            guard let byte = UInt8(value[index..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = next
+        }
+        self.init(bytes)
+    }
+}
+
 public enum SessionLifecycleState: Equatable, Sendable {
     case idle
     case waitingForApproval

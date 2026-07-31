@@ -256,3 +256,10 @@ public final class MetalRemoteRenderer: NSObject, MTKViewDelegate, @unchecked Se
         ]
     }
 }
+
+public protocol RemoteFrameRendering: AnyObject, Sendable {
+    func display(_ pixelBuffer: CVPixelBuffer)
+    func clear()
+}
+
+extension MetalRemoteRenderer: RemoteFrameRendering {}

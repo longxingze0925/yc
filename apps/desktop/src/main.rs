@@ -1,33 +1,68 @@
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use remote_desktop::api::{
     now_epoch_millis, ApiClient, Architecture, CreateSessionRequest, DeviceCapabilities,
     DeviceRegistrationMetadata, LoginChallenge, LoginFinishOutcome, LoginRequest, MfaFactor,
     Platform, ReqwestHttpTransport,
 };
 use remote_desktop::app::MfaFlowError;
-use remote_desktop::signal::SignalConnectContext;
+use remote_desktop::signal::{
+    SessionPeerMessage, SessionSignalMessageKind, SessionSnapshot, SignalConnectContext,
+    SignalNotification,
+};
 use remote_desktop::{
-    current_platform, AccountTokenManager, AppModel, DeviceIdentityManager, InputManager,
-    JsonFileServiceConfigStore, LocalDeviceRegistration, LoginError, Page, ProcessSecretStore,
-    ServiceConfig, ServiceConfigStore, SessionResources, SignalClient, SignalConnectionState,
-    SignalWebSocketClient,
+    current_platform, AccountTokenManager, AppModel, ControlledAccessPreferences,
+    ControlledP2pTransport, ControlledSignalAction, ControlledSignalRuntime, DeviceIdentity,
+    DeviceIdentityManager, EphemeralQuicIdentity, InputManager, JsonFileControlledAccessStore,
+    JsonFileServiceConfigStore, LanDirectCandidate, LocalDeviceRegistration, LoginError, Page,
+    ProcessSecretStore, ServiceConfig, ServiceConfigStore, SessionResources, SignalClient,
+    SignalConnectionState, SignalWebSocketClient,
 };
 use remote_render::RenderSurface;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
+use uuid::Uuid;
 
 slint::include_modules!();
+
+enum ControlledTransportEvent {
+    LanCandidatePrepared {
+        session_id: String,
+        candidate: Result<LanDirectCandidate, String>,
+    },
+    ProbeSelected {
+        session_id: String,
+        transport: Result<ControlledP2pTransport, String>,
+    },
+    RuntimeFinished {
+        session_id: String,
+        result: Result<(), String>,
+    },
+}
 
 struct DesktopController {
     model: AppModel,
     config_store: Option<JsonFileServiceConfigStore>,
+    controlled_access_store: Option<JsonFileControlledAccessStore>,
+    controlled_access: ControlledAccessPreferences,
     http: Option<Arc<ReqwestHttpTransport>>,
     tokens: AccountTokenManager,
     identity: DeviceIdentityManager,
     signal: SignalWebSocketClient,
     last_signal_state: SignalConnectionState,
+    controlled_signal: Option<ControlledSignalRuntime>,
+    accepted_controlled_session: Option<SessionSnapshot>,
+    pending_lan_candidate: Option<LanDirectCandidate>,
+    local_candidate_authorization: Option<remote_protocol::CandidateAuthorization>,
+    controlled_p2p: Option<ControlledP2pTransport>,
+    pending_quic_identity: Option<EphemeralQuicIdentity>,
+    controlled_cancellation: Option<remote_transport::TransportCancellation>,
+    transport_runtime: tokio::runtime::Runtime,
+    transport_events: mpsc::Receiver<ControlledTransportEvent>,
+    transport_event_tx: mpsc::Sender<ControlledTransportEvent>,
     session: Option<SessionResources<Box<dyn remote_desktop::input::InputBackend>>>,
     pending_login: Option<LoginChallenge>,
 }
@@ -37,13 +72,19 @@ impl DesktopController {
         let platform = current_platform();
         let mut model = AppModel::new(platform.snapshot());
         let config_store = JsonFileServiceConfigStore::for_current_user().ok();
+        let controlled_access_store = JsonFileControlledAccessStore::for_current_user().ok();
+        let controlled_access = controlled_access_store
+            .as_ref()
+            .and_then(|store| store.load().ok())
+            .unwrap_or_default();
         let persisted = config_store
             .as_ref()
             .and_then(|store| store.load().ok().flatten());
         let configured = ServiceConfig::from_environment()
             .ok()
             .flatten()
-            .or(persisted);
+            .or(persisted)
+            .or_else(|| ServiceConfig::official().ok());
         if let Some(config) = configured {
             let label = config.environment_label();
             model.set_service_config(config, format!("已加载{label}配置"));
@@ -53,14 +94,33 @@ impl DesktopController {
             model.set_server_status("HTTP 客户端初始化失败");
         }
         let secret_store = Arc::new(ProcessSecretStore::default());
+        let transport_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .enable_time()
+            .worker_threads(2)
+            .build()
+            .expect("desktop transport runtime initialization failed");
+        let (transport_event_tx, transport_events) = mpsc::channel();
         Self {
             model,
             config_store,
+            controlled_access_store,
+            controlled_access,
             http,
             tokens: AccountTokenManager::new(secret_store.clone()),
             identity: DeviceIdentityManager::new(secret_store),
             signal: SignalWebSocketClient::default(),
             last_signal_state: SignalConnectionState::Disconnected,
+            controlled_signal: None,
+            accepted_controlled_session: None,
+            pending_lan_candidate: None,
+            local_candidate_authorization: None,
+            controlled_p2p: None,
+            pending_quic_identity: None,
+            controlled_cancellation: None,
+            transport_runtime,
+            transport_events,
+            transport_event_tx,
             session: None,
             pending_login: None,
         }
@@ -99,14 +159,9 @@ impl DesktopController {
         let identity = self.identity.shared_current().expect("identity loaded");
         let request = LoginRequest::new(account.trim(), password, identity.as_ref());
         match client.login(&request) {
-            Ok(challenge) if challenge.required_factors.is_empty() => self.finish_login_challenge(
-                account.trim(),
-                &config,
-                &client,
-                challenge,
-                None,
-                None,
-            ),
+            Ok(challenge) if challenge.required_factors.is_empty() => {
+                self.finish_login_challenge(account.trim(), &config, &client, challenge, None, None)
+            }
             Ok(challenge) => {
                 self.model.begin_mfa(
                     account.trim(),
@@ -163,7 +218,12 @@ impl DesktopController {
             self.model.set_login_status("MFA 挑战不匹配，请重新登录");
             return;
         }
-        match client.finish_login(&challenge, self.identity.current().expect("identity loaded"), Some(attempt.factor), Some(code.trim())) {
+        match client.finish_login(
+            &challenge,
+            self.identity.current().expect("identity loaded"),
+            Some(attempt.factor),
+            Some(code.trim()),
+        ) {
             Ok(outcome) => {
                 self.model.complete_mfa();
                 self.pending_login = None;
@@ -201,7 +261,9 @@ impl DesktopController {
         };
         match client.finish_login(&challenge, identity, factor, code) {
             Ok(outcome) => self.finish_authenticated_login(account, config, client, outcome),
-            Err(error) => self.model.set_login_status(format!("登录完成验证失败：{error}")),
+            Err(error) => self
+                .model
+                .set_login_status(format!("登录完成验证失败：{error}")),
         }
     }
 
@@ -242,14 +304,19 @@ impl DesktopController {
         };
         let identity = self.identity.shared_current().expect("identity loaded");
         let metadata = registration_metadata(&self.model);
-        let registration_result = match (&outcome.device_enrollment_grant, outcome.device_state.as_str()) {
-            (Some(grant), "pending_enrollment") => client.register_device(
-                &access_token,
-                &account_id,
-                identity.as_ref(),
-                metadata,
-                grant,
-            ).map(Some),
+        let registration_result = match (
+            &outcome.device_enrollment_grant,
+            outcome.device_state.as_str(),
+        ) {
+            (Some(grant), "pending_enrollment") => client
+                .register_device(
+                    &access_token,
+                    &account_id,
+                    identity.as_ref(),
+                    metadata,
+                    grant,
+                )
+                .map(Some),
             (None, "registered") => Ok(None),
             _ => {
                 self.fail_authenticated_login("登录完成响应的设备注册状态无效");
@@ -277,10 +344,10 @@ impl DesktopController {
             self.fail_authenticated_login("账号设备列表中找不到当前设备");
             return;
         };
-        if let Err(error) = self
-            .identity
-            .update_registration(local_view.public_key_id.clone(), local_view.public_key_version)
-        {
+        if let Err(error) = self.identity.update_registration(
+            local_view.public_key_id.clone(),
+            local_view.public_key_version,
+        ) {
             self.fail_authenticated_login(format!(
                 "设备注册成功，但公钥版本无法安全持久化：{error}"
             ));
@@ -480,6 +547,7 @@ impl DesktopController {
     }
 
     fn disconnect(&mut self) {
+        self.clear_controlled_transport();
         self.disconnect_resources();
         self.model
             .set_session_status("本地会话资源已释放，输入状态已 release-all");
@@ -487,10 +555,538 @@ impl DesktopController {
     }
 
     fn refresh_signal_state(&mut self) {
+        self.refresh_controlled_transport_events();
         let state = self.signal.state();
         if state != self.last_signal_state {
             self.last_signal_state = state;
             self.model.set_signal_status(state.label());
+        }
+        loop {
+            match self.signal.try_recv_notification() {
+                Ok(Some(notification)) => self.handle_signal_notification(notification),
+                Ok(None) => break,
+                Err(_) if state != SignalConnectionState::Online => break,
+                Err(error) => {
+                    self.model
+                        .set_signal_status(format!("Signal 通知读取失败：{error}"));
+                    break;
+                }
+            }
+        }
+    }
+
+    fn handle_signal_notification(&mut self, notification: SignalNotification) {
+        match notification {
+            SignalNotification::SessionInvite(invite) => {
+                self.respond_to_account_invite(invite.session)
+            }
+            SignalNotification::SessionAcceptAck(state) => {
+                let Some(local) = self.model.local_device() else {
+                    return;
+                };
+                if state.status != "accepted"
+                    || state.session.controlled_device_id != local.device_id
+                {
+                    return;
+                }
+                match ControlledSignalRuntime::from_accepted(&state.session) {
+                    Ok(runtime) => {
+                        let session_id = runtime.session_id().to_owned();
+                        self.controlled_signal = Some(runtime);
+                        self.accepted_controlled_session = Some(state.session.clone());
+                        self.begin_lan_candidate_gathering(session_id);
+                        self.model
+                            .set_session_status("会话已接受；正在采集经签名的 LAN 候选");
+                    }
+                    Err(error) => self
+                        .model
+                        .set_session_status(format!("已接受会话的安全上下文无效：{error}")),
+                }
+            }
+            SignalNotification::OnlineDevices(devices) => {
+                let Some(runtime) = self.controlled_signal.as_mut() else {
+                    return;
+                };
+                for device in devices {
+                    if device.device_id != runtime.controller_device_id() {
+                        continue;
+                    }
+                    let Ok(public_key) = URL_SAFE_NO_PAD.decode(device.public_key) else {
+                        self.model
+                            .set_session_status("主控设备公钥编码无效，已停止等待密钥交换");
+                        return;
+                    };
+                    let Ok(public_key) = <[u8; 32]>::try_from(public_key.as_slice()) else {
+                        self.model
+                            .set_session_status("主控设备公钥长度无效，已停止等待密钥交换");
+                        return;
+                    };
+                    if let Err(error) =
+                        runtime.set_controller_public_key(&device.device_id, public_key)
+                    {
+                        self.model
+                            .set_session_status(format!("主控设备身份绑定无效：{error}"));
+                    }
+                    return;
+                }
+            }
+            SignalNotification::CandidateTokenIssued(issued) => {
+                self.handle_candidate_token_issued(issued);
+            }
+            SignalNotification::SessionMessage(message) => {
+                let peer_candidate = (message.kind
+                    == SessionSignalMessageKind::ConnectionCandidate)
+                    .then(|| decode_peer_candidate(&message))
+                    .transpose();
+                let Some(runtime) = self.controlled_signal.as_mut() else {
+                    return;
+                };
+                let actions = match runtime.handle_peer_message(&message, now_epoch_millis()) {
+                    Ok(actions) => actions,
+                    Err(error) => {
+                        self.model
+                            .set_session_status(format!("被控 Signal 会话消息已拒绝：{error}"));
+                        return;
+                    }
+                };
+                match peer_candidate {
+                    Ok(Some((candidate, authorization))) => {
+                        self.begin_authorized_probe(candidate, authorization)
+                    }
+                    Err(()) => {
+                        self.model
+                            .set_session_status("主控候选载荷无效，未启动 UDP 探测");
+                        return;
+                    }
+                    Ok(None) => {}
+                }
+                for action in actions {
+                    match action {
+                        ControlledSignalAction::Send {
+                            kind,
+                            session_id,
+                            role,
+                            payload,
+                        } => {
+                            if let Err(error) =
+                                self.signal
+                                    .send_session_message(kind, &session_id, role, payload)
+                            {
+                                self.model
+                                    .set_session_status(format!("安全握手消息发送失败：{error}"));
+                                return;
+                            }
+                        }
+                        ControlledSignalAction::Ready => self.handle_secure_session_ready(),
+                    }
+                }
+            }
+            SignalNotification::SessionRejectAck(state)
+            | SignalNotification::SessionCancelAck(state)
+            | SignalNotification::SessionCloseAck(state) => {
+                if self
+                    .controlled_signal
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.session_id() == state.session_id)
+                {
+                    if let Some(runtime) = self.controlled_signal.as_mut() {
+                        runtime.close();
+                    }
+                    self.clear_controlled_transport();
+                    self.model
+                        .set_session_status("会话已关闭；未启动媒体或输入通道");
+                }
+            }
+            SignalNotification::ConnectionState(_) => {}
+        }
+    }
+
+    fn begin_lan_candidate_gathering(&mut self, session_id: String) {
+        let Some(local) = self.model.local_device() else {
+            return;
+        };
+        let Some(identity) = self.identity.shared_current() else {
+            self.model
+                .set_session_status("设备身份未加载，未创建 LAN 候选");
+            return;
+        };
+        let Ok(session_id_u128) = Uuid::parse_str(&session_id).map(|value| value.as_u128()) else {
+            self.model
+                .set_session_status("会话 ID 无效，未创建 LAN 候选");
+            return;
+        };
+        let device_id = local.device_id.clone();
+        let sender = self.transport_event_tx.clone();
+        self.transport_runtime.spawn(async move {
+            let candidate = LanDirectCandidate::gather(
+                session_id_u128,
+                &device_id,
+                identity.as_ref(),
+                now_epoch_millis(),
+            )
+            .await
+            .map_err(|error| error.to_string());
+            let _ = sender.send(ControlledTransportEvent::LanCandidatePrepared {
+                session_id,
+                candidate,
+            });
+        });
+    }
+
+    fn refresh_controlled_transport_events(&mut self) {
+        loop {
+            let event = match self.transport_events.try_recv() {
+                Ok(event) => event,
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            };
+            match event {
+                ControlledTransportEvent::LanCandidatePrepared {
+                    session_id,
+                    candidate,
+                } => {
+                    if self
+                        .controlled_signal
+                        .as_ref()
+                        .is_none_or(|runtime| runtime.session_id() != session_id)
+                    {
+                        continue;
+                    }
+                    match candidate {
+                        Ok(candidate) => {
+                            if let Err(error) = self
+                                .signal
+                                .request_candidate_token(&candidate.token_request)
+                            {
+                                self.model.set_session_status(format!(
+                                    "LAN 候选 token 请求发送失败：{error}"
+                                ));
+                                continue;
+                            }
+                            self.pending_lan_candidate = Some(candidate);
+                            self.model.set_session_status(
+                                "已绑定私网 UDP socket，等待 Signal 签发 LAN candidate token",
+                            );
+                        }
+                        Err(error) => self.model.set_session_status(format!(
+                            "LAN Direct 不可用：{error}；未创建候选或启动探测"
+                        )),
+                    }
+                }
+                ControlledTransportEvent::ProbeSelected {
+                    session_id,
+                    transport,
+                } => {
+                    if self
+                        .controlled_signal
+                        .as_ref()
+                        .is_none_or(|runtime| runtime.session_id() != session_id)
+                    {
+                        continue;
+                    }
+                    match transport {
+                        Ok(transport) => self.begin_controlled_key_exchange(transport),
+                        Err(error) => self.model.set_session_status(format!(
+                            "经授权的 LAN UDP 探测失败：{error}；未进入密钥交换"
+                        )),
+                    }
+                }
+                ControlledTransportEvent::RuntimeFinished { session_id, result } => {
+                    if self
+                        .controlled_signal
+                        .as_ref()
+                        .is_none_or(|runtime| runtime.session_id() != session_id)
+                    {
+                        continue;
+                    }
+                    self.controlled_cancellation.take();
+                    self.model.set_session_status(match result {
+                        Ok(()) => "远程会话已结束，采集和输入资源已释放".to_owned(),
+                        Err(error) => format!("远程会话已停止：{error}"),
+                    });
+                }
+            }
+        }
+    }
+
+    fn handle_candidate_token_issued(&mut self, issued: remote_protocol::CandidateTokenIssued) {
+        let Some(runtime) = self.controlled_signal.as_ref() else {
+            return;
+        };
+        let Some(candidate) = self.pending_lan_candidate.as_ref() else {
+            return;
+        };
+        if Uuid::parse_str(runtime.session_id())
+            .ok()
+            .is_none_or(|session_id| session_id.as_u128() != issued.session_id)
+            || issued.device_id != candidate.candidate.device_id
+            || issued.role != remote_protocol::SessionRole::Controlled
+            || issued.candidate_id != candidate.candidate.candidate_id
+        {
+            return;
+        }
+        let authorization = remote_protocol::CandidateAuthorization {
+            candidate_token: issued.candidate_token,
+            candidate_token_binding_hash: issued.candidate_token_binding_hash,
+            expires_at_epoch_millis: issued.expires_at_epoch_millis,
+        };
+        let payload = serde_json::json!({
+            "candidate": candidate.candidate,
+            "authorization": authorization,
+            "transport_certificate_der": URL_SAFE_NO_PAD.encode(
+                candidate.quic_identity.certificate_der()
+            ),
+            "server_name": candidate.quic_identity.server_name(),
+        });
+        if let Err(error) = self.signal.send_session_message(
+            SessionSignalMessageKind::ConnectionCandidate,
+            runtime.session_id(),
+            remote_protocol::SessionRole::Controlled,
+            payload,
+        ) {
+            self.model
+                .set_session_status(format!("LAN 候选发送失败：{error}"));
+            return;
+        }
+        self.local_candidate_authorization = Some(authorization);
+        self.model
+            .set_session_status("LAN 候选与单会话 QUIC 证书已发送；等待主控授权探测");
+    }
+
+    fn begin_authorized_probe(
+        &mut self,
+        remote_candidate: remote_protocol::ConnectionCandidateDto,
+        remote_authorization: remote_protocol::CandidateAuthorization,
+    ) {
+        let (Some(local), Some(local_authorization), Some(runtime)) = (
+            self.pending_lan_candidate.take(),
+            self.local_candidate_authorization.take(),
+            self.controlled_signal.as_ref(),
+        ) else {
+            self.model
+                .set_session_status("主控候选已验证，但本地候选授权尚未完成；未启动 UDP 探测");
+            return;
+        };
+        let session_id = runtime.session_id().to_owned();
+        let permissions_digest =
+            match accepted_permissions_digest(self.accepted_controlled_session.as_ref()) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    self.model.set_session_status(error);
+                    return;
+                }
+            };
+        self.pending_quic_identity = Some(local.quic_identity.clone());
+        let sender = self.transport_event_tx.clone();
+        self.transport_runtime.spawn(async move {
+            let transport = match ControlledP2pTransport::new(
+                local.socket,
+                local.candidate,
+                local_authorization,
+                remote_candidate,
+                remote_authorization,
+                local.local_networks,
+                permissions_digest,
+                now_epoch_millis(),
+            ) {
+                Ok(mut transport) => match transport.accept_probe(now_epoch_millis()).await {
+                    Ok(_) => Ok(transport),
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = sender.send(ControlledTransportEvent::ProbeSelected {
+                session_id,
+                transport,
+            });
+        });
+        self.model
+            .set_session_status("已收到并校验主控候选；正在后台等待授权 UDP probe");
+    }
+
+    fn begin_controlled_key_exchange(&mut self, transport: ControlledP2pTransport) {
+        let (Some(runtime), Some(session), Some(account_id), Some(identity)) = (
+            self.controlled_signal.as_mut(),
+            self.accepted_controlled_session.as_ref(),
+            self.model.account_id(),
+            self.identity.shared_current(),
+        ) else {
+            self.model
+                .set_session_status("会话上下文缺失，未进入密钥交换");
+            return;
+        };
+        let Some(path) = transport.selected_path() else {
+            self.model
+                .set_session_status("未选中实际候选路径，未进入密钥交换");
+            return;
+        };
+        let config = match session_handshake_config(session, account_id, path, identity.as_ref()) {
+            Ok(config) => config,
+            Err(error) => {
+                self.model.set_session_status(error);
+                return;
+            }
+        };
+        match runtime.begin_key_exchange(config, path, identity.as_ref()) {
+            Ok(ControlledSignalAction::Send {
+                kind,
+                session_id,
+                role,
+                payload,
+            }) => {
+                if let Err(error) =
+                    self.signal
+                        .send_session_message(kind, &session_id, role, payload)
+                {
+                    self.model
+                        .set_session_status(format!("密钥交换消息发送失败：{error}"));
+                    return;
+                }
+                self.controlled_p2p = Some(transport);
+                self.model
+                    .set_session_status("LAN 路径已验证，已发送签名密钥交换消息");
+            }
+            Ok(ControlledSignalAction::Ready) | Err(_) => {
+                self.model
+                    .set_session_status("密钥交换状态无效，未启动 QUIC");
+            }
+        }
+    }
+
+    fn handle_secure_session_ready(&mut self) {
+        let (Some(identity), Some(mut transport), Some(runtime)) = (
+            self.pending_quic_identity.take(),
+            self.controlled_p2p.take(),
+            self.controlled_signal.as_mut(),
+        ) else {
+            self.model
+                .set_session_status("密钥确认后 QUIC 会话材料不完整");
+            return;
+        };
+        let Some(secure_session) = runtime.take_secure_session() else {
+            self.model
+                .set_session_status("端到端会话尚未就绪，未启动 QUIC 数据通道");
+            return;
+        };
+        let session_id = runtime.session_id().to_owned();
+        let cancellation = remote_transport::TransportCancellation::default();
+        self.controlled_cancellation = Some(cancellation.clone());
+        let sender = self.transport_event_tx.clone();
+        let capturer = remote_capture::platform_capturer();
+        let input = InputManager::new(current_platform().input_backend());
+        self.transport_runtime.spawn(async move {
+            let result = transport
+                .accept_and_run(
+                    secure_session,
+                    identity.tls_config(),
+                    remote_transport::DataChannelLimits::default(),
+                    &cancellation,
+                    capturer,
+                    input,
+                    "primary".to_owned(),
+                    30,
+                )
+                .await
+                .map_err(|error| error.to_string());
+            let _ = sender.send(ControlledTransportEvent::RuntimeFinished { session_id, result });
+        });
+        self.model
+            .set_session_status("端到端密钥已确认；正在等待 QUIC 连接并启动 H.264/输入通道");
+    }
+
+    fn clear_controlled_transport(&mut self) {
+        if let Some(cancellation) = self.controlled_cancellation.take() {
+            cancellation.cancel();
+        }
+        if let Some(mut transport) = self.controlled_p2p.take() {
+            transport.close();
+        }
+        self.pending_lan_candidate.take();
+        self.local_candidate_authorization.take();
+        self.pending_quic_identity.take();
+        self.accepted_controlled_session.take();
+        if let Some(runtime) = self.controlled_signal.as_mut() {
+            runtime.close();
+        }
+    }
+
+    fn set_allow_account_remote(&mut self, enabled: bool) {
+        let previous = self.controlled_access;
+        let next = ControlledAccessPreferences {
+            allow_account_devices: enabled,
+        };
+        let Some(store) = &self.controlled_access_store else {
+            self.model.set_session_status("被控访问设置无法持久化");
+            return;
+        };
+        match store.save(next) {
+            Ok(()) => {
+                self.controlled_access = next;
+                self.model.set_session_status(if enabled {
+                    "已允许我的账号设备远程访问"
+                } else {
+                    "已关闭我的账号设备远程访问"
+                });
+            }
+            Err(error) => {
+                self.controlled_access = previous;
+                self.model
+                    .set_session_status(format!("被控访问设置保存失败：{error}"));
+            }
+        }
+    }
+
+    fn respond_to_account_invite(&mut self, session: remote_desktop::signal::SessionSnapshot) {
+        let Some(local) = self.model.local_device() else {
+            return;
+        };
+        if session.controlled_device_id != local.device_id || session.status != "waiting_approval" {
+            return;
+        }
+        let Some(account_id) = self.model.account_id().map(ToOwned::to_owned) else {
+            return;
+        };
+        let Some(config) = self.model.service_config().cloned() else {
+            return;
+        };
+        let Some(access_token) = self
+            .tokens
+            .current()
+            .and_then(|tokens| tokens.access_token(now_epoch_millis()))
+            .map(ToOwned::to_owned)
+        else {
+            self.model
+                .set_session_status("会话邀请未处理：账号 token 已过期");
+            return;
+        };
+        let Some(identity) = self.identity.shared_current() else {
+            return;
+        };
+        let client = match self.api_client(&config) {
+            Ok(client) => client,
+            Err(error) => {
+                self.model.set_session_status(error);
+                return;
+            }
+        };
+        let accept = self.controlled_access.allow_account_devices;
+        match client.respond_to_session(
+            &access_token,
+            &account_id,
+            identity.as_ref(),
+            &session.session_id,
+            accept,
+            (!accept).then_some("account_remote_access_disabled"),
+        ) {
+            Ok(response) => self
+                .model
+                .set_session_status(if response.status == "accepted" {
+                    "已接受我的账号设备连接，正在建立安全通道"
+                } else {
+                    "已拒绝连接：本机未允许账号设备远程访问"
+                }),
+            Err(error) => self
+                .model
+                .set_session_status(format!("会话邀请响应失败：{error}")),
         }
     }
 }
@@ -498,8 +1094,112 @@ impl DesktopController {
 impl Drop for DesktopController {
     fn drop(&mut self) {
         self.signal.disconnect();
+        self.clear_controlled_transport();
         self.disconnect_resources();
     }
+}
+
+fn decode_peer_candidate(
+    message: &SessionPeerMessage,
+) -> Result<
+    (
+        remote_protocol::ConnectionCandidateDto,
+        remote_protocol::CandidateAuthorization,
+    ),
+    (),
+> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CandidatePayload {
+        candidate: remote_protocol::ConnectionCandidateDto,
+        authorization: remote_protocol::CandidateAuthorization,
+    }
+    let payload: CandidatePayload =
+        serde_json::from_value(message.payload.clone()).map_err(|_| ())?;
+    Ok((payload.candidate, payload.authorization))
+}
+
+fn accepted_permissions_digest(session: Option<&SessionSnapshot>) -> Result<[u8; 32], String> {
+    let session = session.ok_or_else(|| "会话权限上下文缺失".to_owned())?;
+    let permissions: remote_protocol::SessionPermissions = serde_json::from_value(
+        session
+            .payload
+            .get("permissions")
+            .cloned()
+            .ok_or_else(|| "会话未提供有效权限".to_owned())?,
+    )
+    .map_err(|_| "会话权限载荷无效".to_owned())?;
+    let expected = remote_crypto::permissions_digest(permissions)
+        .map_err(|_| "会话权限摘要计算失败".to_owned())?;
+    let supplied = session
+        .payload
+        .get("permissions_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "会话未提供权限摘要".to_owned())?;
+    if decode_hex_digest(supplied)? != expected {
+        return Err("会话权限摘要不匹配，已拒绝候选路径".to_owned());
+    }
+    Ok(expected)
+}
+
+fn session_handshake_config(
+    session: &SessionSnapshot,
+    account_id: &str,
+    path: &remote_transport::ValidatedCandidatePath,
+    identity: &DeviceIdentity,
+) -> Result<remote_runtime::SessionHandshakeConfig, String> {
+    let permissions: remote_protocol::SessionPermissions = serde_json::from_value(
+        session
+            .payload
+            .get("permissions")
+            .cloned()
+            .ok_or_else(|| "会话未提供有效权限".to_owned())?,
+    )
+    .map_err(|_| "会话权限载荷无效".to_owned())?;
+    let permissions_digest = accepted_permissions_digest(Some(session))?;
+    let session_id = Uuid::parse_str(&session.session_id)
+        .map_err(|_| "会话 ID 无效".to_owned())?
+        .as_u128();
+    let expires = session
+        .payload
+        .get("session_expires_at_epoch_millis")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "会话过期时间缺失".to_owned())?;
+    let mut key_exchange_nonce = [0_u8; 32];
+    rand::Rng::fill(&mut rand::rng(), &mut key_exchange_nonce);
+    Ok(remote_runtime::SessionHandshakeConfig {
+        context: remote_protocol::SessionKdfContext {
+            account_id: account_id.to_owned(),
+            session_id,
+            controller_device_id: session.controller_device_id.clone(),
+            controlled_device_id: session.controlled_device_id.clone(),
+            permissions_digest,
+            protocol_version: remote_protocol::PROTOCOL_VERSION,
+            session_expires_at_epoch_millis: expires,
+            selected_transport_path: path.binding.transport_path,
+            selected_candidate_pair_id: path.binding.candidate_pair_id,
+            relay_node_id: path.binding.relay_node_id.clone(),
+            key_exchange_transcript_hash: [0; 32],
+        },
+        permissions,
+        local_role: remote_protocol::SessionRole::Controlled,
+        local_device_id: session.controlled_device_id.clone(),
+        local_device_public_key: identity.public_key(),
+        key_exchange_nonce,
+        timestamp_epoch_millis: now_epoch_millis(),
+    })
+}
+
+fn decode_hex_digest(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("权限摘要长度无效".to_owned());
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(pair).map_err(|_| "权限摘要编码无效".to_owned())?;
+        bytes[index] = u8::from_str_radix(text, 16).map_err(|_| "权限摘要编码无效".to_owned())?;
+    }
+    Ok(bytes)
 }
 
 fn registration_metadata(model: &AppModel) -> DeviceRegistrationMetadata {
@@ -615,11 +1315,58 @@ fn sync_ui(ui: &AppWindow, controller: &DesktopController) {
     let online = device_rows.iter().filter(|device| device.online).count();
     ui.set_device_summary(format!("{} 台账号设备 · {online} 台在线", model.devices().len()).into());
     ui.set_devices(ModelRc::new(VecModel::from(device_rows)));
+    ui.set_allow_account_remote(controller.controlled_access.allow_account_devices);
 }
 
 fn refresh(weak: &slint::Weak<AppWindow>, controller: &Rc<RefCell<DesktopController>>) {
     if let Some(ui) = weak.upgrade() {
         sync_ui(&ui, &controller.borrow());
+    }
+}
+
+#[cfg(test)]
+mod controlled_signal_tests {
+    use super::*;
+
+    #[test]
+    fn fake_signal_candidate_is_decoded_only_when_the_exact_pair_is_present() {
+        let message = SessionPeerMessage {
+            kind: SessionSignalMessageKind::ConnectionCandidate,
+            session_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            role: remote_protocol::SessionRole::Controller,
+            from_device_id: "ios-1".to_owned(),
+            payload: serde_json::json!({
+                "candidate": {
+                    "candidate_id": "00000000000000000000000000000001",
+                    "session_id": "00000000-0000-4000-8000-000000000001",
+                    "device_id": "ios-1",
+                    "role": "controller",
+                    "kind": "lan_direct",
+                    "endpoint": "192.168.1.12:50000",
+                    "source": "local_interface",
+                    "observe_result_id": null,
+                    "priority": 0,
+                    "rtt_ms": null,
+                    "loss_ppm": null,
+                    "jitter_ms": null,
+                    "relay_node_id": null
+                },
+                "authorization": {
+                    "candidate_token": [1, 2, 3],
+                    "candidate_token_binding_hash": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    "expires_at_epoch_millis": 30000
+                }
+            }),
+        };
+        let (candidate, authorization) = decode_peer_candidate(&message).expect("candidate");
+        assert_eq!(candidate.device_id, "ios-1");
+        assert_eq!(authorization.candidate_token, [1, 2, 3]);
+
+        let malformed = SessionPeerMessage {
+            payload: serde_json::json!({ "candidate": {} }),
+            ..message
+        };
+        assert!(decode_peer_candidate(&malformed).is_err());
     }
 }
 
@@ -697,6 +1444,13 @@ fn main() -> Result<(), slint::PlatformError> {
     let state = Rc::clone(&controller);
     ui.on_disconnect(move || {
         state.borrow_mut().disconnect();
+        refresh(&weak, &state);
+    });
+
+    let weak = ui.as_weak();
+    let state = Rc::clone(&controller);
+    ui.on_set_allow_account_remote(move |enabled| {
+        state.borrow_mut().set_allow_account_remote(enabled);
         refresh(&weak, &state);
     });
 

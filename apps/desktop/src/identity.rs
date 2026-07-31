@@ -78,6 +78,11 @@ impl DeviceIdentity {
     pub fn sign_canonical(&self, canonical_bytes: &[u8]) -> [u8; 64] {
         self.key_pair.sign_canonical(canonical_bytes)
     }
+
+    /// Signs a pre-hashed protocol transcript without exposing the device key.
+    pub fn sign_digest(&self, digest: &[u8; 32]) -> [u8; 64] {
+        self.key_pair.sign_digest(digest)
+    }
 }
 
 impl fmt::Debug for DeviceIdentity {

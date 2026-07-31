@@ -1,0 +1,18 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "event_id": "00000000-0000-4000-8000-000000000002",
+  "display_id": "display-1",
+  "input_kind": "physical_key",
+  "key_event_kind": "down",
+  "physical_code": 4,
+  "logical_key": "a",
+  "key_code": 4,
+  "modifiers": [
+    "ctrl"
+  ],
+  "wheel_delta_x": 0.0,
+  "wheel_delta_y": 0.0,
+  "keyboard_layout": "en-US",
+  "is_auto_repeat": false,
+  "timestamp_epoch_millis": 1234
+}

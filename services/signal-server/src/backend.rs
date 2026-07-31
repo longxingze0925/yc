@@ -7,7 +7,7 @@ use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use remote_protocol::DeviceStatus;
 use tokio::sync::{Mutex, RwLock};
 
-use super::OnlineDevice;
+use super::{security::decode_array, OnlineDevice};
 
 const KEY_PREFIX: &str = "rctl:signal:v1";
 pub(super) const PRESENCE_TTL_MILLIS: u64 = 90_000;
@@ -347,6 +347,8 @@ impl RedisBackend {
             .arg(&device.public_key_id)
             .arg("public_key_version")
             .arg(device.public_key_version)
+            .arg("public_key")
+            .arg(&device.public_key)
             .arg("client_capabilities_hash")
             .arg(&device.client_capabilities_hash)
             .arg("status")
@@ -544,6 +546,9 @@ fn online_device_from_hash(
     let public_key_version = take_field(&mut values, "public_key_version")?
         .parse()
         .map_err(|_| BackendError::invalid_data("invalid Redis public_key_version"))?;
+    let public_key = take_field(&mut values, "public_key")?;
+    decode_array::<32>(&public_key)
+        .map_err(|_| BackendError::invalid_data("invalid Redis public_key"))?;
     let client_capabilities_hash = take_field(&mut values, "client_capabilities_hash")?;
     let status = parse_device_status(&take_field(&mut values, "status")?)?;
     let last_seen_epoch_millis = take_field(&mut values, "last_seen_epoch_millis")?
@@ -555,6 +560,7 @@ fn online_device_from_hash(
         device_id,
         public_key_id,
         public_key_version,
+        public_key,
         client_capabilities_hash,
         status,
         last_seen_epoch_millis,

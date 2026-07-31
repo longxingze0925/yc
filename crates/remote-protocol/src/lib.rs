@@ -20,6 +20,51 @@ pub use security::*;
 
 use serde::{Deserialize, Serialize};
 
+pub mod serde_uuid_u128 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&uuid::Uuid::from_u128(*value).hyphenated().to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        uuid::Uuid::parse_str(&value)
+            .map(|value| value.as_u128())
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+pub mod serde_hex_u128 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!("{value:032x}"))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(serde::de::Error::custom(
+                "128-bit identifier must be exactly 32 hexadecimal characters",
+            ));
+        }
+        u128::from_str_radix(&value, 16).map_err(serde::de::Error::custom)
+    }
+}
+
 pub const PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +126,7 @@ pub enum ConnectionStateKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInvite {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub controller_device_id: String,
     pub controlled_device_id: String,
@@ -140,6 +186,7 @@ pub enum SignalServerMessage {
         devices: Vec<DeviceSummary>,
     },
     SessionInviteQueued {
+        #[serde(with = "crate::serde_uuid_u128")]
         session_id: u128,
     },
     Error {
@@ -166,5 +213,22 @@ mod tests {
             serde_json::to_string(&PlatformKind::Ubuntu).expect("json"),
             r#""ubuntu""#
         );
+    }
+
+    #[test]
+    fn external_session_and_128_bit_ids_use_string_wire_forms() {
+        let session = serde_json::to_value(SessionInvite {
+            session_id: 1,
+            controller_device_id: "controller".into(),
+            controlled_device_id: "controlled".into(),
+            requested_permissions: Permissions::default(),
+        })
+        .expect("session invite JSON");
+        assert_eq!(
+            session["session_id"],
+            "00000000-0000-0000-0000-000000000001"
+        );
+        let encoded = serde_json::to_string(&u128::MAX).expect("plain u128 remains supported");
+        assert_eq!(encoded, u128::MAX.to_string());
     }
 }

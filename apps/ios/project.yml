@@ -1,0 +1,42 @@
+name: RemoteController
+options:
+  bundleIdPrefix: com.rctl.remote
+  deploymentTarget:
+    iOS: "16.0"
+  groupSortPosition: top
+packages:
+  RemoteController:
+    path: .
+targets:
+  RemoteControllerApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+    dependencies:
+      - package: RemoteController
+        product: RemoteControllerKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rctl.remote.controller
+        PRODUCT_NAME: 远控
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: 远控
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: 用于连接同一局域网内的电脑
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+      configs:
+        Debug:
+          INFOPLIST_KEY_RCTLOfficialAPIURL: http://127.0.0.1:18080
+          INFOPLIST_KEY_RCTLOfficialSignalURL: ws://127.0.0.1:18081/ws
+        Release:
+          INFOPLIST_KEY_RCTLOfficialAPIURL: $(RCTL_OFFICIAL_API_URL)
+          INFOPLIST_KEY_RCTLOfficialSignalURL: $(RCTL_OFFICIAL_SIGNAL_URL)

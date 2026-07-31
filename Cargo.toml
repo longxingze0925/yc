@@ -1,12 +1,15 @@
 [workspace]
 members = [
     "crates/remote-core",
+    "crates/remote-ios-ffi",
     "crates/remote-protocol",
     "crates/remote-store",
     "crates/remote-transport",
     "crates/remote-crypto",
     "crates/remote-capture",
+    "crates/remote-codec",
     "crates/remote-render",
+    "crates/remote-runtime",
     "services/api-server",
     "services/signal-server",
     "services/relay-server",
@@ -27,6 +30,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

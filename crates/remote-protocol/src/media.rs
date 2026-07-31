@@ -55,6 +55,7 @@ pub struct InputCapability {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaCapabilities {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub role: SessionRole,
     pub codec_capabilities: Vec<CodecCapability>,
@@ -64,6 +65,7 @@ pub struct MediaCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaConfigRequest {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub display_id: String,
     pub preferred_codec: VideoCodec,
@@ -87,6 +89,7 @@ pub enum MediaConfigStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaConfigState {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub display_id: String,
     pub codec: VideoCodec,
@@ -121,6 +124,7 @@ pub enum MediaQualityReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaQualityRequest {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub display_id: String,
     pub quality_profile: QualityProfile,
@@ -130,6 +134,7 @@ pub struct MediaQualityRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaQualityState {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub display_id: String,
     pub rtt_ms: u32,
@@ -147,6 +152,7 @@ pub struct MediaQualityState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyframeRequest {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub display_id: String,
     pub reason: MediaQualityReason,
@@ -156,6 +162,7 @@ pub struct KeyframeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoFrameInfo {
+    #[serde(with = "crate::serde_uuid_u128")]
     pub session_id: u128,
     pub display_id: String,
     pub frame_id: u64,

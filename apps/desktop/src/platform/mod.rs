@@ -4,6 +4,8 @@ use crate::input::InputBackend;
 mod ubuntu;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(any(target_os = "windows", test))]
+mod windows_keymap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformSnapshot {

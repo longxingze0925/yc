@@ -1,0 +1,27 @@
+[package]
+name = "remote-ios-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+remote-core = { path = "../remote-core" }
+remote-protocol = { path = "../remote-protocol" }
+remote-runtime = { path = "../remote-runtime" }
+remote-transport = { path = "../remote-transport" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+remote-crypto = { path = "../remote-crypto" }
+remote-transport = { path = "../remote-transport", features = ["test-support"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

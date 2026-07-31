@@ -203,7 +203,9 @@ impl ApiClient {
     pub fn login(&self, request: &LoginRequest) -> Result<LoginChallenge, ApiClientError> {
         let response = self.send_json(HttpMethod::Post, "/v1/auth/login", request, None)?;
         serde_json::from_value(ensure_success(response)?)
-            .map(|challenge: LoginChallenge| challenge.with_client_nonce(request.client_nonce.clone()))
+            .map(|challenge: LoginChallenge| {
+                challenge.with_client_nonce(request.client_nonce.clone())
+            })
             .map_err(|_| ApiClientError::Serialization)
     }
 
@@ -265,6 +267,38 @@ impl ApiClient {
             HttpMethod::Post,
             "/v1/sessions",
             request,
+            access_token,
+            account_id,
+            identity,
+        )
+    }
+
+    pub fn respond_to_session(
+        &self,
+        access_token: &str,
+        account_id: &str,
+        identity: &DeviceIdentity,
+        session_id: &str,
+        accept: bool,
+        reason: Option<&str>,
+    ) -> Result<SessionViewResponse, ApiClientError> {
+        let action = if accept { "accept" } else { "reject" };
+        let path = format!("/v1/sessions/{session_id}/{action}");
+        let request = SessionActionRequest {
+            actor_type: "device",
+            actor_device_id: identity.device_id(),
+            actor_role: "controlled",
+            idempotency_key: Uuid::new_v4().to_string(),
+            reason: if accept {
+                None
+            } else {
+                Some(reason.unwrap_or("account_remote_access_disabled"))
+            },
+        };
+        self.send_signed_json(
+            HttpMethod::Post,
+            &path,
+            &request,
             access_token,
             account_id,
             identity,
@@ -786,6 +820,27 @@ pub struct CreateSessionResponse {
     pub user_warnings: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct SessionActionRequest<'a> {
+    actor_type: &'static str,
+    actor_device_id: &'a str,
+    actor_role: &'static str,
+    idempotency_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SessionViewResponse {
+    pub session_id: String,
+    pub controller_device_id: String,
+    pub controlled_device_id: String,
+    pub status: String,
+    pub permissions: SessionPermissions,
+    pub permissions_digest: String,
+    pub session_expires_at_epoch_millis: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,7 +936,9 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&login.body).expect("login body");
         assert_eq!(body["device_id"], identity.device_id());
         assert_eq!(body["public_key_version"], 0);
-        assert!(body["client_nonce"].as_str().is_some_and(|value| !value.is_empty()));
+        assert!(body["client_nonce"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
         assert!(body.get("access_token").is_none());
     }
 
@@ -1107,5 +1164,65 @@ mod tests {
         let devices = client.list_devices("access-private").expect("devices");
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].display_name, "Office");
+    }
+
+    #[test]
+    fn controlled_device_accept_and_disabled_reject_are_signed() {
+        let transport = Arc::new(RecordingTransport::default());
+        let session_view = |status: &str| {
+            serde_json::json!({
+                "session_id": "session-1",
+                "controller_device_id": "ios-1",
+                "controlled_device_id": "desktop-test",
+                "status": status,
+                "permissions": {
+                    "remote_desktop": true, "input_control": true, "clipboard": false,
+                    "file_transfer": false, "unattended": false, "privacy_screen": false,
+                    "block_local_input": false, "require_prompt": true, "allow_relay": true
+                },
+                "permissions_digest": "digest",
+                "session_expires_at_epoch_millis": 99
+            })
+        };
+        transport.respond(200, session_view("accepted"));
+        transport.respond(200, session_view("rejected"));
+        let client = ApiClient::new(config(), transport.clone());
+        let store = Arc::new(ProcessSecretStore::default());
+        let mut manager = DeviceIdentityManager::new(store);
+        manager.load_or_create().expect("identity");
+        let identity = manager.current().expect("identity");
+
+        client
+            .respond_to_session(
+                "access-private",
+                "account-1",
+                identity,
+                "session-1",
+                true,
+                None,
+            )
+            .expect("accept");
+        client
+            .respond_to_session(
+                "access-private",
+                "account-1",
+                identity,
+                "session-1",
+                false,
+                Some("account_remote_access_disabled"),
+            )
+            .expect("reject");
+
+        let accept = transport.take_request();
+        assert!(accept.url.ends_with("/v1/sessions/session-1/accept"));
+        assert!(accept.headers.contains_key("x-rctl-device-signature"));
+        let accept_body: serde_json::Value = serde_json::from_slice(&accept.body).expect("body");
+        assert_eq!(accept_body["actor_role"], "controlled");
+        assert!(accept_body.get("reason").is_none());
+
+        let reject = transport.take_request();
+        assert!(reject.url.ends_with("/v1/sessions/session-1/reject"));
+        let reject_body: serde_json::Value = serde_json::from_slice(&reject.body).expect("body");
+        assert_eq!(reject_body["reason"], "account_remote_access_disabled");
     }
 }

@@ -1,0 +1,136 @@
+name: iOS
+
+on:
+  push:
+    paths:
+      - ".github/workflows/ios-testflight.yml"
+      - "apps/ios/**"
+      - "crates/remote-core/**"
+      - "crates/remote-crypto/**"
+      - "crates/remote-ios-ffi/**"
+      - "crates/remote-protocol/**"
+      - "crates/remote-runtime/**"
+      - "crates/remote-transport/**"
+      - "tools/build-ios-core-xcframework.sh"
+      - "tools/ios-testflight.sh"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  pull_request:
+    paths:
+      - ".github/workflows/ios-testflight.yml"
+      - "apps/ios/**"
+      - "crates/remote-core/**"
+      - "crates/remote-crypto/**"
+      - "crates/remote-ios-ffi/**"
+      - "crates/remote-protocol/**"
+      - "crates/remote-runtime/**"
+      - "crates/remote-transport/**"
+      - "tools/build-ios-core-xcframework.sh"
+      - "tools/ios-testflight.sh"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  workflow_dispatch:
+    inputs:
+      upload_to_testflight:
+        description: "签名归档后上传到 TestFlight"
+        required: true
+        type: boolean
+        default: false
+      marketing_version:
+        description: "CFBundleShortVersionString，例如 0.1.0"
+        required: true
+        type: string
+        default: "0.1.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  simulator-build:
+    name: Simulator build
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          xcodebuild -version
+          xcodegen --version
+
+      - name: Build Rust XCFramework
+        run: ./tools/build-ios-core-xcframework.sh
+
+      - name: Generate Xcode project
+        working-directory: apps/ios
+        run: xcodegen generate
+
+      - name: Build iOS Simulator app
+        run: |
+          xcodebuild \
+            -project apps/ios/RemoteController.xcodeproj \
+            -scheme RemoteControllerApp \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+  testflight:
+    name: Signed archive
+    if: github.event_name == 'workflow_dispatch'
+    needs: simulator-build
+    runs-on: macos-15
+    timeout-minutes: 90
+    environment: testflight
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Archive, validate, and optionally upload
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          RCTL_OFFICIAL_API_URL: ${{ vars.RCTL_OFFICIAL_API_URL }}
+          RCTL_OFFICIAL_SIGNAL_URL: ${{ vars.RCTL_OFFICIAL_SIGNAL_URL }}
+          IOS_DISTRIBUTION_CERTIFICATE_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}
+          IOS_DISTRIBUTION_CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY_BASE64: ${{ secrets.ASC_PRIVATE_KEY_BASE64 }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          MARKETING_VERSION: ${{ inputs.marketing_version }}
+          UPLOAD_TO_TESTFLIGHT: ${{ inputs.upload_to_testflight }}
+          IOS_OUTPUT_DIR: ${{ runner.temp }}/ios-output
+        run: ./tools/ios-testflight.sh
+
+      - name: Upload signed build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-${{ github.run_number }}
+          path: ${{ runner.temp }}/ios-output
+          if-no-files-found: warn
+          retention-days: 7

@@ -13,5 +13,8 @@ tokio = { workspace = true }
 x11rb = { version = "0.13", features = ["randr"] }
 zbus = "5"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-capture = "2.0.0"
+
 [lints]
 workspace = true
