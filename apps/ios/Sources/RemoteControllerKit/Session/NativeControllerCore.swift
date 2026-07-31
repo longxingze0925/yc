@@ -167,7 +167,7 @@ private struct NativeVideoFormat: Decodable {
 private let nativeCommandCallback: RemoteControllerCommandCallback = {
     context, commandKind, connectionEpoch, delivery, payload, payloadLength in
     guard let context = NativeControllerSession.context(from: context) else { return }
-    switch commandKind {
+    switch UInt32(bitPattern: commandKind) {
     case REMOTE_CONTROLLER_COMMAND_START.rawValue:
         context.commandContinuation.yield(.start(connectionEpoch: connectionEpoch))
     case REMOTE_CONTROLLER_COMMAND_SIGN_KEY_EXCHANGE.rawValue:
@@ -198,10 +198,10 @@ private let nativeEventCallback: RemoteControllerEventCallback = {
     context, eventKind, stateOrError, payload, payloadLength,
     presentationTimeMillis, isKeyframe, frameID in
     guard let context = NativeControllerSession.context(from: context) else { return }
-    switch eventKind {
+    switch UInt32(bitPattern: eventKind) {
     case REMOTE_CONTROLLER_EVENT_STATE.rawValue:
         let lifecycle: SessionLifecycleState
-        switch stateOrError {
+        switch UInt32(bitPattern: stateOrError) {
         case REMOTE_CONTROLLER_STATE_CONNECTING.rawValue: lifecycle = .connecting
         case REMOTE_CONTROLLER_STATE_STREAMING.rawValue: lifecycle = .connected
         case REMOTE_CONTROLLER_STATE_RECONNECTING.rawValue: lifecycle = .reconnecting
@@ -451,7 +451,7 @@ public final class NativeControllerSession: @unchecked Sendable {
     }
 
     private func check(_ result: Int32) throws {
-        switch result {
+        switch UInt32(bitPattern: result) {
         case REMOTE_CONTROLLER_OK.rawValue: return
         case REMOTE_CONTROLLER_INVALID_HANDLE.rawValue: throw NativeControllerCoreError.invalidHandle
         case REMOTE_CONTROLLER_INVALID_STATE.rawValue: throw NativeControllerCoreError.invalidState

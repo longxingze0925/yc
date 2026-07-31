@@ -46,14 +46,14 @@ public final class MetalRemoteRenderer: NSObject, MTKViewDelegate, @unchecked Se
     private var viewportZoomScale: CGFloat = 1
     private weak var view: MTKView?
 
-    public override init() throws {
+    public init(resourceBundle: Bundle? = nil) throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw MetalRemoteRendererError.metalUnavailable
         }
         guard let commandQueue = device.makeCommandQueue() else {
             throw MetalRemoteRendererError.commandQueueUnavailable
         }
-        guard let library = try? device.makeDefaultLibrary(bundle: .module) else {
+        guard let library = try? device.makeDefaultLibrary(bundle: resourceBundle ?? .module) else {
             throw MetalRemoteRendererError.shaderLibraryUnavailable
         }
         guard let vertex = library.makeFunction(name: "remoteVertex"),

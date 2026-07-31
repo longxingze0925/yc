@@ -47,11 +47,11 @@ public final class ControllerAppModel: ObservableObject {
     private var bootstrapped = false
 
     public init(
-        configurationStore: ServiceConfigurationStore = ServiceConfigurationStore(),
+        configurationStore: ServiceConfigurationStore? = nil,
         secureStore: any SecureStoring = KeychainStore(),
         proofClient: any CredentialProofClient = UnavailableCredentialProofClient()
     ) {
-        self.configurationStore = configurationStore
+        self.configurationStore = configurationStore ?? ServiceConfigurationStore()
         tokenVault = TokenVault(store: secureStore)
         identityStore = DeviceIdentityStore(store: secureStore)
         recoveryCodeDeliveryVault = RecoveryCodeDeliveryVault(store: secureStore)

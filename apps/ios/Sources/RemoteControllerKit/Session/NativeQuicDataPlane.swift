@@ -49,7 +49,7 @@ private let nativeQuicStateCallback: RemoteQuicStateCallback = {
 
 private let nativeQuicPacketCallback: RemoteQuicPacketCallback = {
     context, _, delivery, _, groupID, packetIndex, packetCount, packet, packetLength in
-    guard delivery == REMOTE_QUIC_DELIVERY_VIDEO.rawValue,
+    guard UInt32(bitPattern: delivery) == REMOTE_QUIC_DELIVERY_VIDEO.rawValue,
           let callback = NativeQuicDataPlane.context(from: context),
           let packet else { return }
     callback.receiveVideoPacket(
@@ -64,7 +64,7 @@ private let nativeQuicDisconnectCallback: RemoteQuicDisconnectCallback = {
     context, _, result, reason, reasonLength in
     guard let callback = NativeQuicDataPlane.context(from: context) else { return }
     callback.continuation.yield(.disconnected(
-        recoverable: result == REMOTE_CONTROLLER_TRANSPORT_ERROR.rawValue,
+        recoverable: UInt32(bitPattern: result) == REMOTE_CONTROLLER_TRANSPORT_ERROR.rawValue,
         reason: NativeQuicDataPlane.string(from: reason, count: reasonLength)
     ))
 }
@@ -189,7 +189,7 @@ final class NativeQuicDataPlane: @unchecked Sendable {
     }
 
     private func check(_ result: Int32) throws {
-        switch result {
+        switch UInt32(bitPattern: result) {
         case REMOTE_CONTROLLER_OK.rawValue: return
         case REMOTE_CONTROLLER_INVALID_HANDLE.rawValue: throw NativeControllerCoreError.invalidHandle
         case REMOTE_CONTROLLER_INVALID_STATE.rawValue: throw NativeControllerCoreError.invalidState

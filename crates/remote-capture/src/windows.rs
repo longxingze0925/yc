@@ -278,10 +278,9 @@ impl Default for WindowsCapturer {
 
 impl WindowsCapturer {
     pub fn with_limits(limits: CaptureLimits) -> Self {
-        Self {
-            limits,
-            ..Self::default()
-        }
+        let mut capturer = Self::default();
+        capturer.limits = limits;
+        capturer
     }
 
     fn enumerate_monitors(&self) -> CaptureResult<Vec<NativeMonitor>> {

@@ -701,7 +701,7 @@ private actor SignalNativeSecureTransportDriver: NativeSecureTransportDriver {
         do {
             switch event {
             case let .state(state, _):
-                guard state == REMOTE_QUIC_STATE_CONNECTED.rawValue else { return }
+                guard UInt32(bitPattern: state) == REMOTE_QUIC_STATE_CONNECTED.rawValue else { return }
                 quicConnected = true
                 let queued = pendingPackets
                 pendingPackets.removeAll()
