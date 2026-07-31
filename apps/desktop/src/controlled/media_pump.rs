@@ -205,6 +205,22 @@ mod tests {
 
     #[test]
     fn capture_encode_sink_and_stop_form_a_real_h264_slice() {
+        if std::process::Command::new("gst-launch-1.0")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+            || std::process::Command::new("gst-inspect-1.0")
+                .arg("x264enc")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_or(true, |status| !status.success())
+        {
+            eprintln!("skipping real H.264 media pump test: GStreamer x264enc is unavailable");
+            return;
+        }
         let capturer = SafeMockCapturer::new(vec![MonitorInfo {
             monitor_id: 7,
             name: "test display".into(),

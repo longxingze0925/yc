@@ -188,7 +188,7 @@ public final class H264Decoder: @unchecked Sendable {
             let status = VTDecompressionSessionDecodeFrame(
                 decompressionSession,
                 sampleBuffer: sampleBuffer,
-                flags: [.enableAsynchronousDecompression],
+                flags: [._EnableAsynchronousDecompression],
                 frameRefcon: context.toOpaque(),
                 infoFlagsOut: nil
             )
@@ -232,7 +232,7 @@ public final class H264Decoder: @unchecked Sendable {
                 }
             }
         }
-        guard descriptionStatus == noErr, let videoDescription = description as? CMVideoFormatDescription else {
+        guard descriptionStatus == noErr, let videoDescription = description else {
             throw H264DecoderError.invalidParameterSets(descriptionStatus)
         }
 

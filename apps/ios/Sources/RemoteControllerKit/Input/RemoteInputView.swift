@@ -302,7 +302,7 @@ public final class RemoteInputSurfaceView: UIView, UIKeyInput, UIGestureRecogniz
                 logicalKey: key.charactersIgnoringModifiers,
                 modifiers: modifierNames(key.modifierFlags),
                 state: state,
-                isRepeat: key.isRepeat
+                isRepeat: state == .repeat
             )
         }
         return handled
@@ -324,7 +324,7 @@ public final class RemoteInputSurfaceView: UIView, UIKeyInput, UIGestureRecogniz
             keyCode: hidUsage,
             logicalKey: logicalKey,
             modifiers: modifiers,
-            keyboardLayout: UITextInputMode.currentInputMode?.primaryLanguage,
+            keyboardLayout: UITextInputMode.currentInputMode()?.primaryLanguage,
             isAutoRepeat: isRepeat
         ))
     }
