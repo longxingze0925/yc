@@ -126,7 +126,7 @@ private final class DarwinLANCandidateSocket: @unchecked Sendable {
 
     func probe(_ peer: ControlledSignalCandidate) async throws {
         let packet = try Self.probePacket(peer)
-        let remote = try remoteAddress(
+        let remote = try Self.remoteAddress(
             endpoint: peer.candidate.endpoint,
             localInterface: interface
         )
@@ -770,7 +770,7 @@ private actor SignalNativeSecureTransportDriver: NativeSecureTransportDriver {
 private extension Data {
     init?(uuid: UUID) {
         var value = uuid.uuid
-        self = withUnsafeBytes(of: &value) { Data($0) }
+        self = Swift.withUnsafeBytes(of: &value) { Data($0) }
     }
 
     init?(lowerHex128 value: String) {
