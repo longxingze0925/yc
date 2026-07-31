@@ -324,7 +324,7 @@ public final class RemoteInputSurfaceView: UIView, UIKeyInput, UIGestureRecogniz
             keyCode: hidUsage,
             logicalKey: logicalKey,
             modifiers: modifiers,
-            keyboardLayout: UITextInputMode.currentInputMode()?.primaryLanguage,
+            keyboardLayout: textInputMode?.primaryLanguage,
             isAutoRepeat: isRepeat
         ))
     }
