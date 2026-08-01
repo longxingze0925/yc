@@ -3,7 +3,7 @@
 }
 
 http://{$PUBLIC_HOST} {
-	redir https://{host}{uri} permanent
+	redir https://{host}{$PUBLIC_HTTPS_REDIRECT_SUFFIX}{uri} permanent
 }
 
 https://{$PUBLIC_HOST} {

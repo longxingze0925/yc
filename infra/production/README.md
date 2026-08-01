@@ -27,6 +27,20 @@ RCTL_AUTO_INSTALL_DOCKER=1 \
 bash <(curl -fsSL https://raw.githubusercontent.com/longxingze0925/yc/main/ops/install.sh)
 ```
 
+如果服务器已有 Nginx/Caddy 占用 `80/443`，可以在安装前改用空闲端口：
+
+```bash
+RCTL_PUBLIC_HTTP_PORT=8080 \
+RCTL_PUBLIC_HTTPS_PORT=8443 \
+RCTL_RELAY_PUBLIC_PORT=18082 \
+RCTL_DEPLOY_MODE=ip_self_signed \
+RCTL_PUBLIC_HOST=203.0.113.10 \
+RCTL_SKIP_PUBLIC_IP_CHECK=1 \
+bash <(curl -fsSL https://raw.githubusercontent.com/longxingze0925/yc/main/ops/install.sh)
+```
+
+安装器会先用 `ss` 检查这三个端口；发现占用时会显示监听进程并停止安装，不会覆盖已有软件。若使用域名自动证书，`80/TCP` 仍必须能临时提供 Let's Encrypt HTTP 校验。
+
 域名自动证书：
 
 ```bash
@@ -66,11 +80,11 @@ remote-control uninstall
 需要放行：
 
 ```text
-80/TCP       域名证书签发和 HTTPS 跳转
-443/TCP      API + Signal WebSocket
-443/UDP      HTTP/3（可选）
-18082/TCP    Relay TLS fallback
-18082/UDP    Relay QUIC
+HTTP_PORT/TCP       域名证书签发和 HTTP 跳转（默认 80）
+HTTPS_PORT/TCP      API + Signal WebSocket（默认 443）
+HTTPS_PORT/UDP      HTTP/3（可选）
+RELAY_PORT/TCP      Relay TLS fallback（默认 18082）
+RELAY_PORT/UDP      Relay QUIC（默认 18082）
 ```
 
 域名模式要求 A 记录已指向该服务器。纯 IP 模式要求输入 IPv4 与至少一个外部观测源的结果一致；在多出口 NAT 环境中可显式设置 `RCTL_SKIP_PUBLIC_IP_CHECK=1` 跳过安装阶段检查。

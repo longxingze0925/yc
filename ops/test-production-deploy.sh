@@ -20,6 +20,10 @@ source "$script_dir/remotectl.sh"
 mkdir -p "$CONFIG_DIR" "$CERT_DIR" "$BACKUP_DIR"
 DEPLOY_MODE=ip_self_signed
 PUBLIC_HOST=203.0.113.10
+PUBLIC_HTTP_PORT=8080
+PUBLIC_HTTPS_PORT=8443
+RELAY_PUBLIC_PORT=18082
+PUBLIC_HTTPS_REDIRECT_SUFFIX=:8443
 generate_ip_certificate >/dev/null 2>&1
 write_environment
 
@@ -32,8 +36,8 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
-[[ "$REMOTE_API_PUBLIC_URL" == "https://203.0.113.10" ]]
-[[ "$REMOTE_SIGNAL_PUBLIC_URL" == "wss://203.0.113.10/ws" ]]
+[[ "$REMOTE_API_PUBLIC_URL" == "https://203.0.113.10:8443" ]]
+[[ "$REMOTE_SIGNAL_PUBLIC_URL" == "wss://203.0.113.10:8443/ws" ]]
 [[ "$REMOTE_RELAY_PUBLIC_URL" == "203.0.113.10:18082" ]]
 [[ ${#REMOTE_MFA_SECRET_KEY} -eq 43 ]]
 

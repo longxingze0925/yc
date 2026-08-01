@@ -74,7 +74,7 @@ confirm() {
 ensure_system_dependencies() {
     local missing=()
     local command_name
-    for command_name in curl openssl jq tar gzip; do
+    for command_name in curl openssl jq tar gzip ss; do
         command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
     done
     ((${#missing[@]} == 0)) && return 0
@@ -83,7 +83,7 @@ ensure_system_dependencies() {
         || die "missing commands (${missing[*]}); automatic dependency installation supports Debian/Ubuntu"
     log "Installing system dependencies: ${missing[*]}"
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl jq tar gzip
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl jq tar gzip iproute2
 }
 
 ensure_docker() {
@@ -172,6 +172,49 @@ LETSENCRYPT_EMAIL=''
 CUSTOM_CERT_PATH=''
 CUSTOM_KEY_PATH=''
 CUSTOM_CA_PATH=''
+PUBLIC_HTTP_PORT='80'
+PUBLIC_HTTPS_PORT='443'
+PUBLIC_HTTPS_REDIRECT_SUFFIX=''
+RELAY_PUBLIC_PORT='18082'
+
+validate_port() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+$ ]] && ((value >= 1 && value <= 65535))
+}
+
+collect_ports() {
+    PUBLIC_HTTP_PORT="${RCTL_PUBLIC_HTTP_PORT:-80}"
+    PUBLIC_HTTPS_PORT="${RCTL_PUBLIC_HTTPS_PORT:-443}"
+    RELAY_PUBLIC_PORT="${RCTL_RELAY_PUBLIC_PORT:-18082}"
+    validate_port "$PUBLIC_HTTP_PORT" || die 'RCTL_PUBLIC_HTTP_PORT must be between 1 and 65535'
+    validate_port "$PUBLIC_HTTPS_PORT" || die 'RCTL_PUBLIC_HTTPS_PORT must be between 1 and 65535'
+    validate_port "$RELAY_PUBLIC_PORT" || die 'RCTL_RELAY_PUBLIC_PORT must be between 1 and 65535'
+    [[ "$PUBLIC_HTTP_PORT" != "$PUBLIC_HTTPS_PORT" && "$PUBLIC_HTTP_PORT" != "$RELAY_PUBLIC_PORT" \
+        && "$PUBLIC_HTTPS_PORT" != "$RELAY_PUBLIC_PORT" ]] \
+        || die 'public HTTP, HTTPS, and Relay ports must be distinct'
+    if [[ "$PUBLIC_HTTPS_PORT" == '443' ]]; then
+        PUBLIC_HTTPS_REDIRECT_SUFFIX=''
+    else
+        PUBLIC_HTTPS_REDIRECT_SUFFIX=":$PUBLIC_HTTPS_PORT"
+    fi
+}
+
+check_port_available() {
+    local port="$1" label="$2"
+    command -v ss >/dev/null 2>&1 || return 0
+    local listeners
+    listeners="$(ss -H -ltnup "sport = :$port" 2>/dev/null || true)"
+    if [[ -n "$listeners" ]]; then
+        printf '%s\n' "$listeners" >&2
+        die "$label port $port is already in use; set a different RCTL_*_PORT or stop the existing service"
+    fi
+}
+
+check_ports_available() {
+    check_port_available "$PUBLIC_HTTP_PORT" 'HTTP'
+    check_port_available "$PUBLIC_HTTPS_PORT" 'HTTPS'
+    check_port_available "$RELAY_PUBLIC_PORT" 'Relay'
+}
 
 collect_deployment_config() {
     DEPLOY_MODE="${RCTL_DEPLOY_MODE:-}"
@@ -204,6 +247,8 @@ collect_deployment_config() {
     case "$DEPLOY_MODE" in
         domain)
             is_domain "$PUBLIC_HOST" || die 'domain mode requires a valid domain name'
+            [[ "${RCTL_PUBLIC_HTTP_PORT:-80}" == '80' && "${RCTL_PUBLIC_HTTPS_PORT:-443}" == '443' ]] \
+                || die 'domain mode with automatic Let\x27s Encrypt requires public ports 80 and 443; use custom certificate mode behind an existing proxy for alternate ports'
             LETSENCRYPT_EMAIL="${RCTL_LETSENCRYPT_EMAIL:-}"
             [[ -n "$LETSENCRYPT_EMAIL" ]] || read -r -p "Let's Encrypt email: " LETSENCRYPT_EMAIL
             [[ "$LETSENCRYPT_EMAIL" == *@*.* ]] || die 'a valid email is required for certificate expiry notices'
@@ -225,6 +270,8 @@ collect_deployment_config() {
             [[ -n "$CUSTOM_KEY_PATH" ]] || read -r -p 'Private key path: ' CUSTOM_KEY_PATH
             ;;
     esac
+    collect_ports
+    check_ports_available
 }
 
 write_environment() {
@@ -236,10 +283,18 @@ write_environment() {
     {
         printf 'PUBLIC_HOST=%s\n' "$PUBLIC_HOST"
         printf 'DEPLOY_MODE=%s\n' "$DEPLOY_MODE"
-        printf 'REMOTE_API_PUBLIC_URL=https://%s\n' "$PUBLIC_HOST"
-        printf 'REMOTE_SIGNAL_PUBLIC_URL=wss://%s/ws\n' "$PUBLIC_HOST"
-        printf 'REMOTE_RELAY_PUBLIC_URL=%s:18082\n' "$PUBLIC_HOST"
-        printf 'RELAY_PUBLIC_PORT=18082\n'
+        if [[ "$PUBLIC_HTTPS_PORT" == '443' ]]; then
+            printf 'REMOTE_API_PUBLIC_URL=https://%s\n' "$PUBLIC_HOST"
+            printf 'REMOTE_SIGNAL_PUBLIC_URL=wss://%s/ws\n' "$PUBLIC_HOST"
+        else
+            printf 'REMOTE_API_PUBLIC_URL=https://%s:%s\n' "$PUBLIC_HOST" "$PUBLIC_HTTPS_PORT"
+            printf 'REMOTE_SIGNAL_PUBLIC_URL=wss://%s:%s/ws\n' "$PUBLIC_HOST" "$PUBLIC_HTTPS_PORT"
+        fi
+        printf 'REMOTE_RELAY_PUBLIC_URL=%s:%s\n' "$PUBLIC_HOST" "$RELAY_PUBLIC_PORT"
+        printf 'RELAY_PUBLIC_PORT=%s\n' "$RELAY_PUBLIC_PORT"
+        printf 'PUBLIC_HTTP_PORT=%s\n' "$PUBLIC_HTTP_PORT"
+        printf 'PUBLIC_HTTPS_PORT=%s\n' "$PUBLIC_HTTPS_PORT"
+        printf 'PUBLIC_HTTPS_REDIRECT_SUFFIX=%s\n' "$PUBLIC_HTTPS_REDIRECT_SUFFIX"
         printf 'POSTGRES_DB=remote_control\n'
         printf 'POSTGRES_USER=remote\n'
         printf 'POSTGRES_PASSWORD=%s\n' "$(random_hex 24)"
@@ -448,7 +503,7 @@ public_curl() {
 }
 
 local_public_curl() {
-    public_curl --resolve "${PUBLIC_HOST}:443:127.0.0.1" "$@"
+    public_curl --resolve "${PUBLIC_HOST}:${PUBLIC_HTTPS_PORT}:127.0.0.1" "$@"
 }
 
 check_internal_services() {
