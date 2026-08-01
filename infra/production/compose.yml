@@ -1,0 +1,194 @@
+name: remote-control-production
+
+x-service-build: &service-build
+  context: ../..
+  dockerfile: infra/docker-compose/Dockerfile
+
+x-service-environment: &service-environment
+  RUST_LOG: ${RUST_LOG:-info}
+  REMOTE_SERVICE_TOKEN: ${REMOTE_SERVICE_TOKEN:?REMOTE_SERVICE_TOKEN is required}
+
+services:
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-bookworm
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    image: postgres:17-bookworm
+    environment:
+      REMOTE_LOCAL_COMPOSE_MIGRATION: "1"
+      SCHEMA_FREEZE_CONFIRMED: "1"
+      SCHEMA_TARGET_EMPTY_CONFIRMED: "1"
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:?POSTGRES_DB is required}
+      PGUSER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../migrations:/migrations:ro
+    entrypoint: ["/bin/sh", "/migrations/ensure-local-compose-schema.sh"]
+    restart: "no"
+
+  api-server:
+    build:
+      <<: *service-build
+      args:
+        SERVICE: api-server
+    environment:
+      <<: *service-environment
+      REMOTE_API_BIND: 0.0.0.0:18080
+      REMOTE_API_PUBLIC_URL: ${REMOTE_API_PUBLIC_URL:?REMOTE_API_PUBLIC_URL is required}
+      REMOTE_TOKEN_SECRET: ${REMOTE_TOKEN_SECRET:?REMOTE_TOKEN_SECRET is required}
+      REMOTE_STORAGE_BACKEND: postgres
+      REMOTE_MFA_SECRET_KEY: ${REMOTE_MFA_SECRET_KEY:?REMOTE_MFA_SECRET_KEY is required}
+      REMOTE_SIGNAL_PUSH_URL: http://signal-server:18081/internal/v1/push
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    expose:
+      - "18080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    init: true
+    restart: unless-stopped
+
+  signal-server:
+    build:
+      <<: *service-build
+      args:
+        SERVICE: signal-server
+    environment:
+      <<: *service-environment
+      REMOTE_SIGNAL_BIND: 0.0.0.0:18081
+      REMOTE_TOKEN_SECRET: ${REMOTE_TOKEN_SECRET:?REMOTE_TOKEN_SECRET is required}
+      REMOTE_API_INTERNAL_URL: http://api-server:18080
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      api-server:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "18081"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    init: true
+    restart: unless-stopped
+
+  relay-server:
+    build:
+      <<: *service-build
+      args:
+        SERVICE: relay-server
+    user: "0:0"
+    environment:
+      <<: *service-environment
+      REMOTE_RELAY_QUIC_BIND: 0.0.0.0:18082
+      REMOTE_RELAY_TLS_BIND: 0.0.0.0:18082
+      REMOTE_RELAY_HEALTH_BIND: 127.0.0.1:18083
+      REMOTE_RELAY_STAGE_TLS: "1"
+      REMOTE_RELAY_NODE_ID: ${REMOTE_RELAY_NODE_ID:-relay-production-1}
+      REMOTE_RELAY_TOKEN_SECRET: ${REMOTE_RELAY_TOKEN_SECRET:?REMOTE_RELAY_TOKEN_SECRET is required}
+      REMOTE_RELAY_ALLOWED_TRANSPORTS: quic_relay,tls_443_relay
+      REMOTE_API_INTERNAL_URL: http://api-server:18080
+    depends_on:
+      api-server:
+        condition: service_healthy
+    ports:
+      - "${RELAY_PUBLIC_PORT:-18082}:18082/tcp"
+      - "${RELAY_PUBLIC_PORT:-18082}:18082/udp"
+    volumes:
+      - type: bind
+        source: ${TLS_CERT_PATH:?TLS_CERT_PATH is required}
+        target: /run/secrets/relay/relay.crt
+        read_only: true
+      - type: bind
+        source: ${TLS_KEY_PATH:?TLS_KEY_PATH is required}
+        target: /run/secrets/relay/relay.key
+        read_only: true
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18083/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    init: true
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10-alpine
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?PUBLIC_HOST is required}
+    depends_on:
+      api-server:
+        condition: service_healthy
+      signal-server:
+        condition: service_healthy
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - type: bind
+        source: ${TLS_CERT_PATH:?TLS_CERT_PATH is required}
+        target: /certs/server.crt
+        read_only: true
+      - type: bind
+        source: ${TLS_KEY_PATH:?TLS_KEY_PATH is required}
+        target: /certs/server.key
+        read_only: true
+      - caddy-data:/data
+      - caddy-config:/config
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  caddy-data:
+  caddy-config:

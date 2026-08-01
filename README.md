@@ -98,6 +98,16 @@ make test
 make check
 ```
 
+## 服务端一键部署
+
+生产编排支持域名证书和纯公网 IPv4 自签名 IP SAN 证书：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/longxingze0925/yc/main/ops/install.sh)
+```
+
+详见 [生产部署说明](infra/production/README.md)。
+
 ## 当前阶段
 
 已完成的账号、设备注册、Signal 鉴权、P2P/Relay 和 Ubuntu 抓屏基础继续复用。当前进入 `Mobile MVP`，按 `TM001-TM006` 交付 iOS 主控闭环；原 M3-M7 全平台矩阵作为后续 V1 Core 门禁保留。

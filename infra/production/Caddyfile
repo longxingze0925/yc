@@ -1,0 +1,20 @@
+{
+	admin off
+}
+
+http://{$PUBLIC_HOST} {
+	redir https://{host}{uri} permanent
+}
+
+https://{$PUBLIC_HOST} {
+	tls /certs/server.crt /certs/server.key
+
+	@signal path /ws /ws/*
+	handle @signal {
+		reverse_proxy signal-server:18081
+	}
+
+	handle {
+		reverse_proxy api-server:18080
+	}
+}
