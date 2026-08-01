@@ -18,8 +18,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         *) echo "unsupported SERVICE: $SERVICE" >&2; exit 1 ;; \
     esac \
     && if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
-        export CARGO_SOURCE_CRATES_IO_REPLACE_WITH=deployment; \
-        export CARGO_SOURCE_DEPLOYMENT_REGISTRY="$CARGO_REGISTRY_MIRROR"; \
+        case "$CARGO_REGISTRY_MIRROR" in \
+            sparse+https://*) ;; \
+            *) echo "unsupported Cargo registry mirror: $CARGO_REGISTRY_MIRROR" >&2; exit 1 ;; \
+        esac; \
+        case "$CARGO_REGISTRY_MIRROR" in \
+            *[!A-Za-z0-9+:/._~%-]*) echo "invalid Cargo registry mirror" >&2; exit 1 ;; \
+        esac; \
+        mkdir -p .cargo; \
+        printf '[source.crates-io]\nreplace-with = "deployment"\n\n[source.deployment]\nregistry = "%s"\n' \
+            "$CARGO_REGISTRY_MIRROR" > .cargo/config.toml; \
     fi \
     && RUSTUP_TOOLCHAIN="$RUST_VERSION" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
         cargo build --locked --release --package "$SERVICE" \
