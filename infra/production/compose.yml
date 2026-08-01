@@ -161,6 +161,7 @@ services:
     image: caddy:2.10-alpine
     environment:
       PUBLIC_HOST: ${PUBLIC_HOST:?PUBLIC_HOST is required}
+      PUBLIC_HTTPS_REDIRECT_SUFFIX: ${PUBLIC_HTTPS_REDIRECT_SUFFIX:-}
     depends_on:
       api-server:
         condition: service_healthy

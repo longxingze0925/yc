@@ -41,7 +41,9 @@ set +a
 [[ "$REMOTE_RELAY_PUBLIC_URL" == "203.0.113.10:18082" ]]
 [[ ${#REMOTE_MFA_SECRET_KEY} -eq 43 ]]
 
-docker compose --env-file "$ENV_FILE" \
-    --file "$repository_root/infra/production/compose.yml" config --quiet
+rendered_compose="$(docker compose --env-file "$ENV_FILE" \
+    --file "$repository_root/infra/production/compose.yml" config)"
+grep -F 'PUBLIC_HTTPS_REDIRECT_SUFFIX: :8443' <<< "$rendered_compose" >/dev/null
+grep -Fx ':443 {' "$repository_root/infra/production/Caddyfile" >/dev/null
 
 printf 'production deployment smoke test passed\n'
