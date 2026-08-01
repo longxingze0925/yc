@@ -4,7 +4,7 @@ FROM rust:1-bookworm AS builder
 
 ARG SERVICE
 ARG CARGO_BUILD_JOBS=1
-ARG CARGO_REGISTRIES_CRATES_IO_INDEX=sparse+https://index.crates.io/
+ARG CARGO_REGISTRY_MIRROR
 WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -17,8 +17,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         api-server|signal-server|relay-server) ;; \
         *) echo "unsupported SERVICE: $SERVICE" >&2; exit 1 ;; \
     esac \
+    && if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
+        export CARGO_SOURCE_CRATES_IO_REPLACE_WITH=deployment; \
+        export CARGO_SOURCE_DEPLOYMENT_REGISTRY="$CARGO_REGISTRY_MIRROR"; \
+    fi \
     && RUSTUP_TOOLCHAIN="$RUST_VERSION" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
-        CARGO_REGISTRIES_CRATES_IO_INDEX="$CARGO_REGISTRIES_CRATES_IO_INDEX" \
         cargo build --locked --release --package "$SERVICE" \
     && cp "target/release/$SERVICE" /tmp/service
 
