@@ -46,7 +46,7 @@ public struct RoleCapabilities: Codable, Equatable, Sendable {
     public static let iosControllerOnly = RoleCapabilities(
         controller: true,
         controlled: false,
-        fileTransfer: true,
+        fileTransfer: false,
         unattended: false
     )
 

@@ -33,6 +33,7 @@ final class DeviceIdentityStoreTests: XCTestCase {
 
         XCTAssertEqual(request.platform, .ios)
         XCTAssertEqual(request.roleCapabilities, .iosControllerOnly)
+        XCTAssertFalse(request.roleCapabilities.fileTransfer)
         XCTAssertFalse(request.osVersion.isEmpty)
         XCTAssertFalse(request.publicKey.contains("="))
         XCTAssertEqual(request.deviceEnrollmentGrant, "grant-id.grant-secret")

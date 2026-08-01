@@ -183,7 +183,7 @@ final class ProtocolModelTests: XCTestCase {
         XCTAssertEqual(Set(capabilities.keys), ["controller", "controlled", "file_transfer", "unattended"])
         XCTAssertEqual(capabilities["controller"] as? Bool, true)
         XCTAssertEqual(capabilities["controlled"] as? Bool, false)
-        XCTAssertEqual(capabilities["file_transfer"] as? Bool, true)
+        XCTAssertEqual(capabilities["file_transfer"] as? Bool, false)
         XCTAssertEqual(capabilities["unattended"] as? Bool, false)
     }
 
