@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Remote Control
+Name[zh_CN]=远程控制
+GenericName=Remote Desktop
+GenericName[zh_CN]=远程桌面
+Comment=Connect to and control devices in your account
+Comment[zh_CN]=连接并控制账号内的设备
+Exec=rctl-remote-desktop
+Icon=rctl-remote-desktop
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;control;support;
+Keywords[zh_CN]=远程;桌面;控制;协助;
+StartupNotify=true

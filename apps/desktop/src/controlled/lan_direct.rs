@@ -21,6 +21,7 @@ use tokio::net::UdpSocket;
 use crate::identity::DeviceIdentity;
 
 const CANDIDATE_TOKEN_TTL_MILLIS: u32 = 30_000;
+const LAN_BIND_ATTEMPTS: usize = 128;
 
 #[derive(Debug)]
 pub enum LanDirectError {
@@ -143,13 +144,8 @@ impl LanDirectCandidate {
         now_epoch_millis: u64,
     ) -> Result<Self, LanDirectError> {
         let interface = discover_private_interface()?;
-        let socket = UdpSocket::bind(SocketAddr::new(interface.address, 0))
-            .await
-            .map_err(|_| LanDirectError::Bind)?;
+        let socket = bind_lan_socket(interface.address).await?;
         let endpoint = socket.local_addr().map_err(|_| LanDirectError::Bind)?;
-        if endpoint.port() < remote_transport::LAN_EPHEMERAL_PORT_MIN {
-            return Err(LanDirectError::Bind);
-        }
         let mut candidate = ConnectionCandidateDto {
             candidate_id: 0,
             session_id,
@@ -209,13 +205,19 @@ struct PrivateInterface {
 
 fn discover_private_interface() -> Result<PrivateInterface, LanDirectError> {
     let interfaces = get_if_addrs().map_err(|_| LanDirectError::InterfaceDiscovery)?;
-    interfaces
+    let default_interface = std::fs::read_to_string("/proc/net/route")
+        .ok()
+        .and_then(|routes| parse_default_route_interface(&routes));
+    let mut candidates = interfaces
         .into_iter()
         .filter_map(|interface| {
             let IfAddr::V4(address) = interface.addr else {
                 return None;
             };
-            if !is_private_unicast(address.ip) || !is_contiguous_netmask(address.netmask) {
+            if is_virtual_lan_interface(&interface.name)
+                || !is_private_unicast(address.ip)
+                || !is_contiguous_netmask(address.netmask)
+            {
                 return None;
             }
             let prefix = u32::from(address.netmask).leading_ones() as u8;
@@ -233,8 +235,60 @@ fn discover_private_interface() -> Result<PrivateInterface, LanDirectError> {
                 network,
             })
         })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        let left_default = default_interface.as_deref() == Some(left.name.as_str());
+        let right_default = default_interface.as_deref() == Some(right.name.as_str());
+        right_default
+            .cmp(&left_default)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.address.to_string().cmp(&right.address.to_string()))
+    });
+    candidates
+        .into_iter()
         .next()
         .ok_or(LanDirectError::NoPrivateInterface)
+}
+
+async fn bind_lan_socket(address: IpAddr) -> Result<UdpSocket, LanDirectError> {
+    let minimum = remote_transport::LAN_EPHEMERAL_PORT_MIN;
+    let port_count = u32::from(u16::MAX) - u32::from(minimum) + 1;
+    let start = rand::rng().random_range(0..port_count);
+    for offset in 0..LAN_BIND_ATTEMPTS as u32 {
+        let port = minimum + ((start + offset) % port_count) as u16;
+        if let Ok(socket) = UdpSocket::bind(SocketAddr::new(address, port)).await {
+            return Ok(socket);
+        }
+    }
+    Err(LanDirectError::Bind)
+}
+
+fn parse_default_route_interface(routes: &str) -> Option<String> {
+    routes
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 8 || fields[1] != "00000000" || fields[7] != "00000000" {
+                return None;
+            }
+            let flags = u16::from_str_radix(fields[3], 16).ok()?;
+            if flags & 0x1 == 0 {
+                return None;
+            }
+            let metric = fields[6].parse::<u32>().ok()?;
+            Some((metric, fields[0].to_owned()))
+        })
+        .min_by_key(|(metric, _)| *metric)
+        .map(|(_, interface)| interface)
+}
+
+fn is_virtual_lan_interface(name: &str) -> bool {
+    [
+        "br-", "cni", "docker", "flannel", "podman", "veth", "virbr", "vnet", "vboxnet", "vmnet",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 fn is_private_unicast(address: Ipv4Addr) -> bool {
@@ -267,6 +321,35 @@ mod tests {
         assert!(!is_private_unicast(Ipv4Addr::LOCALHOST));
         assert!(!is_contiguous_netmask(Ipv4Addr::new(255, 0, 255, 0)));
         assert!(is_contiguous_netmask(Ipv4Addr::new(255, 255, 255, 0)));
+    }
+
+    #[test]
+    fn selects_the_lowest_metric_default_route_and_rejects_virtual_bridges() {
+        let routes = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+wlo1\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\n\
+enp5s0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\n";
+        assert_eq!(
+            parse_default_route_interface(routes).as_deref(),
+            Some("enp5s0")
+        );
+        assert!(is_virtual_lan_interface("docker0"));
+        assert!(is_virtual_lan_interface("br-0123456789ab"));
+        assert!(is_virtual_lan_interface("veth1234"));
+        assert!(!is_virtual_lan_interface("wlo1"));
+        assert!(!is_virtual_lan_interface("enp5s0"));
+    }
+
+    #[tokio::test]
+    async fn explicit_lan_bind_never_returns_a_low_ephemeral_port() {
+        for _ in 0..32 {
+            let socket = bind_lan_socket(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .await
+                .expect("bind high LAN port");
+            assert!(
+                socket.local_addr().expect("local endpoint").port()
+                    >= remote_transport::LAN_EPHEMERAL_PORT_MIN
+            );
+        }
     }
 
     #[test]

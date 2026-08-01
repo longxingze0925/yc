@@ -1,5 +1,6 @@
 use super::{DesktopPlatform, PlatformSnapshot};
 use crate::input::{InputBackend, InputError, PhysicalKey, PointerButton, UnsupportedInputBackend};
+use remote_capture::{PortalInputError, UbuntuWaylandPortalInput};
 use std::collections::BTreeSet;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
@@ -44,10 +45,7 @@ impl UbuntuSession {
 
     fn input_backend(self) -> Box<dyn InputBackend> {
         match self {
-            Self::Wayland => Box::new(UnsupportedInputBackend::new(
-                "xdg-desktop-portal RemoteDesktop",
-                "portal RemoteDesktop integration is not linked in this milestone",
-            )),
+            Self::Wayland => Box::new(WaylandInputBackend::default()),
             Self::X11 => X11InputBackend::connect().map_or_else(
                 |error| Box::new(UnsupportedInputBackend::new("X11 XTest", error)) as _,
                 |backend| Box::new(backend) as _,
@@ -58,6 +56,153 @@ impl UbuntuSession {
             )),
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct WaylandInputBackend {
+    portal: UbuntuWaylandPortalInput,
+}
+
+impl WaylandInputBackend {
+    fn portal_result(result: Result<(), PortalInputError>) -> Result<(), InputError> {
+        result.map_err(|error| match error {
+            PortalInputError::SessionInactive => InputError::Unsupported(
+                "the RemoteDesktop portal session is not active or authorization was revoked",
+            ),
+            PortalInputError::InvalidInput(reason) => InputError::InjectionFailed(reason),
+            PortalInputError::PortalFailure(_) => {
+                InputError::InjectionFailed("the RemoteDesktop portal rejected input injection")
+            }
+            PortalInputError::TimedOut => {
+                InputError::InjectionFailed("the RemoteDesktop portal input request timed out")
+            }
+        })
+    }
+}
+
+impl InputBackend for WaylandInputBackend {
+    fn name(&self) -> &'static str {
+        "xdg-desktop-portal RemoteDesktop"
+    }
+
+    fn key_down(&mut self, key: PhysicalKey) -> Result<(), InputError> {
+        let keycode = hid_usage_to_evdev_keycode(key).ok_or(InputError::Unsupported(
+            "the HID usage is not mapped to a Linux evdev keycode",
+        ))?;
+        Self::portal_result(self.portal.keycode(keycode, true))
+    }
+
+    fn key_up(&mut self, key: PhysicalKey) -> Result<(), InputError> {
+        let keycode = hid_usage_to_evdev_keycode(key).ok_or(InputError::Unsupported(
+            "the HID usage is not mapped to a Linux evdev keycode",
+        ))?;
+        Self::portal_result(self.portal.keycode(keycode, false))
+    }
+
+    fn button_down(&mut self, button: PointerButton) -> Result<(), InputError> {
+        Self::portal_result(self.portal.button(pointer_button_to_evdev(button), true))
+    }
+
+    fn button_up(&mut self, button: PointerButton) -> Result<(), InputError> {
+        Self::portal_result(self.portal.button(pointer_button_to_evdev(button), false))
+    }
+
+    fn move_pointer(&mut self, x_norm: f64, y_norm: f64) -> Result<(), InputError> {
+        Self::portal_result(self.portal.move_pointer(x_norm, y_norm))
+    }
+
+    fn wheel(&mut self, delta_x: f64, delta_y: f64) -> Result<(), InputError> {
+        Self::portal_result(self.portal.wheel(delta_x, delta_y))
+    }
+
+    fn text_commit(&mut self, text: &str) -> Result<(), InputError> {
+        Self::portal_result(self.portal.text_commit(text))
+    }
+
+    fn release_all(&mut self) -> Result<(), InputError> {
+        Self::portal_result(self.portal.release_all())
+    }
+}
+
+fn pointer_button_to_evdev(button: PointerButton) -> i32 {
+    match button {
+        PointerButton::Left => 0x110,
+        PointerButton::Right => 0x111,
+        PointerButton::Middle => 0x112,
+        PointerButton::Back => 0x113,
+        PointerButton::Forward => 0x114,
+    }
+}
+
+fn hid_usage_to_evdev_keycode(key: PhysicalKey) -> Option<i32> {
+    let keycode = match key.0 {
+        0x04 => 30,
+        0x05 => 48,
+        0x06 => 46,
+        0x07 => 32,
+        0x08 => 18,
+        0x09 => 33,
+        0x0a => 34,
+        0x0b => 35,
+        0x0c => 23,
+        0x0d => 36,
+        0x0e => 37,
+        0x0f => 38,
+        0x10 => 50,
+        0x11 => 49,
+        0x12 => 24,
+        0x13 => 25,
+        0x14 => 16,
+        0x15 => 19,
+        0x16 => 31,
+        0x17 => 20,
+        0x18 => 22,
+        0x19 => 47,
+        0x1a => 17,
+        0x1b => 45,
+        0x1c => 21,
+        0x1d => 44,
+        0x1e..=0x27 => 2 + i32::try_from(key.0 - 0x1e).ok()?,
+        0x28 => 28,
+        0x29 => 1,
+        0x2a => 14,
+        0x2b => 15,
+        0x2c => 57,
+        0x2d => 12,
+        0x2e => 13,
+        0x2f => 26,
+        0x30 => 27,
+        0x31 => 43,
+        0x33 => 39,
+        0x34 => 40,
+        0x35 => 41,
+        0x36 => 51,
+        0x37 => 52,
+        0x38 => 53,
+        0x39 => 58,
+        0x3a..=0x43 => 59 + i32::try_from(key.0 - 0x3a).ok()?,
+        0x44 => 87,
+        0x45 => 88,
+        0x4a => 102,
+        0x4b => 104,
+        0x4c => 111,
+        0x4d => 107,
+        0x4e => 109,
+        0x4f => 106,
+        0x50 => 105,
+        0x51 => 108,
+        0x52 => 103,
+        0xe0 => 29,
+        0xe1 => 42,
+        0xe2 => 56,
+        0xe3 => 125,
+        0xe4 => 97,
+        0xe5 => 54,
+        0xe6 => 100,
+        0xe7 => 126,
+        _ => return None,
+    };
+    Some(keycode)
 }
 
 #[derive(Debug)]
@@ -442,7 +587,7 @@ impl DesktopPlatform for UbuntuPlatform {
             render_status: "unsupported: OpenGL/Vulkan 原生表面未接入".into(),
             input_status: match self.session {
                 UbuntuSession::Wayland => {
-                    "unsupported: xdg-desktop-portal RemoteDesktop 未接入".into()
+                    "xdg-desktop-portal RemoteDesktop: 已接入，会话启动时与屏幕共同授权".into()
                 }
                 UbuntuSession::X11 => "X11 XTest: 会话启动时连接并验证".into(),
                 UbuntuSession::Unknown => "unsupported: 未检测到 Wayland/X11".into(),
@@ -468,6 +613,17 @@ mod tests {
     }
 
     #[test]
+    fn wayland_reports_joint_screencast_and_remote_desktop_authorization() {
+        let snapshot = UbuntuPlatform {
+            session: UbuntuSession::Wayland,
+        }
+        .snapshot();
+        assert!(snapshot.capture_status.contains("ScreenCast"));
+        assert!(snapshot.input_status.contains("RemoteDesktop"));
+        assert!(!snapshot.input_status.starts_with("unsupported:"));
+    }
+
+    #[test]
     fn x11_maps_common_hid_usages_to_standard_keycodes() {
         assert_eq!(hid_usage_to_x11_keycode(PhysicalKey(0x04)), Some(38));
         assert_eq!(hid_usage_to_x11_keycode(PhysicalKey(0x05)), Some(56));
@@ -478,6 +634,26 @@ mod tests {
         assert_eq!(hid_usage_to_x11_keycode(PhysicalKey(0xe0)), Some(37));
         assert_eq!(hid_usage_to_x11_keycode(PhysicalKey(0xe7)), Some(134));
         assert_eq!(hid_usage_to_x11_keycode(PhysicalKey(0xff)), None);
+    }
+
+    #[test]
+    fn wayland_maps_hid_usages_to_linux_evdev_keycodes() {
+        assert_eq!(hid_usage_to_evdev_keycode(PhysicalKey(0x04)), Some(30));
+        assert_eq!(hid_usage_to_evdev_keycode(PhysicalKey(0x1d)), Some(44));
+        assert_eq!(hid_usage_to_evdev_keycode(PhysicalKey(0x28)), Some(28));
+        assert_eq!(hid_usage_to_evdev_keycode(PhysicalKey(0x52)), Some(103));
+        assert_eq!(hid_usage_to_evdev_keycode(PhysicalKey(0xe0)), Some(29));
+        assert_eq!(hid_usage_to_evdev_keycode(PhysicalKey(0xe7)), Some(126));
+        assert_eq!(hid_usage_to_evdev_keycode(PhysicalKey(0xff)), None);
+    }
+
+    #[test]
+    fn wayland_pointer_buttons_use_linux_evdev_codes() {
+        assert_eq!(pointer_button_to_evdev(PointerButton::Left), 0x110);
+        assert_eq!(pointer_button_to_evdev(PointerButton::Right), 0x111);
+        assert_eq!(pointer_button_to_evdev(PointerButton::Middle), 0x112);
+        assert_eq!(pointer_button_to_evdev(PointerButton::Back), 0x113);
+        assert_eq!(pointer_button_to_evdev(PointerButton::Forward), 0x114);
     }
 
     #[test]

@@ -8,7 +8,8 @@ use std::env;
 use crate::{CaptureBackend, ScreenCapturer, UnsupportedCapturer};
 
 pub use portal::{
-    PortalCapability, PortalSessionState, UbuntuWaylandPortalCapturer, WaylandPortalStatus,
+    PortalCapability, PortalInputError, PortalSessionState, UbuntuWaylandPortalCapturer,
+    UbuntuWaylandPortalInput, WaylandPortalStatus,
 };
 pub use x11::UbuntuX11Capturer;
 

@@ -1,0 +1,28 @@
+.TH RCTL-REMOTE-DESKTOP 1 "2026-08-01" "Remote Control 0.1.0" "User Commands"
+.SH NAME
+rctl-remote-desktop \- start the Remote Control desktop client
+.SH SYNOPSIS
+.B rctl-remote-desktop
+.SH DESCRIPTION
+.B rctl-remote-desktop
+starts the graphical Remote Control client through its systemd user service.
+If a systemd user manager is unavailable, it starts the client directly.
+.PP
+Remote access remains disabled until the local user signs in and explicitly
+enables access from devices on the same account.
+.SH USER SERVICE
+Inspect or stop the running client with:
+.PP
+.nf
+systemctl --user status rctl-remote-desktop.service
+systemctl --user stop rctl-remote-desktop.service
+.fi
+.SH FILES
+.TP
+.I ~/.config/rctl-remote/services.json
+Per-user service endpoint configuration.
+.TP
+.I ~/.config/rctl-remote/controlled-access.json
+Per-user controlled-access preference.
+.SH SEE ALSO
+.BR systemctl (1)

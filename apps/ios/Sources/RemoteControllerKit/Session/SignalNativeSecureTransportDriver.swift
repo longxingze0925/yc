@@ -39,7 +39,7 @@ private enum SignalNativeTransportError: LocalizedError {
     case socket(String)
     case candidateTokenMismatch
     case peerMismatch
-    case probeFailed
+    case probeFailed(String)
     case quicNotConnected
 
     var errorDescription: String? {
@@ -49,7 +49,9 @@ private enum SignalNativeTransportError: LocalizedError {
         case let .socket(operation): return "UDP socket 操作失败：\(operation)"
         case .candidateTokenMismatch: return "候选 token 与本机候选不匹配"
         case .peerMismatch: return "Signal 对端设备绑定不匹配"
-        case .probeFailed: return "授权 UDP probe 未在时限内收到原样回显"
+        case let .probeFailed(detail):
+            if detail.isEmpty { return "授权 UDP probe 未在时限内收到原样回显" }
+            return "授权 UDP probe 失败：\(detail)"
         case .quicNotConnected: return "QUIC 数据面尚未连接"
         }
     }
@@ -125,59 +127,84 @@ private final class DarwinLANCandidateSocket: @unchecked Sendable {
     }
 
     func probe(_ peer: ControlledSignalCandidate) async throws {
-        let packet = try Self.probePacket(peer)
         let remote = try Self.remoteAddress(
             endpoint: peer.candidate.endpoint,
             localInterface: interface
         )
+        let packets = try (0..<3).map { _ in try Self.probePacket(peer) }
+        let localEndpoint = endpoint
+        let remoteEndpoint = peer.candidate.endpoint
         let descriptor = try duplicateDescriptor()
         try await Task.detached(priority: .userInitiated) {
             defer { Darwin.close(descriptor) }
-            var remote = remote
-            let sent = packet.withUnsafeBytes { bytes in
-                withUnsafePointer(to: &remote) { pointer in
-                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        Darwin.sendto(
-                            descriptor,
-                            bytes.baseAddress,
-                            bytes.count,
-                            0,
-                            $0,
-                            socklen_t(MemoryLayout<sockaddr_in>.size)
-                        )
+            var lastDetail = "未收到回显"
+            for (index, packet) in packets.enumerated() {
+                var remote = remote
+                let sent = packet.withUnsafeBytes { bytes in
+                    withUnsafePointer(to: &remote) { pointer in
+                        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            Darwin.sendto(
+                                descriptor,
+                                bytes.baseAddress,
+                                bytes.count,
+                                0,
+                                $0,
+                                socklen_t(MemoryLayout<sockaddr_in>.size)
+                            )
+                        }
                     }
                 }
-            }
-            guard sent == packet.count else { throw SignalNativeTransportError.probeFailed }
+                guard sent == packet.count else {
+                    let code = Darwin.errno
+                    lastDetail = "sendto errno=\(code) (\(String(cString: strerror(code)))) local=\(localEndpoint) remote=\(remoteEndpoint) attempt=\(index + 1)"
+                    continue
+                }
 
-            var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
-            guard Darwin.poll(&pollDescriptor, 1, 3_000) == 1,
-                  pollDescriptor.revents & Int16(POLLIN) != 0 else {
-                throw SignalNativeTransportError.probeFailed
-            }
-            var response = [UInt8](repeating: 0, count: 2_305)
-            var sender = sockaddr_in()
-            var senderLength = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let received = response.withUnsafeMutableBytes { bytes in
-                withUnsafeMutablePointer(to: &sender) { pointer in
-                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        Darwin.recvfrom(
-                            descriptor,
-                            bytes.baseAddress,
-                            bytes.count,
-                            0,
-                            $0,
-                            &senderLength
-                        )
+                var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+                let polled = Darwin.poll(&pollDescriptor, 1, 1_000)
+                guard polled == 1, pollDescriptor.revents & Int16(POLLIN) != 0 else {
+                    if polled < 0 {
+                        let code = Darwin.errno
+                        lastDetail = "poll errno=\(code) (\(String(cString: strerror(code)))) local=\(localEndpoint) remote=\(remoteEndpoint) attempt=\(index + 1)"
+                    } else {
+                        lastDetail = "timeout 1000ms local=\(localEndpoint) remote=\(remoteEndpoint) attempt=\(index + 1)"
+                    }
+                    continue
+                }
+
+                var response = [UInt8](repeating: 0, count: 2_305)
+                var sender = sockaddr_in()
+                var senderLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let received = response.withUnsafeMutableBytes { bytes in
+                    withUnsafeMutablePointer(to: &sender) { pointer in
+                        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            Darwin.recvfrom(
+                                descriptor,
+                                bytes.baseAddress,
+                                bytes.count,
+                                0,
+                                $0,
+                                &senderLength
+                            )
+                        }
                     }
                 }
+                guard received >= 0 else {
+                    let code = Darwin.errno
+                    lastDetail = "recvfrom errno=\(code) (\(String(cString: strerror(code)))) local=\(localEndpoint) remote=\(remoteEndpoint) attempt=\(index + 1)"
+                    continue
+                }
+                let actualPeer = Self.socketAddressText(sender)
+                guard received == packet.count,
+                      sender.sin_addr.s_addr == remote.sin_addr.s_addr,
+                      sender.sin_port == remote.sin_port,
+                      Data(response.prefix(received)) == packet else {
+                    lastDetail = "回显不匹配 local=\(localEndpoint) expected=\(remoteEndpoint) actual=\(actualPeer) bytes=\(received) attempt=\(index + 1)"
+                    continue
+                }
+                return
             }
-            guard received == packet.count,
-                  sender.sin_addr.s_addr == remote.sin_addr.s_addr,
-                  sender.sin_port == remote.sin_port,
-                  Data(response.prefix(received)) == packet else {
-                throw SignalNativeTransportError.probeFailed
-            }
+            throw SignalNativeTransportError.probeFailed(lastDetail)
         }.value
     }
 
@@ -286,7 +313,7 @@ private final class DarwinLANCandidateSocket: @unchecked Sendable {
               !peer.authorization.candidateToken.isEmpty,
               peer.authorization.candidateToken.count <= 2_048,
               peer.authorization.candidateTokenBindingHash.count == 32 else {
-            throw SignalNativeTransportError.probeFailed
+            throw SignalNativeTransportError.probeFailed("探测包字段无效")
         }
         var nonce = try randomBytes(count: 32)
         if nonce.allSatisfy({ $0 == 0 }) { nonce[0] = 1 }
@@ -308,6 +335,11 @@ private final class DarwinLANCandidateSocket: @unchecked Sendable {
             return nil
         }
         return String(cString: buffer)
+    }
+
+    private static func socketAddressText(_ address: sockaddr_in) -> String {
+        let host = ipv4Text(address.sin_addr) ?? "?"
+        return "\(host):\(UInt16(bigEndian: address.sin_port))"
     }
 
     private static func isPrivateIPv4(_ address: UInt32) -> Bool {

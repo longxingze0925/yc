@@ -313,21 +313,69 @@ pub async fn accept_authorized_probe(
     if local_candidate.kind == TransportPath::LanDirect {
         validate_lan_probe_scope(&expected_peer.to_string(), local_networks)?;
     }
+    let local_endpoint = socket.local_addr().ok();
+    eprintln!(
+        "[rctl-p2p] waiting authorized probe local={:?} expected_peer={} candidate_kind={:?}",
+        local_endpoint, expected_peer, local_candidate.kind
+    );
     let mut encoded = vec![0_u8; MAX_PROBE_PACKET_BYTES + 1];
-    let (encoded_len, peer) = tokio::time::timeout(timeout, socket.recv_from(&mut encoded))
-        .await
-        .map_err(|_| BindingError::InvalidState)?
-        .map_err(|_| BindingError::InvalidEndpoint)?;
+    let (encoded_len, peer) =
+        match tokio::time::timeout(timeout, socket.recv_from(&mut encoded)).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(_)) => {
+                eprintln!(
+                    "[rctl-p2p] probe recv failed local={:?} expected_peer={}",
+                    local_endpoint, expected_peer
+                );
+                return Err(BindingError::InvalidEndpoint);
+            }
+            Err(_) => {
+                eprintln!(
+                    "[rctl-p2p] probe timeout local={:?} expected_peer={} timeout_ms={}",
+                    local_endpoint,
+                    expected_peer,
+                    timeout.as_millis()
+                );
+                return Err(BindingError::InvalidState);
+            }
+        };
     if peer != expected_peer || encoded_len > MAX_PROBE_PACKET_BYTES {
+        eprintln!(
+            "[rctl-p2p] probe peer/size mismatch local={:?} expected_peer={} actual_peer={} bytes={}",
+            local_endpoint, expected_peer, peer, encoded_len
+        );
         encoded.zeroize();
         return Err(BindingError::ProbeMalformed);
     }
-    let packet = decode_probe_packet(&encoded[..encoded_len])?;
-    replay_guard.validate(local_candidate, authorization, &packet, now_epoch_millis)?;
+    let packet = match decode_probe_packet(&encoded[..encoded_len]) {
+        Ok(packet) => packet,
+        Err(error) => {
+            eprintln!(
+                "[rctl-p2p] probe decode failed local={:?} peer={} bytes={} error={:?}",
+                local_endpoint, peer, encoded_len, error
+            );
+            encoded.zeroize();
+            return Err(error);
+        }
+    };
+    if let Err(error) =
+        replay_guard.validate(local_candidate, authorization, &packet, now_epoch_millis)
+    {
+        eprintln!(
+            "[rctl-p2p] probe authorization failed local={:?} peer={} error={:?}",
+            local_endpoint, peer, error
+        );
+        encoded.zeroize();
+        return Err(error);
+    }
     socket
         .send_to(&encoded[..encoded_len], peer)
         .await
         .map_err(|_| BindingError::InvalidEndpoint)?;
+    eprintln!(
+        "[rctl-p2p] probe echoed local={:?} peer={} bytes={}",
+        local_endpoint, peer, encoded_len
+    );
     encoded.zeroize();
     Ok(ProbedP2pSocket {
         socket,

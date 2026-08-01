@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+SYSTEM_CA=/usr/local/share/ca-certificates/rctl-remote-desktop-yc-root-ca.crt
+
+case "${1:-}" in
+    remove|deconfigure)
+        rm -f "$SYSTEM_CA"
+        update-ca-certificates
+        ;;
+esac
+
+exit 0

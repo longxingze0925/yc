@@ -570,26 +570,23 @@ pub fn sign_device_request_for_test(
 }
 
 pub fn permissions_digest(permissions: &crate::SessionPermissions) -> String {
-    let fields = [
-        ("remote_desktop", permissions.remote_desktop),
-        ("input_control", permissions.input_control),
-        ("clipboard", permissions.clipboard),
-        ("file_transfer", permissions.file_transfer),
-        ("unattended", permissions.unattended),
-        ("privacy_screen", permissions.privacy_screen),
-        ("block_local_input", permissions.block_local_input),
-        ("require_prompt", permissions.require_prompt),
-        ("allow_relay", permissions.allow_relay),
-    ];
-    let values = fields
-        .iter()
-        .map(|(name, value)| (*name, [u8::from(*value)]))
-        .collect::<Vec<_>>();
-    let refs = values
-        .iter()
-        .map(|(name, value)| (*name, value.as_slice()))
-        .collect::<Vec<_>>();
-    sha256_hex(&canonical_fields("rctl-permissions-v1", &refs))
+    // Keep the API/session digest byte-for-byte aligned with desktop/iOS.
+    // The protocol canonical form intentionally has no additional domain field.
+    let protocol_permissions = remote_protocol::SessionPermissions {
+        remote_desktop: permissions.remote_desktop,
+        input_control: permissions.input_control,
+        clipboard: permissions.clipboard,
+        file_transfer: permissions.file_transfer,
+        unattended: permissions.unattended,
+        privacy_screen: permissions.privacy_screen,
+        block_local_input: permissions.block_local_input,
+        require_prompt: permissions.require_prompt,
+        allow_relay: permissions.allow_relay,
+    };
+    let canonical = protocol_permissions
+        .canonical_bytes()
+        .expect("session permissions canonical encoding");
+    sha256_hex(&canonical)
 }
 
 pub fn canonical_fields(domain: &str, fields: &[(&str, &[u8])]) -> Vec<u8> {
@@ -779,6 +776,38 @@ mod tests {
         assert!(variants
             .iter()
             .all(|value| permissions_digest(value) != expected));
+    }
+
+    #[test]
+    fn permissions_digest_matches_remote_protocol() {
+        let permissions = crate::SessionPermissions {
+            remote_desktop: true,
+            input_control: true,
+            clipboard: true,
+            file_transfer: false,
+            unattended: false,
+            privacy_screen: false,
+            block_local_input: false,
+            require_prompt: true,
+            allow_relay: true,
+        };
+        let protocol_permissions = remote_protocol::SessionPermissions {
+            remote_desktop: permissions.remote_desktop,
+            input_control: permissions.input_control,
+            clipboard: permissions.clipboard,
+            file_transfer: permissions.file_transfer,
+            unattended: permissions.unattended,
+            privacy_screen: permissions.privacy_screen,
+            block_local_input: permissions.block_local_input,
+            require_prompt: permissions.require_prompt,
+            allow_relay: permissions.allow_relay,
+        };
+        let expected = hex_encode(&sha256(
+            &protocol_permissions
+                .canonical_bytes()
+                .expect("protocol canonical permissions"),
+        ));
+        assert_eq!(permissions_digest(&permissions), expected);
     }
 
     #[test]

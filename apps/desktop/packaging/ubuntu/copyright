@@ -1,0 +1,8 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Remote Control
+Source: https://github.com/longxingze0925/yc
+
+Files: *
+Copyright: 2026 Remote Control Project
+License: proprietary
+ This internal test build is not licensed for redistribution.

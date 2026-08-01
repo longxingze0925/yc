@@ -156,6 +156,10 @@ impl ControlledSignalRuntime {
         &self.controller_device_id
     }
 
+    pub const fn controller_public_key_ready(&self) -> bool {
+        self.controller_public_key.is_some()
+    }
+
     pub fn set_controller_public_key(
         &mut self,
         device_id: &str,

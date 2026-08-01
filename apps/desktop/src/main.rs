@@ -21,6 +21,7 @@ use remote_desktop::{
 use remote_render::RenderSurface;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -53,10 +54,16 @@ struct DesktopController {
     identity: DeviceIdentityManager,
     signal: SignalWebSocketClient,
     last_signal_state: SignalConnectionState,
+    controller_public_keys: HashMap<String, [u8; 32]>,
     controlled_signal: Option<ControlledSignalRuntime>,
+    lan_candidate_gathering_session: Option<String>,
     accepted_controlled_session: Option<SessionSnapshot>,
     pending_lan_candidate: Option<LanDirectCandidate>,
     local_candidate_authorization: Option<remote_protocol::CandidateAuthorization>,
+    pending_remote_candidate: Option<(
+        remote_protocol::ConnectionCandidateDto,
+        remote_protocol::CandidateAuthorization,
+    )>,
     controlled_p2p: Option<ControlledP2pTransport>,
     pending_quic_identity: Option<EphemeralQuicIdentity>,
     controlled_cancellation: Option<remote_transport::TransportCancellation>,
@@ -111,10 +118,13 @@ impl DesktopController {
             identity: DeviceIdentityManager::new(secret_store),
             signal: SignalWebSocketClient::default(),
             last_signal_state: SignalConnectionState::Disconnected,
+            controller_public_keys: HashMap::new(),
             controlled_signal: None,
+            lan_candidate_gathering_session: None,
             accepted_controlled_session: None,
             pending_lan_candidate: None,
             local_candidate_authorization: None,
+            pending_remote_candidate: None,
             controlled_p2p: None,
             pending_quic_identity: None,
             controlled_cancellation: None,
@@ -578,9 +588,23 @@ impl DesktopController {
     fn handle_signal_notification(&mut self, notification: SignalNotification) {
         match notification {
             SignalNotification::SessionInvite(invite) => {
+                eprintln!(
+                    "[rctl-signal] session_invite session={} status={} controller={} controlled={}",
+                    invite.session.session_id,
+                    invite.session.status,
+                    invite.session.controller_device_id,
+                    invite.session.controlled_device_id
+                );
                 self.respond_to_account_invite(invite.session)
             }
             SignalNotification::SessionAcceptAck(state) => {
+                eprintln!(
+                    "[rctl-signal] session_accept_ack session={} status={} controller={} controlled={}",
+                    state.session_id,
+                    state.status,
+                    state.session.controller_device_id,
+                    state.session.controlled_device_id
+                );
                 let Some(local) = self.model.local_device() else {
                     return;
                 };
@@ -590,13 +614,37 @@ impl DesktopController {
                     return;
                 }
                 match ControlledSignalRuntime::from_accepted(&state.session) {
-                    Ok(runtime) => {
+                    Ok(mut runtime) => {
                         let session_id = runtime.session_id().to_owned();
+                        if let Some(public_key) = self
+                            .controller_public_keys
+                            .get(runtime.controller_device_id())
+                            .copied()
+                        {
+                            let controller_device_id = runtime.controller_device_id().to_owned();
+                            if let Err(error) =
+                                runtime.set_controller_public_key(&controller_device_id, public_key)
+                            {
+                                self.model
+                                    .set_session_status(format!("主控设备身份绑定无效：{error}"));
+                                return;
+                            }
+                        }
                         self.controlled_signal = Some(runtime);
                         self.accepted_controlled_session = Some(state.session.clone());
-                        self.begin_lan_candidate_gathering(session_id);
-                        self.model
-                            .set_session_status("会话已接受；正在采集经签名的 LAN 候选");
+                        if let Err(error) = self.signal.request_online_devices() {
+                            self.model.set_session_status(format!(
+                                "会话已接受，但主控设备公钥刷新失败：{error}"
+                            ));
+                            return;
+                        }
+                        self.begin_lan_candidate_if_peer_key_ready();
+                        if self.lan_candidate_gathering_session.as_deref()
+                            != Some(session_id.as_str())
+                        {
+                            self.model
+                                .set_session_status("会话已接受；正在等待主控设备权威公钥");
+                        }
                     }
                     Err(error) => self
                         .model
@@ -604,13 +652,8 @@ impl DesktopController {
                 }
             }
             SignalNotification::OnlineDevices(devices) => {
-                let Some(runtime) = self.controlled_signal.as_mut() else {
-                    return;
-                };
+                eprintln!("[rctl-signal] online_devices count={}", devices.len());
                 for device in devices {
-                    if device.device_id != runtime.controller_device_id() {
-                        continue;
-                    }
                     let Ok(public_key) = URL_SAFE_NO_PAD.decode(device.public_key) else {
                         self.model
                             .set_session_status("主控设备公钥编码无效，已停止等待密钥交换");
@@ -621,19 +664,45 @@ impl DesktopController {
                             .set_session_status("主控设备公钥长度无效，已停止等待密钥交换");
                         return;
                     };
-                    if let Err(error) =
-                        runtime.set_controller_public_key(&device.device_id, public_key)
-                    {
-                        self.model
-                            .set_session_status(format!("主控设备身份绑定无效：{error}"));
-                    }
-                    return;
+                    self.controller_public_keys
+                        .insert(device.device_id, public_key);
                 }
+                if let Some(runtime) = self.controlled_signal.as_mut() {
+                    let controller_device_id = runtime.controller_device_id().to_owned();
+                    if let Some(public_key) = self
+                        .controller_public_keys
+                        .get(&controller_device_id)
+                        .copied()
+                    {
+                        if let Err(error) =
+                            runtime.set_controller_public_key(&controller_device_id, public_key)
+                        {
+                            self.model
+                                .set_session_status(format!("主控设备身份绑定无效：{error}"));
+                            return;
+                        }
+                    }
+                }
+                self.begin_lan_candidate_if_peer_key_ready();
             }
             SignalNotification::CandidateTokenIssued(issued) => {
+                eprintln!(
+                    "[rctl-signal] candidate_token_issued session={} device={} role={:?} candidate_id={}",
+                    issued.session_id,
+                    issued.device_id,
+                    issued.role,
+                    issued.candidate_id
+                );
                 self.handle_candidate_token_issued(issued);
             }
             SignalNotification::SessionMessage(message) => {
+                eprintln!(
+                    "[rctl-signal] session_message kind={:?} session={} from={} role={:?}",
+                    message.kind,
+                    message.session_id,
+                    message.from_device_id,
+                    message.role
+                );
                 let peer_candidate = (message.kind
                     == SessionSignalMessageKind::ConnectionCandidate)
                     .then(|| decode_peer_candidate(&message))
@@ -684,6 +753,12 @@ impl DesktopController {
             SignalNotification::SessionRejectAck(state)
             | SignalNotification::SessionCancelAck(state)
             | SignalNotification::SessionCloseAck(state) => {
+                eprintln!(
+                    "[rctl-signal] session_terminal session={} status={} reason={:?}",
+                    state.session_id,
+                    state.status,
+                    state.reason
+                );
                 if self
                     .controlled_signal
                     .as_ref()
@@ -733,6 +808,23 @@ impl DesktopController {
         });
     }
 
+    fn begin_lan_candidate_if_peer_key_ready(&mut self) {
+        let Some(runtime) = self.controlled_signal.as_ref() else {
+            return;
+        };
+        if !runtime.controller_public_key_ready() {
+            return;
+        }
+        let session_id = runtime.session_id().to_owned();
+        if self.lan_candidate_gathering_session.as_deref() == Some(session_id.as_str()) {
+            return;
+        }
+        self.lan_candidate_gathering_session = Some(session_id.clone());
+        self.begin_lan_candidate_gathering(session_id);
+        self.model
+            .set_session_status("主控设备公钥已绑定；正在采集经签名的 LAN 候选");
+    }
+
     fn refresh_controlled_transport_events(&mut self) {
         loop {
             let event = match self.transport_events.try_recv() {
@@ -763,6 +855,14 @@ impl DesktopController {
                                 continue;
                             }
                             self.pending_lan_candidate = Some(candidate);
+                            eprintln!(
+                                "[rctl-signal] lan_candidate_prepared session={} endpoint={}",
+                                session_id,
+                                self.pending_lan_candidate
+                                    .as_ref()
+                                    .map(|value| value.candidate.endpoint.as_str())
+                                    .unwrap_or("?")
+                            );
                             self.model.set_session_status(
                                 "已绑定私网 UDP socket，等待 Signal 签发 LAN candidate token",
                             );
@@ -848,8 +948,15 @@ impl DesktopController {
             return;
         }
         self.local_candidate_authorization = Some(authorization);
-        self.model
-            .set_session_status("LAN 候选与单会话 QUIC 证书已发送；等待主控授权探测");
+        eprintln!(
+            "[rctl-signal] controlled_candidate_sent session={} endpoint={}",
+            runtime.session_id(),
+            candidate.candidate.endpoint
+        );
+        if !self.try_begin_authorized_probe() {
+            self.model
+                .set_session_status("LAN 候选与单会话 QUIC 证书已发送；等待主控授权探测");
+        }
     }
 
     fn begin_authorized_probe(
@@ -857,27 +964,53 @@ impl DesktopController {
         remote_candidate: remote_protocol::ConnectionCandidateDto,
         remote_authorization: remote_protocol::CandidateAuthorization,
     ) {
-        let (Some(local), Some(local_authorization), Some(runtime)) = (
-            self.pending_lan_candidate.take(),
-            self.local_candidate_authorization.take(),
-            self.controlled_signal.as_ref(),
-        ) else {
+        self.pending_remote_candidate = Some((remote_candidate, remote_authorization));
+        if !self.try_begin_authorized_probe() {
             self.model
-                .set_session_status("主控候选已验证，但本地候选授权尚未完成；未启动 UDP 探测");
-            return;
+                .set_session_status("已缓存主控授权候选；等待本地候选 token 后自动启动 UDP 探测");
+        }
+    }
+
+    fn try_begin_authorized_probe(&mut self) -> bool {
+        let Some((local, local_authorization, (remote_candidate, remote_authorization))) =
+            take_probe_materials_if_ready(
+                &mut self.pending_lan_candidate,
+                &mut self.local_candidate_authorization,
+                &mut self.pending_remote_candidate,
+            )
+        else {
+            return false;
+        };
+        let Some(runtime) = self.controlled_signal.as_ref() else {
+            self.pending_lan_candidate = Some(local);
+            self.local_candidate_authorization = Some(local_authorization);
+            self.pending_remote_candidate = Some((remote_candidate, remote_authorization));
+            return false;
         };
         let session_id = runtime.session_id().to_owned();
+        eprintln!(
+            "[rctl-signal] authorized_probe_start session={} local={} remote={}",
+            session_id,
+            local.candidate.endpoint,
+            remote_candidate.endpoint
+        );
         let permissions_digest =
             match accepted_permissions_digest(self.accepted_controlled_session.as_ref()) {
                 Ok(digest) => digest,
                 Err(error) => {
                     self.model.set_session_status(error);
-                    return;
+                    return true;
                 }
             };
         self.pending_quic_identity = Some(local.quic_identity.clone());
         let sender = self.transport_event_tx.clone();
         self.transport_runtime.spawn(async move {
+            eprintln!(
+                "[rctl-transport] constructing session={} local={} remote={}",
+                session_id,
+                local.candidate.endpoint,
+                remote_candidate.endpoint
+            );
             let transport = match ControlledP2pTransport::new(
                 local.socket,
                 local.candidate,
@@ -888,11 +1021,29 @@ impl DesktopController {
                 permissions_digest,
                 now_epoch_millis(),
             ) {
-                Ok(mut transport) => match transport.accept_probe(now_epoch_millis()).await {
-                    Ok(_) => Ok(transport),
-                    Err(error) => Err(error.to_string()),
-                },
-                Err(error) => Err(error.to_string()),
+                Ok(mut transport) => {
+                    eprintln!("[rctl-transport] constructed session={session_id}");
+                    match transport.accept_probe(now_epoch_millis()).await {
+                        Ok(_) => {
+                            eprintln!("[rctl-transport] probe accepted session={session_id}");
+                            Ok(transport)
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[rctl-transport] probe failed session={} error={}",
+                                session_id, error
+                            );
+                            Err(error.to_string())
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[rctl-transport] construction failed session={} error={}",
+                        session_id, error
+                    );
+                    Err(error.to_string())
+                }
             };
             let _ = sender.send(ControlledTransportEvent::ProbeSelected {
                 session_id,
@@ -901,6 +1052,7 @@ impl DesktopController {
         });
         self.model
             .set_session_status("已收到并校验主控候选；正在后台等待授权 UDP probe");
+        true
     }
 
     fn begin_controlled_key_exchange(&mut self, transport: ControlledP2pTransport) {
@@ -1001,7 +1153,9 @@ impl DesktopController {
             transport.close();
         }
         self.pending_lan_candidate.take();
+        self.lan_candidate_gathering_session.take();
         self.local_candidate_authorization.take();
+        self.pending_remote_candidate.take();
         self.pending_quic_identity.take();
         self.accepted_controlled_session.take();
         if let Some(runtime) = self.controlled_signal.as_mut() {
@@ -1119,6 +1273,23 @@ fn decode_peer_candidate(
     Ok((payload.candidate, payload.authorization))
 }
 
+fn take_probe_materials_if_ready<A, B, C>(
+    local_candidate: &mut Option<A>,
+    local_authorization: &mut Option<B>,
+    remote_candidate: &mut Option<C>,
+) -> Option<(A, B, C)> {
+    if local_candidate.is_none() || local_authorization.is_none() || remote_candidate.is_none() {
+        return None;
+    }
+    Some((
+        local_candidate.take().expect("local candidate checked"),
+        local_authorization
+            .take()
+            .expect("local authorization checked"),
+        remote_candidate.take().expect("remote candidate checked"),
+    ))
+}
+
 fn accepted_permissions_digest(session: Option<&SessionSnapshot>) -> Result<[u8; 32], String> {
     let session = session.ok_or_else(|| "会话权限上下文缺失".to_owned())?;
     let permissions: remote_protocol::SessionPermissions = serde_json::from_value(
@@ -1218,14 +1389,19 @@ fn registration_metadata(model: &AppModel) -> DeviceRegistrationMetadata {
 }
 
 fn signal_capabilities(model: &AppModel) -> serde_json::Value {
+    let platform = model.platform();
     serde_json::json!({
         "platform": match current_platform_kind() { Platform::Windows => "windows", Platform::Ubuntu => "ubuntu", Platform::Ios => "ios" },
         "os_version": current_os_version(model),
         "arch": match current_architecture() { Architecture::X86_64 => "x86_64", Architecture::Aarch64 => "aarch64" },
         "transport": ["quic", "relay"],
-        "native_capture": false,
-        "native_input": false
+        "native_capture": backend_is_available(&platform.capture_status),
+        "native_input": backend_is_available(&platform.input_status)
     })
+}
+
+fn backend_is_available(status: &str) -> bool {
+    !status.starts_with("unsupported:")
 }
 
 #[cfg(target_os = "windows")]
@@ -1261,6 +1437,9 @@ fn sync_ui(ui: &AppWindow, controller: &DesktopController) {
     ui.set_render_status(platform.render_status.clone().into());
     ui.set_input_status(platform.input_status.clone().into());
     ui.set_privacy_status(platform.privacy_status.clone().into());
+    ui.set_capture_available(backend_is_available(&platform.capture_status));
+    ui.set_input_available(backend_is_available(&platform.input_status));
+    ui.set_controlled_active(controller.controlled_cancellation.is_some());
     ui.set_account_label(model.account().unwrap_or_default().into());
     ui.set_login_status(model.login_status().into());
     ui.set_mfa_required(model.mfa_required());
@@ -1329,6 +1508,23 @@ mod controlled_signal_tests {
     use super::*;
 
     #[test]
+    fn signal_capabilities_report_the_detected_native_backends() {
+        let model = AppModel::new(remote_desktop::PlatformSnapshot {
+            platform_label: "Ubuntu Desktop 26.04 LTS".into(),
+            local_device_name: "Ubuntu Desktop".into(),
+            session_kind: "Wayland".into(),
+            capture_status: "PipeWire + xdg-desktop-portal ScreenCast: 已接入".into(),
+            render_status: "unsupported: controller renderer is not installed".into(),
+            input_status: "xdg-desktop-portal RemoteDesktop: 已接入".into(),
+            privacy_status: "unsupported: privacy mode is not installed".into(),
+        });
+        let capabilities = signal_capabilities(&model);
+        assert_eq!(capabilities["native_capture"], true);
+        assert_eq!(capabilities["native_input"], true);
+        assert!(!backend_is_available(&model.platform().render_status));
+    }
+
+    #[test]
     fn fake_signal_candidate_is_decoded_only_when_the_exact_pair_is_present() {
         let message = SessionPeerMessage {
             kind: SessionSignalMessageKind::ConnectionCandidate,
@@ -1368,11 +1564,39 @@ mod controlled_signal_tests {
         };
         assert!(decode_peer_candidate(&malformed).is_err());
     }
+
+    #[test]
+    fn early_remote_candidate_is_not_consumed_before_local_token_arrives() {
+        let mut local_candidate = Some("local-socket");
+        let mut local_authorization = None::<&str>;
+        let mut remote_candidate = Some("ios-candidate");
+
+        assert!(take_probe_materials_if_ready(
+            &mut local_candidate,
+            &mut local_authorization,
+            &mut remote_candidate,
+        )
+        .is_none());
+        assert_eq!(local_candidate, Some("local-socket"));
+        assert_eq!(remote_candidate, Some("ios-candidate"));
+
+        local_authorization = Some("local-token");
+        assert_eq!(
+            take_probe_materials_if_ready(
+                &mut local_candidate,
+                &mut local_authorization,
+                &mut remote_candidate,
+            ),
+            Some(("local-socket", "local-token", "ios-candidate"))
+        );
+    }
 }
 
 fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     let controller = Rc::new(RefCell::new(DesktopController::new()));
+    let runtime_handle = controller.borrow().transport_runtime.handle().clone();
+    let _runtime_guard = runtime_handle.enter();
     sync_ui(&ui, &controller.borrow());
 
     let weak = ui.as_weak();

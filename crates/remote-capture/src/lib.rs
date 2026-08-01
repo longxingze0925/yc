@@ -8,8 +8,9 @@ mod windows;
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    LinuxDesktopSession, PortalCapability, PortalSessionState, UbuntuWaylandPortalCapturer,
-    UbuntuX11Capturer, WaylandPortalStatus, X11Capturer,
+    LinuxDesktopSession, PortalCapability, PortalInputError, PortalSessionState,
+    UbuntuWaylandPortalCapturer, UbuntuWaylandPortalInput, UbuntuX11Capturer, WaylandPortalStatus,
+    X11Capturer,
 };
 #[cfg(target_os = "windows")]
 pub use windows::WindowsCapturer;

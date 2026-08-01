@@ -1,17 +1,24 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use ashpd::desktop::remote_desktop::{
+    DeviceType, KeyState, NotifyKeyboardKeycodeOptions, NotifyKeyboardKeysymOptions,
+    NotifyPointerAxisOptions, NotifyPointerButtonOptions, NotifyPointerMotionAbsoluteOptions,
+    RemoteDesktop, SelectDevicesOptions,
+};
 use ashpd::desktop::screencast::{
     CursorMode, Screencast, SelectSourcesOptions, SourceType, Stream as PortalStream,
 };
 use ashpd::desktop::{PersistMode, ResponseError, Session};
+use futures_util::StreamExt;
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
+use tokio::sync::mpsc as tokio_mpsc;
 use zbus::blocking::{Connection, Proxy};
 
 use crate::{
@@ -22,11 +29,18 @@ use crate::{
 const PORTAL_DESTINATION: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const SCREEN_CAST_INTERFACE: &str = "org.freedesktop.portal.ScreenCast";
+const REMOTE_DESKTOP_INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
 const SOURCE_TYPE_MONITOR: u32 = 1;
 const CURSOR_MODE_HIDDEN: u32 = 1;
 const CURSOR_MODE_EMBEDDED: u32 = 2;
+const DEVICE_TYPE_KEYBOARD: u32 = 1;
+const DEVICE_TYPE_POINTER: u32 = 2;
 const MAX_PORTAL_STREAMS: usize = 16;
 const PIPEWIRE_START_TIMEOUT: Duration = Duration::from_secs(10);
+const PORTAL_INPUT_TIMEOUT: Duration = Duration::from_secs(5);
+
+static NEXT_PORTAL_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_PORTAL_INPUT: OnceLock<Mutex<Option<ActivePortalInput>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PortalCapability {
@@ -35,6 +49,8 @@ pub enum PortalCapability {
         version: u32,
         source_types: u32,
         cursor_modes: u32,
+        remote_desktop_version: u32,
+        device_types: u32,
     },
     Unavailable {
         reason: String,
@@ -55,6 +71,224 @@ pub enum PortalSessionState {
 pub struct WaylandPortalStatus {
     pub capability: PortalCapability,
     pub session: PortalSessionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortalInputError {
+    SessionInactive,
+    InvalidInput(&'static str),
+    PortalFailure(String),
+    TimedOut,
+}
+
+impl std::fmt::Display for PortalInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionInactive => {
+                formatter.write_str("Wayland RemoteDesktop portal session is inactive")
+            }
+            Self::InvalidInput(reason) => {
+                write!(formatter, "Wayland portal input is invalid: {reason}")
+            }
+            Self::PortalFailure(reason) => write!(
+                formatter,
+                "Wayland RemoteDesktop portal input failed: {reason}"
+            ),
+            Self::TimedOut => formatter.write_str("Wayland RemoteDesktop portal input timed out"),
+        }
+    }
+}
+
+impl std::error::Error for PortalInputError {}
+
+#[derive(Debug, Clone, Default)]
+pub struct UbuntuWaylandPortalInput;
+
+impl UbuntuWaylandPortalInput {
+    pub fn is_active(&self) -> bool {
+        active_portal_input()
+            .lock()
+            .ok()
+            .and_then(|active| {
+                active
+                    .as_ref()
+                    .map(|active| active.active.load(Ordering::Acquire))
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn keycode(&self, keycode: i32, pressed: bool) -> Result<(), PortalInputError> {
+        if keycode <= 0 {
+            return Err(PortalInputError::InvalidInput(
+                "evdev keycode must be positive",
+            ));
+        }
+        self.dispatch(|response| PortalCommand::Keycode {
+            keycode,
+            pressed,
+            response,
+        })
+    }
+
+    pub fn button(&self, button: i32, pressed: bool) -> Result<(), PortalInputError> {
+        if button <= 0 {
+            return Err(PortalInputError::InvalidInput(
+                "evdev pointer button must be positive",
+            ));
+        }
+        self.dispatch(|response| PortalCommand::Button {
+            button,
+            pressed,
+            response,
+        })
+    }
+
+    pub fn move_pointer(&self, x_norm: f64, y_norm: f64) -> Result<(), PortalInputError> {
+        if !x_norm.is_finite()
+            || !y_norm.is_finite()
+            || !(0.0..=1.0).contains(&x_norm)
+            || !(0.0..=1.0).contains(&y_norm)
+        {
+            return Err(PortalInputError::InvalidInput(
+                "pointer coordinates must be finite normalized values",
+            ));
+        }
+        self.dispatch(|response| PortalCommand::PointerMove {
+            x_norm,
+            y_norm,
+            response,
+        })
+    }
+
+    pub fn wheel(&self, delta_x: f64, delta_y: f64) -> Result<(), PortalInputError> {
+        if !delta_x.is_finite() || !delta_y.is_finite() {
+            return Err(PortalInputError::InvalidInput(
+                "wheel deltas must be finite",
+            ));
+        }
+        self.dispatch(|response| PortalCommand::PointerAxis {
+            delta_x,
+            delta_y,
+            response,
+        })
+    }
+
+    pub fn text_commit(&self, text: &str) -> Result<(), PortalInputError> {
+        if text.is_empty() {
+            return Err(PortalInputError::InvalidInput("text commit is empty"));
+        }
+        self.dispatch(|response| PortalCommand::TextCommit {
+            text: text.to_owned(),
+            response,
+        })
+    }
+
+    pub fn release_all(&self) -> Result<(), PortalInputError> {
+        if !self.is_active() {
+            return Ok(());
+        }
+        self.dispatch(|response| PortalCommand::ReleaseAll { response })
+    }
+
+    fn dispatch(
+        &self,
+        command: impl FnOnce(mpsc::SyncSender<PortalCommandResult>) -> PortalCommand,
+    ) -> Result<(), PortalInputError> {
+        let active = active_portal_input()
+            .lock()
+            .map_err(|_| PortalInputError::SessionInactive)?
+            .as_ref()
+            .filter(|active| active.active.load(Ordering::Acquire))
+            .cloned()
+            .ok_or(PortalInputError::SessionInactive)?;
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        active
+            .sender
+            .send(command(response_sender))
+            .map_err(|_| PortalInputError::SessionInactive)?;
+        response_receiver
+            .recv_timeout(PORTAL_INPUT_TIMEOUT)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => PortalInputError::TimedOut,
+                mpsc::RecvTimeoutError::Disconnected => PortalInputError::SessionInactive,
+            })?
+            .map_err(PortalInputError::PortalFailure)
+    }
+}
+
+type PortalCommandResult = Result<(), String>;
+
+#[derive(Clone)]
+struct ActivePortalInput {
+    session_id: u64,
+    sender: tokio_mpsc::UnboundedSender<PortalCommand>,
+    active: Arc<AtomicBool>,
+}
+
+fn active_portal_input() -> &'static Mutex<Option<ActivePortalInput>> {
+    ACTIVE_PORTAL_INPUT.get_or_init(|| Mutex::new(None))
+}
+
+fn register_portal_input(active: ActivePortalInput) -> CaptureResult<()> {
+    let mut slot = active_portal_input()
+        .lock()
+        .map_err(|_| backend_failure("register portal input", "active input lock was poisoned"))?;
+    if slot
+        .as_ref()
+        .is_some_and(|current| current.active.load(Ordering::Acquire))
+    {
+        return Err(CaptureError::BackendFailure {
+            backend: CaptureBackend::UbuntuWaylandPipeWire,
+            operation: "register portal input",
+            reason: "another Wayland RemoteDesktop portal session is already active".into(),
+        });
+    }
+    *slot = Some(active);
+    Ok(())
+}
+
+fn unregister_portal_input(session_id: u64) {
+    if let Ok(mut slot) = active_portal_input().lock() {
+        if slot
+            .as_ref()
+            .is_some_and(|active| active.session_id == session_id)
+        {
+            *slot = None;
+        }
+    }
+}
+
+enum PortalCommand {
+    Keycode {
+        keycode: i32,
+        pressed: bool,
+        response: mpsc::SyncSender<PortalCommandResult>,
+    },
+    Button {
+        button: i32,
+        pressed: bool,
+        response: mpsc::SyncSender<PortalCommandResult>,
+    },
+    PointerMove {
+        x_norm: f64,
+        y_norm: f64,
+        response: mpsc::SyncSender<PortalCommandResult>,
+    },
+    PointerAxis {
+        delta_x: f64,
+        delta_y: f64,
+        response: mpsc::SyncSender<PortalCommandResult>,
+    },
+    TextCommit {
+        text: String,
+        response: mpsc::SyncSender<PortalCommandResult>,
+    },
+    ReleaseAll {
+        response: mpsc::SyncSender<PortalCommandResult>,
+    },
+    Close {
+        response: mpsc::SyncSender<PortalCommandResult>,
+    },
 }
 
 pub struct UbuntuWaylandPortalCapturer {
@@ -103,7 +337,7 @@ impl UbuntuWaylandPortalCapturer {
     }
 
     /// Queries the real desktop portal over the user's D-Bus session without
-    /// opening a ScreenCast session or triggering a permission prompt.
+    /// opening a RemoteDesktop/ScreenCast session or triggering a permission prompt.
     pub fn probe_portal(&mut self) -> CaptureResult<WaylandPortalStatus> {
         let result = self.probe_portal_inner();
         match result {
@@ -125,22 +359,35 @@ impl UbuntuWaylandPortalCapturer {
 
     fn probe_portal_inner(&self) -> CaptureResult<WaylandPortalStatus> {
         let connection = Connection::session().map_err(|error| portal_failure("connect", error))?;
-        let proxy = Proxy::new(
+        let screencast_proxy = Proxy::new(
             &connection,
             PORTAL_DESTINATION,
             PORTAL_PATH,
             SCREEN_CAST_INTERFACE,
         )
         .map_err(|error| portal_failure("create ScreenCast proxy", error))?;
-        let version = proxy
+        let version = screencast_proxy
             .get_property::<u32>("version")
-            .map_err(|error| portal_failure("read portal version", error))?;
-        let source_types = proxy
+            .map_err(|error| portal_failure("read ScreenCast portal version", error))?;
+        let source_types = screencast_proxy
             .get_property::<u32>("AvailableSourceTypes")
             .map_err(|error| portal_failure("read available source types", error))?;
-        let cursor_modes = proxy
+        let cursor_modes = screencast_proxy
             .get_property::<u32>("AvailableCursorModes")
             .map_err(|error| portal_failure("read available cursor modes", error))?;
+        let remote_desktop_proxy = Proxy::new(
+            &connection,
+            PORTAL_DESTINATION,
+            PORTAL_PATH,
+            REMOTE_DESKTOP_INTERFACE,
+        )
+        .map_err(|error| portal_failure("create RemoteDesktop proxy", error))?;
+        let remote_desktop_version = remote_desktop_proxy
+            .get_property::<u32>("version")
+            .map_err(|error| portal_failure("read RemoteDesktop portal version", error))?;
+        let device_types = remote_desktop_proxy
+            .get_property::<u32>("AvailableDeviceTypes")
+            .map_err(|error| portal_failure("read available remote desktop devices", error))?;
 
         if source_types & SOURCE_TYPE_MONITOR == 0 {
             return Err(CaptureError::Unsupported {
@@ -158,12 +405,23 @@ impl UbuntuWaylandPortalCapturer {
                 ),
             });
         }
+        let required_devices = DEVICE_TYPE_KEYBOARD | DEVICE_TYPE_POINTER;
+        if device_types & required_devices != required_devices {
+            return Err(CaptureError::Unsupported {
+                backend: CaptureBackend::UbuntuWaylandPipeWire,
+                reason: format!(
+                    "the compositor RemoteDesktop portal exposes device mask {device_types:#x} without keyboard and pointer control"
+                ),
+            });
+        }
 
         Ok(WaylandPortalStatus {
             capability: PortalCapability::Available {
                 version,
                 source_types,
                 cursor_modes,
+                remote_desktop_version,
+                device_types,
             },
             session: PortalSessionState::ReadyForUserAuthorization,
         })
@@ -205,6 +463,14 @@ impl ScreenCapturer for UbuntuWaylandPortalCapturer {
     }
 
     fn authorization_state(&self) -> CaptureAuthorizationState {
+        if matches!(self.status.session, PortalSessionState::Active { .. })
+            && self
+                .portal_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_active())
+        {
+            return CaptureAuthorizationState::Unavailable;
+        }
         match (&self.status.capability, &self.status.session) {
             (PortalCapability::NotChecked, _) => CaptureAuthorizationState::NotChecked,
             (PortalCapability::Unavailable { .. }, _) => CaptureAuthorizationState::Unavailable,
@@ -273,6 +539,13 @@ impl ScreenCapturer for UbuntuWaylandPortalCapturer {
         if self.state != CaptureState::Running {
             return Err(CaptureError::InvalidState);
         }
+        if self
+            .portal_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_active())
+        {
+            return Err(CaptureError::BackendUnavailable);
+        }
         self.pipewire_consumer
             .as_ref()
             .ok_or(CaptureError::InvalidState)?
@@ -282,6 +555,14 @@ impl ScreenCapturer for UbuntuWaylandPortalCapturer {
     fn capture_frame(&mut self, monitor_id: u32) -> CaptureResult<CapturedFrame> {
         if self.state != CaptureState::Running {
             return Err(CaptureError::InvalidState);
+        }
+        if self
+            .portal_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_active())
+        {
+            let _ = self.stop();
+            return Err(CaptureError::BackendUnavailable);
         }
         self.pipewire_consumer
             .as_ref()
@@ -374,60 +655,119 @@ impl PortalStreamDescriptor {
 }
 
 struct PortalWorker {
-    close_sender: Option<mpsc::Sender<()>>,
+    session_id: u64,
+    command_sender: Option<tokio_mpsc::UnboundedSender<PortalCommand>>,
     join_handle: Option<JoinHandle<Result<(), String>>>,
+    active: Arc<AtomicBool>,
 }
 
 impl PortalWorker {
     fn start(
         cursor_mode: CursorMode,
     ) -> CaptureResult<(Self, OwnedFd, Vec<PortalStreamDescriptor>)> {
+        let session_id = NEXT_PORTAL_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let (setup_sender, setup_receiver) = mpsc::sync_channel(1);
-        let (close_sender, close_receiver) = mpsc::channel();
+        let (command_sender, command_receiver) = tokio_mpsc::unbounded_channel();
+        let active = Arc::new(AtomicBool::new(true));
+        let worker_active = Arc::clone(&active);
         let join_handle = thread::Builder::new()
             .name("remote-capture-portal".into())
-            .spawn(move || portal_thread(cursor_mode, setup_sender, close_receiver))
+            .spawn(move || {
+                portal_thread(
+                    session_id,
+                    cursor_mode,
+                    setup_sender,
+                    command_receiver,
+                    worker_active,
+                )
+            })
             .map_err(|error| backend_failure("spawn portal worker", error))?;
 
         match setup_receiver.recv() {
-            Ok(Ok((remote_fd, streams))) => Ok((
-                Self {
-                    close_sender: Some(close_sender),
+            Ok(Ok((remote_fd, streams))) => {
+                let mut worker = Self {
+                    session_id,
+                    command_sender: Some(command_sender.clone()),
                     join_handle: Some(join_handle),
-                },
-                remote_fd,
-                streams,
-            )),
+                    active: Arc::clone(&active),
+                };
+                if let Err(error) = register_portal_input(ActivePortalInput {
+                    session_id,
+                    sender: command_sender,
+                    active,
+                }) {
+                    let _ = worker.stop();
+                    return Err(error);
+                }
+                Ok((worker, remote_fd, streams))
+            }
             Ok(Err(failure)) => {
+                active.store(false, Ordering::Release);
                 let _ = join_handle.join();
                 Err(failure.into_capture_error())
             }
             Err(error) => {
+                active.store(false, Ordering::Release);
                 let _ = join_handle.join();
                 Err(backend_failure("receive portal setup", error))
             }
         }
     }
 
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
     fn stop(&mut self) -> CaptureResult<()> {
-        if let Some(sender) = self.close_sender.take() {
-            let _ = sender.send(());
-        }
-        let Some(join_handle) = self.join_handle.take() else {
-            return Ok(());
+        unregister_portal_input(self.session_id);
+        let command_result = if self.active.swap(false, Ordering::AcqRel) {
+            self.command_sender.take().map_or(Ok(()), |sender| {
+                let (response_sender, response_receiver) = mpsc::sync_channel(1);
+                if sender
+                    .send(PortalCommand::Close {
+                        response: response_sender,
+                    })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                match response_receiver.recv_timeout(PORTAL_INPUT_TIMEOUT) {
+                    Ok(result) => result.map_err(|reason| CaptureError::BackendFailure {
+                        backend: CaptureBackend::UbuntuWaylandPipeWire,
+                        operation: "close portal session",
+                        reason,
+                    }),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => Err(backend_failure(
+                        "close portal session",
+                        "portal worker did not acknowledge close before the timeout",
+                    )),
+                }
+            })
+        } else {
+            self.command_sender.take();
+            Ok(())
         };
-        match join_handle.join() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(reason)) => Err(CaptureError::BackendFailure {
-                backend: CaptureBackend::UbuntuWaylandPipeWire,
-                operation: "close portal session",
-                reason,
-            }),
-            Err(_) => Err(CaptureError::BackendFailure {
-                backend: CaptureBackend::UbuntuWaylandPipeWire,
-                operation: "join portal worker",
-                reason: "portal worker panicked".into(),
-            }),
+        let join_result = if let Some(join_handle) = self.join_handle.take() {
+            match join_handle.join() {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(reason)) => Err(CaptureError::BackendFailure {
+                    backend: CaptureBackend::UbuntuWaylandPipeWire,
+                    operation: "close portal session",
+                    reason,
+                }),
+                Err(_) => Err(CaptureError::BackendFailure {
+                    backend: CaptureBackend::UbuntuWaylandPipeWire,
+                    operation: "join portal worker",
+                    reason: "portal worker panicked".into(),
+                }),
+            }
+        } else {
+            Ok(())
+        };
+        match (command_result, join_result) {
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
         }
     }
 }
@@ -463,7 +803,7 @@ impl PortalStartFailure {
             Self::Denied => CaptureError::PermissionDenied,
             Self::Failed(reason) => CaptureError::BackendFailure {
                 backend: CaptureBackend::UbuntuWaylandPipeWire,
-                operation: "authorize portal ScreenCast session",
+                operation: "authorize portal RemoteDesktop session",
                 reason,
             },
         }
@@ -471,51 +811,73 @@ impl PortalStartFailure {
 }
 
 fn portal_thread(
+    session_id: u64,
     cursor_mode: CursorMode,
     setup_sender: mpsc::SyncSender<
         Result<(OwnedFd, Vec<PortalStreamDescriptor>), PortalStartFailure>,
     >,
-    close_receiver: mpsc::Receiver<()>,
+    command_receiver: tokio_mpsc::UnboundedReceiver<PortalCommand>,
+    active: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
     let opened = runtime.block_on(open_portal_session(cursor_mode));
-    let (proxy, session, remote_fd, streams) = match opened {
+    let (remote_desktop, screencast, session, remote_fd, streams) = match opened {
         Ok(opened) => opened,
         Err(error) => {
+            active.store(false, Ordering::Release);
             let _ = setup_sender.send(Err(PortalStartFailure::from_error(error)));
             return Ok(());
         }
     };
+    let input_target = PortalInputTarget::from_streams(&streams);
     if setup_sender.send(Ok((remote_fd, streams))).is_err() {
+        active.store(false, Ordering::Release);
         return runtime
             .block_on(session.close())
             .map_err(|error| error.to_string());
     }
 
-    let _ = close_receiver.recv();
-    let close_result = runtime.block_on(session.close());
-    drop(proxy);
-    close_result.map_err(|error| error.to_string())
+    let result = runtime.block_on(run_portal_session(
+        &remote_desktop,
+        &session,
+        input_target,
+        command_receiver,
+    ));
+    active.store(false, Ordering::Release);
+    unregister_portal_input(session_id);
+    drop(screencast);
+    result
 }
 
 async fn open_portal_session(
     cursor_mode: CursorMode,
 ) -> Result<
     (
+        RemoteDesktop,
         Screencast,
-        Session<Screencast>,
+        Session<RemoteDesktop>,
         OwnedFd,
         Vec<PortalStreamDescriptor>,
     ),
     ashpd::Error,
 > {
-    let proxy = Screencast::new().await?;
-    let session = proxy.create_session(Default::default()).await?;
+    let remote_desktop = RemoteDesktop::new().await?;
+    let screencast = Screencast::new().await?;
+    let session = remote_desktop.create_session(Default::default()).await?;
     let open_result = async {
-        proxy
+        remote_desktop
+            .select_devices(
+                &session,
+                SelectDevicesOptions::default()
+                    .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
+                    .set_persist_mode(PersistMode::DoNot),
+            )
+            .await?
+            .response()?;
+        screencast
             .select_sources(
                 &session,
                 SelectSourcesOptions::default()
@@ -526,10 +888,17 @@ async fn open_portal_session(
             )
             .await?
             .response()?;
-        let response = proxy
+        let response = remote_desktop
             .start(&session, None, Default::default())
             .await?
             .response()?;
+        let required_devices = DeviceType::Keyboard | DeviceType::Pointer;
+        if !response.devices().contains(required_devices) {
+            return Err(ashpd::Error::IO(std::io::Error::other(format!(
+                "the user-authorized portal session omitted required input devices: {:?}",
+                response.devices()
+            ))));
+        }
         let streams = response
             .streams()
             .iter()
@@ -537,7 +906,7 @@ async fn open_portal_session(
             .map(|(index, stream)| PortalStreamDescriptor::from_portal(stream, index))
             .collect::<CaptureResult<Vec<_>>>()
             .map_err(|error| ashpd::Error::IO(std::io::Error::other(error)))?;
-        let remote_fd = proxy
+        let remote_fd = screencast
             .open_pipe_wire_remote(&session, Default::default())
             .await?;
         Ok((remote_fd, streams))
@@ -545,12 +914,299 @@ async fn open_portal_session(
     .await;
 
     match open_result {
-        Ok((remote_fd, streams)) => Ok((proxy, session, remote_fd, streams)),
+        Ok((remote_fd, streams)) => Ok((remote_desktop, screencast, session, remote_fd, streams)),
         Err(error) => {
             let _ = session.close().await;
             Err(error)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PortalInputTarget {
+    stream_id: u32,
+    width: u32,
+    height: u32,
+}
+
+impl PortalInputTarget {
+    fn from_streams(streams: &[PortalStreamDescriptor]) -> Option<Self> {
+        let stream = streams
+            .iter()
+            .find(|stream| stream.is_primary)
+            .or_else(|| streams.first())?;
+        let (width, height) = stream.portal_size?;
+        Some(Self {
+            stream_id: stream.monitor_id,
+            width,
+            height,
+        })
+    }
+
+    fn coordinates(self, x_norm: f64, y_norm: f64) -> (f64, f64) {
+        (
+            x_norm * f64::from(self.width.saturating_sub(1)),
+            y_norm * f64::from(self.height.saturating_sub(1)),
+        )
+    }
+}
+
+#[derive(Default)]
+struct PortalPressedInputs {
+    keycodes: HashSet<i32>,
+    keysyms: HashSet<i32>,
+    buttons: HashSet<i32>,
+}
+
+async fn run_portal_session(
+    remote_desktop: &RemoteDesktop,
+    session: &Session<RemoteDesktop>,
+    input_target: Option<PortalInputTarget>,
+    mut command_receiver: tokio_mpsc::UnboundedReceiver<PortalCommand>,
+) -> Result<(), String> {
+    let mut closed = session
+        .receive_closed()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut pressed = PortalPressedInputs::default();
+    loop {
+        tokio::select! {
+            _ = closed.next() => {
+                return Ok(());
+            }
+            command = command_receiver.recv() => {
+                let Some(command) = command else {
+                    let _ = release_portal_inputs(remote_desktop, session, &mut pressed).await;
+                    return session.close().await.map_err(|error| error.to_string());
+                };
+                match command {
+                    PortalCommand::Keycode { keycode, pressed: is_pressed, response } => {
+                        let result = notify_portal_keycode(
+                            remote_desktop,
+                            session,
+                            &mut pressed,
+                            keycode,
+                            is_pressed,
+                        ).await;
+                        let _ = response.send(result);
+                    }
+                    PortalCommand::Button { button, pressed: is_pressed, response } => {
+                        let result = notify_portal_button(
+                            remote_desktop,
+                            session,
+                            &mut pressed,
+                            button,
+                            is_pressed,
+                        ).await;
+                        let _ = response.send(result);
+                    }
+                    PortalCommand::PointerMove { x_norm, y_norm, response } => {
+                        let result = match input_target {
+                            Some(target) => {
+                                let (x, y) = target.coordinates(x_norm, y_norm);
+                                remote_desktop
+                                    .notify_pointer_motion_absolute(
+                                        session,
+                                        target.stream_id,
+                                        x,
+                                        y,
+                                        NotifyPointerMotionAbsoluteOptions::default(),
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            }
+                            None => Err("the portal did not provide logical monitor dimensions for absolute pointer input".into()),
+                        };
+                        let _ = response.send(result);
+                    }
+                    PortalCommand::PointerAxis { delta_x, delta_y, response } => {
+                        let result = remote_desktop
+                            .notify_pointer_axis(
+                                session,
+                                delta_x,
+                                delta_y,
+                                NotifyPointerAxisOptions::default().set_finish(true),
+                            )
+                            .await
+                            .map_err(|error| error.to_string());
+                        let _ = response.send(result);
+                    }
+                    PortalCommand::TextCommit { text, response } => {
+                        let result = notify_portal_text(
+                            remote_desktop,
+                            session,
+                            &mut pressed,
+                            &text,
+                        ).await;
+                        let _ = response.send(result);
+                    }
+                    PortalCommand::ReleaseAll { response } => {
+                        let result = release_portal_inputs(remote_desktop, session, &mut pressed).await;
+                        let _ = response.send(result);
+                    }
+                    PortalCommand::Close { response } => {
+                        let release_result = release_portal_inputs(remote_desktop, session, &mut pressed).await;
+                        let close_result = session.close().await.map_err(|error| error.to_string());
+                        let result = release_result.and(close_result);
+                        let _ = response.send(result);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn notify_portal_keycode(
+    remote_desktop: &RemoteDesktop,
+    session: &Session<RemoteDesktop>,
+    pressed: &mut PortalPressedInputs,
+    keycode: i32,
+    is_pressed: bool,
+) -> PortalCommandResult {
+    remote_desktop
+        .notify_keyboard_keycode(
+            session,
+            keycode,
+            if is_pressed {
+                KeyState::Pressed
+            } else {
+                KeyState::Released
+            },
+            NotifyKeyboardKeycodeOptions::default(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if is_pressed {
+        pressed.keycodes.insert(keycode);
+    } else {
+        pressed.keycodes.remove(&keycode);
+    }
+    Ok(())
+}
+
+async fn notify_portal_button(
+    remote_desktop: &RemoteDesktop,
+    session: &Session<RemoteDesktop>,
+    pressed: &mut PortalPressedInputs,
+    button: i32,
+    is_pressed: bool,
+) -> PortalCommandResult {
+    remote_desktop
+        .notify_pointer_button(
+            session,
+            button,
+            if is_pressed {
+                KeyState::Pressed
+            } else {
+                KeyState::Released
+            },
+            NotifyPointerButtonOptions::default(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if is_pressed {
+        pressed.buttons.insert(button);
+    } else {
+        pressed.buttons.remove(&button);
+    }
+    Ok(())
+}
+
+async fn notify_portal_text(
+    remote_desktop: &RemoteDesktop,
+    session: &Session<RemoteDesktop>,
+    pressed: &mut PortalPressedInputs,
+    text: &str,
+) -> PortalCommandResult {
+    for character in text.chars() {
+        let keysym = unicode_keysym(character)?;
+        remote_desktop
+            .notify_keyboard_keysym(
+                session,
+                keysym,
+                KeyState::Pressed,
+                NotifyKeyboardKeysymOptions::default(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        pressed.keysyms.insert(keysym);
+        if let Err(error) = remote_desktop
+            .notify_keyboard_keysym(
+                session,
+                keysym,
+                KeyState::Released,
+                NotifyKeyboardKeysymOptions::default(),
+            )
+            .await
+        {
+            let _ = release_portal_inputs(remote_desktop, session, pressed).await;
+            return Err(error.to_string());
+        }
+        pressed.keysyms.remove(&keysym);
+    }
+    Ok(())
+}
+
+fn unicode_keysym(character: char) -> Result<i32, String> {
+    let keysym = match character {
+        '\n' | '\r' => 0xff0d,
+        '\t' => 0xff09,
+        character if character.is_control() => {
+            return Err("text commit contains an unsupported control character".into());
+        }
+        character if u32::from(character) <= 0xff => u32::from(character),
+        character => 0x0100_0000 | u32::from(character),
+    };
+    i32::try_from(keysym).map_err(|_| "text commit keysym exceeds the portal range".into())
+}
+
+async fn release_portal_inputs(
+    remote_desktop: &RemoteDesktop,
+    session: &Session<RemoteDesktop>,
+    pressed: &mut PortalPressedInputs,
+) -> PortalCommandResult {
+    let mut failure = None;
+    for keysym in pressed.keysyms.drain() {
+        if let Err(error) = remote_desktop
+            .notify_keyboard_keysym(
+                session,
+                keysym,
+                KeyState::Released,
+                NotifyKeyboardKeysymOptions::default(),
+            )
+            .await
+        {
+            failure.get_or_insert_with(|| error.to_string());
+        }
+    }
+    for keycode in pressed.keycodes.drain() {
+        if let Err(error) = remote_desktop
+            .notify_keyboard_keycode(
+                session,
+                keycode,
+                KeyState::Released,
+                NotifyKeyboardKeycodeOptions::default(),
+            )
+            .await
+        {
+            failure.get_or_insert_with(|| error.to_string());
+        }
+    }
+    for button in pressed.buttons.drain() {
+        if let Err(error) = remote_desktop
+            .notify_pointer_button(
+                session,
+                button,
+                KeyState::Released,
+                NotifyPointerButtonOptions::default(),
+            )
+            .await
+        {
+            failure.get_or_insert_with(|| error.to_string());
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 struct PipeWireConsumer {
@@ -1212,6 +1868,8 @@ mod tests {
             version: 5,
             source_types: SOURCE_TYPE_MONITOR,
             cursor_modes: CURSOR_MODE_EMBEDDED,
+            remote_desktop_version: 2,
+            device_types: DEVICE_TYPE_KEYBOARD | DEVICE_TYPE_POINTER,
         };
         capturer.status.session = PortalSessionState::RequestingUserAuthorization;
         assert_eq!(
@@ -1228,6 +1886,45 @@ mod tests {
             capturer.authorization_state(),
             CaptureAuthorizationState::Denied
         );
+    }
+
+    #[test]
+    fn portal_input_rejects_invalid_values_without_an_active_session() {
+        let input = UbuntuWaylandPortalInput;
+        assert_eq!(
+            input.move_pointer(f64::NAN, 0.5),
+            Err(PortalInputError::InvalidInput(
+                "pointer coordinates must be finite normalized values"
+            ))
+        );
+        assert_eq!(
+            input.wheel(0.0, f64::INFINITY),
+            Err(PortalInputError::InvalidInput(
+                "wheel deltas must be finite"
+            ))
+        );
+        assert_eq!(input.release_all(), Ok(()));
+    }
+
+    #[test]
+    fn unicode_text_uses_xkb_keysyms_without_logging_content() {
+        assert_eq!(unicode_keysym('A'), Ok(0x41));
+        assert_eq!(unicode_keysym('\n'), Ok(0xff0d));
+        assert_eq!(unicode_keysym('\t'), Ok(0xff09));
+        assert_eq!(unicode_keysym('\u{4e2d}'), Ok(0x0100_4e2d));
+        assert!(unicode_keysym('\0').is_err());
+    }
+
+    #[test]
+    fn normalized_pointer_coordinates_map_to_portal_stream_space() {
+        let target = PortalInputTarget {
+            stream_id: 42,
+            width: 1_920,
+            height: 1_080,
+        };
+        assert_eq!(target.coordinates(0.0, 0.0), (0.0, 0.0));
+        assert_eq!(target.coordinates(1.0, 1.0), (1_919.0, 1_079.0));
+        assert_eq!(target.coordinates(0.5, 0.5), (959.5, 539.5));
     }
 
     #[test]
@@ -1315,7 +2012,7 @@ mod tests {
 
     #[test]
     #[ignore = "opens the real portal authorization dialog and requires a Wayland desktop"]
-    fn live_portal_authorization_consumes_a_nonempty_owned_frame() {
+    fn live_portal_authorization_enables_capture_and_remote_desktop_input() {
         let mut capturer = UbuntuWaylandPortalCapturer::default();
         capturer
             .start()
@@ -1339,6 +2036,10 @@ mod tests {
         assert!(!frame.bytes().is_empty());
         assert_eq!(frame.width(), monitor.width);
         assert_eq!(frame.height(), monitor.height);
+        let input = UbuntuWaylandPortalInput;
+        assert!(input.is_active());
+        input.release_all().expect("portal release all");
         capturer.stop().expect("portal and PipeWire cleanup");
+        assert!(!input.is_active());
     }
 }

@@ -503,7 +503,13 @@ component PermissionLine inherits Rectangle {
 
 component ControlledPage inherits Rectangle {
     in property <string> privacy-status;
+    in property <string> capture-status;
+    in property <string> input-status;
+    in property <string> session-status;
     in property <bool> allow-account-remote;
+    in property <bool> capture-available;
+    in property <bool> input-available;
+    in property <bool> controlled-active;
     callback set-allow-account-remote(bool);
     callback disconnect();
     background: Theme.canvas;
@@ -514,7 +520,7 @@ component ControlledPage inherits Rectangle {
             height: 48px;
             Text { text: "本机被控授权与状态"; color: Theme.text; font-size: 24px; font-weight: 700; vertical-alignment: center; }
             Rectangle { horizontal-stretch: 1; background: transparent; }
-            Button { text: "立即断开"; clicked => { root.disconnect(); } }
+            Button { text: "立即断开"; enabled: root.controlled-active; clicked => { root.disconnect(); } }
         }
         Rectangle {
             height: 58px;
@@ -527,8 +533,15 @@ component ControlledPage inherits Rectangle {
                 padding-right: 16px;
                 spacing: 10px;
                 alignment: center;
-                StatusLabel { label: "未被控制"; }
-                Text { text: "本机仅处于本地 UI 演示状态，没有远程会话或屏幕采集。"; color: #3f694e; font-size: 12px; }
+                StatusLabel { label: root.controlled-active ? "控制中" : "等待连接"; }
+                Text {
+                    text: root.session-status == ""
+                        ? "本机已就绪，等待同账号设备连接。"
+                        : root.session-status;
+                    color: #3f694e;
+                    font-size: 12px;
+                    overflow: elide;
+                }
             }
         }
         SectionHeading { title: "被控能力"; meta: "敏感能力默认关闭"; }
@@ -561,8 +574,18 @@ component ControlledPage inherits Rectangle {
                     }
                     Rectangle { x: 0px; y: parent.height - 1px; width: parent.width; height: 1px; background: #e8ebee; }
                 }
-                PermissionLine { name: "屏幕查看"; detail: "受系统采集授权和会话权限共同限制"; state: "unsupported"; }
-                PermissionLine { name: "鼠标与键盘"; detail: "断开、失焦或超时时必须 release-all"; state: "unsupported"; }
+                PermissionLine {
+                    name: "屏幕查看";
+                    detail: root.capture-status;
+                    state: root.capture-available ? "已接入" : "不可用";
+                    active: root.capture-available;
+                }
+                PermissionLine {
+                    name: "鼠标与键盘";
+                    detail: root.input-status;
+                    state: root.input-available ? "已接入" : "不可用";
+                    active: root.input-available;
+                }
                 PermissionLine { name: "剪贴板 / 文件传输"; detail: "独立授权，不保存内容到日志"; state: "默认关闭"; }
                 PermissionLine { name: "隐私屏 / 本地输入保护"; detail: root.privacy-status; state: "unsupported"; }
             }
@@ -677,6 +700,9 @@ export component AppWindow inherits Window {
     in-out property <string> server-key-fingerprint: "";
     in-out property <string> device-summary: "0 台账号设备";
     in-out property <bool> allow-account-remote: false;
+    in-out property <bool> capture-available: false;
+    in-out property <bool> input-available: false;
+    in-out property <bool> controlled-active: false;
     in-out property <[DeviceListItem]> devices: [];
 
     callback login(string, string);
@@ -784,7 +810,13 @@ export component AppWindow inherits Window {
                     }
                     if root.page == 3: ControlledPage {
                         privacy-status: root.privacy-status;
+                        capture-status: root.capture-status;
+                        input-status: root.input-status;
+                        session-status: root.session-status;
                         allow-account-remote: root.allow-account-remote;
+                        capture-available: root.capture-available;
+                        input-available: root.input-available;
+                        controlled-active: root.controlled-active;
                         set-allow-account-remote(value) => { root.set-allow-account-remote(value); }
                         disconnect => { root.disconnect(); }
                     }

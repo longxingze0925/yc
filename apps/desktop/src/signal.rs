@@ -417,6 +417,17 @@ impl SignalWebSocketClient {
             })
     }
 
+    pub fn request_online_devices(&self) -> Result<(), SignalError> {
+        let worker = self.worker.as_ref().ok_or(SignalError::WorkerUnavailable)?;
+        worker
+            .outbound
+            .try_send(encode_list_online_devices_request())
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => SignalError::OutboundQueueFull,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => SignalError::WorkerUnavailable,
+            })
+    }
+
     fn stop_worker(&mut self) {
         if let Some(worker) = self.worker.take() {
             let _ = worker.cancel.send(true);
@@ -641,7 +652,18 @@ async fn establish_connection(
         close_socket(&mut socket, CloseCode::Policy, "hello_ok rejected").await;
         return Err(error);
     }
+    send_with_timeout(
+        &mut socket,
+        Message::Text(encode_list_online_devices_request().into()),
+        options.handshake_timeout,
+        cancel,
+    )
+    .await?;
     Ok(socket)
+}
+
+fn encode_list_online_devices_request() -> String {
+    r#"{"type":"list_online_devices"}"#.to_owned()
 }
 
 async fn connect_socket(
@@ -1982,6 +2004,29 @@ mod tests {
                 }
                 loop {
                     match socket.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let request: Value = serde_json::from_str(&text)
+                                .expect("authenticated client request JSON");
+                            assert_eq!(request["type"], "list_online_devices");
+                            let online_devices = serde_json::json!({
+                                "type": "online_devices",
+                                "devices": [{
+                                    "account_id": "account-1",
+                                    "device_id": "ios-1",
+                                    "public_key_id": "ios-key-1",
+                                    "public_key_version": 1,
+                                    "public_key": URL_SAFE_NO_PAD.encode(public_key),
+                                    "client_capabilities_hash": "aa".repeat(32),
+                                    "status": "online",
+                                    "last_seen_epoch_millis": now_epoch_millis(),
+                                    "connection_id": "ios-connection-1"
+                                }]
+                            });
+                            socket
+                                .send(Message::Text(online_devices.to_string().into()))
+                                .await
+                                .expect("online devices response");
+                        }
                         Some(Ok(Message::Ping(payload))) => {
                             socket
                                 .send(Message::Pong(payload))
@@ -2314,11 +2359,24 @@ mod tests {
             .expect("start authenticated websocket");
         wait_for_state(&client, SignalConnectionState::Online);
         assert!(!format!("{client:?}").contains("access-private"));
+        let notification = wait_for_notification(&client);
+        let SignalNotification::OnlineDevices(devices) = notification else {
+            panic!("expected automatic online device lookup");
+        };
+        assert_eq!(devices[0].device_id, "ios-1");
 
         client.disconnect();
         assert_eq!(client.state(), SignalConnectionState::Disconnected);
         assert!(!client.has_active_worker());
         server.wait_for_close();
+    }
+
+    #[test]
+    fn online_device_request_has_the_frozen_wire_shape() {
+        assert_eq!(
+            encode_list_online_devices_request(),
+            r#"{"type":"list_online_devices"}"#
+        );
     }
 
     #[test]

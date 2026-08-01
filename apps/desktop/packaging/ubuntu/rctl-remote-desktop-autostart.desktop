@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Remote Control Background Service
+Name[zh_CN]=远程控制后台服务
+Comment=Keep this device available to other devices in your account
+Comment[zh_CN]=保持本机可供账号内其他设备连接
+Exec=rctl-remote-desktop
+Icon=rctl-remote-desktop
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Phase=Applications
+X-GNOME-Autostart-Delay=2

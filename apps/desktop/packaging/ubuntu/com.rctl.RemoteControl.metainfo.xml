@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.rctl.RemoteControl</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <name>Remote Control</name>
+  <name xml:lang="zh-CN">远程控制</name>
+  <summary>Control devices in your account from another device</summary>
+  <summary xml:lang="zh-CN">从其他设备控制账号内的电脑</summary>
+  <description>
+    <p>Remote Control is the desktop client for account-based access to computers that you explicitly enable.</p>
+    <p xml:lang="zh-CN">远程控制是通过同一账号连接由本机用户明确启用的电脑桌面客户端。</p>
+  </description>
+  <developer id="com.rctl">
+    <name>Remote Control Project</name>
+  </developer>
+  <launchable type="desktop-id">rctl-remote-desktop.desktop</launchable>
+  <provides>
+    <binary>rctl-remote-desktop</binary>
+  </provides>
+  <url type="homepage">https://github.com/longxingze0925/yc</url>
+  <content_rating type="oars-1.1"/>
+</component>

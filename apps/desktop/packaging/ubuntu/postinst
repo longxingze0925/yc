@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+PACKAGE_CA=/usr/share/rctl-remote-desktop/certificates/yc-root-ca.crt
+SYSTEM_CA=/usr/local/share/ca-certificates/rctl-remote-desktop-yc-root-ca.crt
+EXPECTED_SHA256=8686e04a66e3978e5c5f8c11d0d5bf9afcc44b6fbe2e19277ead05481895cbc8
+
+case "${1:-}" in
+    configure)
+        actual_sha256="$(sha256sum "$PACKAGE_CA" | awk '{print $1}')"
+        if [ "$actual_sha256" != "$EXPECTED_SHA256" ]; then
+            echo "Remote Control CA certificate checksum mismatch" >&2
+            exit 1
+        fi
+        install -d -m 0755 /usr/local/share/ca-certificates
+        install -m 0644 "$PACKAGE_CA" "$SYSTEM_CA"
+        update-ca-certificates
+        ;;
+esac
+
+exit 0
