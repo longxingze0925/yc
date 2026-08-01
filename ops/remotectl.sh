@@ -494,6 +494,14 @@ validate_compose_config() {
     docker_compose config --quiet
 }
 
+build_service_images() {
+    local service
+    for service in api-server signal-server relay-server; do
+        log "Building $service"
+        docker_compose build "$service" || return 1
+    done
+}
+
 public_curl() {
     local arguments=(--fail --silent --show-error --location --max-time 15)
     if [[ -n "${CLIENT_CA_CERT_PATH:-}" && -r "${CLIENT_CA_CERT_PATH:-}" ]]; then
@@ -581,7 +589,14 @@ backup_database() {
 start_stack() {
     load_env
     validate_compose_config
-    docker_compose up --detach --build --remove-orphans
+    if ! build_service_images; then
+        warn 'service image build failed'
+        return 1
+    fi
+    if ! docker_compose up --detach --remove-orphans; then
+        warn 'Compose startup failed'
+        return 1
+    fi
     if ! wait_for_services; then
         warn 'service startup health checks failed; inspect remote-control logs'
         return 1
@@ -632,17 +647,18 @@ update_main() {
     fi
     backup_database >/dev/null
     download_source
-    if ! validate_compose_config || ! docker_compose up --detach --build --remove-orphans; then
+    if ! validate_compose_config || ! build_service_images \
+        || ! docker_compose up --detach --remove-orphans; then
         rollback_source
         install_manager_command
-        docker_compose up --detach --build --remove-orphans || true
+        build_service_images && docker_compose up --detach --remove-orphans || true
         die 'update failed; previous source was restored'
     fi
     install_manager_command
     wait_for_services || {
         rollback_source
         install_manager_command
-        docker_compose up --detach --build --remove-orphans || true
+        build_service_images && docker_compose up --detach --remove-orphans || true
         die 'updated services failed health checks; previous source was restored'
     }
     log 'Update completed; app.previous retains the prior source until the next update'
