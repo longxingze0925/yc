@@ -819,10 +819,19 @@ relay_tls_check() {
     timeout 15 openssl s_client "${arguments[@]}" </dev/null >/dev/null 2>&1
 }
 
+websocket_probe_url() {
+    local url="$1"
+    case "$url" in
+        wss://*) printf 'https://%s\n' "${url#wss://}" ;;
+        ws://*) printf 'http://%s\n' "${url#ws://}" ;;
+        *) printf '%s\n' "$url" ;;
+    esac
+}
+
 diagnose_main() {
     require_root
     load_env
-    local failures=0 ws_status
+    local failures=0 ws_status ws_probe_url
     log 'Checking Compose configuration'
     validate_compose_config || failures=$((failures + 1))
     log 'Checking containers and internal health endpoints'
@@ -831,11 +840,12 @@ diagnose_main() {
     log 'Checking public API TLS endpoint'
     local_public_curl "$REMOTE_API_PUBLIC_URL/health" >/dev/null || failures=$((failures + 1))
     log 'Checking Signal WebSocket route'
+    ws_probe_url="$(websocket_probe_url "$REMOTE_SIGNAL_PUBLIC_URL")"
     ws_status="$(local_public_curl --output /dev/null --write-out '%{http_code}' \
         --http1.1 --header 'Connection: Upgrade' --header 'Upgrade: websocket' \
         --header 'Sec-WebSocket-Version: 13' \
         --header 'Sec-WebSocket-Key: cmVtb3RlLWNvbnRyb2w=' \
-        "$REMOTE_SIGNAL_PUBLIC_URL" 2>/dev/null || true)"
+        "$ws_probe_url" 2>/dev/null || true)"
     if [[ -z "$ws_status" || "$ws_status" == "000" || "$ws_status" == "502" ]]; then
         warn "Signal WebSocket route failed with HTTP ${ws_status:-000}"
         failures=$((failures + 1))

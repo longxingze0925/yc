@@ -40,6 +40,7 @@ set +a
 [[ "$REMOTE_SIGNAL_PUBLIC_URL" == "wss://203.0.113.10:8443/ws" ]]
 [[ "$REMOTE_RELAY_PUBLIC_URL" == "203.0.113.10:18082" ]]
 [[ ${#REMOTE_MFA_SECRET_KEY} -eq 43 ]]
+[[ "$(websocket_probe_url "$REMOTE_SIGNAL_PUBLIC_URL")" == "https://203.0.113.10:8443/ws" ]]
 
 rendered_compose="$(docker compose --env-file "$ENV_FILE" \
     --file "$repository_root/infra/production/compose.yml" config)"
