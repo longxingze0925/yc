@@ -807,13 +807,12 @@ async fn handle_socket(
         return;
     }
 
-    let response = match socket.recv().await {
-        Some(Ok(Message::Text(text))) => serde_json::from_str::<HelloResponse>(&text).ok(),
-        _ => None,
-    };
-    let Some(response) = response else {
-        reject_socket(&mut socket, "hello_response required").await;
-        return;
+    let response = match receive_hello_response(&mut socket).await {
+        Ok(response) => response,
+        Err(reason) => {
+            reject_socket(&mut socket, &reason).await;
+            return;
+        }
     };
     let authenticated = match authenticate_hello(
         &state,
@@ -960,9 +959,48 @@ async fn handle_socket(
     info!(%device_id, %connection_id, "device offline");
 }
 
+async fn receive_hello_response(socket: &mut WebSocket) -> Result<HelloResponse, String> {
+    timeout(Duration::from_millis(HELLO_TTL_MILLIS), async {
+        loop {
+            match socket.recv().await {
+                Some(Ok(Message::Text(text))) => {
+                    return serde_json::from_str::<HelloResponse>(&text)
+                        .map_err(|error| format!("invalid hello_response: {error}"));
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|_| "cannot send hello handshake pong".to_owned())?;
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Binary(_))) => {
+                    return Err("hello_response must use a text frame".to_owned());
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    return Err("connection closed before hello_response".to_owned());
+                }
+                Some(Err(_)) => return Err("cannot receive hello_response".to_owned()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "hello_response timed out".to_owned())?
+}
+
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(test, derive(Serialize))]
+#[serde(rename_all = "snake_case")]
+enum HelloMessageType {
+    HelloResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+#[serde(deny_unknown_fields)]
 struct HelloResponse {
+    #[serde(rename = "type")]
+    _message_type: HelloMessageType,
     account_id: String,
     device_id: String,
     client_nonce: String,
@@ -1851,6 +1889,7 @@ mod tests {
         .expect("canonical");
         let signature = signing_key.sign(&sha256(&canonical));
         HelloResponse {
+            _message_type: HelloMessageType::HelloResponse,
             account_id: "account-1".to_owned(),
             device_id: "ubuntu-1".to_owned(),
             client_nonce: encode(&client_nonce),
@@ -1864,6 +1903,25 @@ mod tests {
             client_capabilities_hash: encode_hex(&capabilities_hash),
             device_signature: encode(&signature.to_bytes()),
         }
+    }
+
+    #[test]
+    fn hello_response_wire_shape_is_strict_and_tagged() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let negotiation = parse_protocol_headers(Some("1"), Some("1")).expect("negotiation");
+        let response = valid_hello(&signing_key, &[3; 32], &negotiation, 1_000_000);
+        let mut value = serde_json::to_value(response).expect("serialize hello_response");
+
+        assert_eq!(value["type"], "hello_response");
+        serde_json::from_value::<HelloResponse>(value.clone()).expect("parse hello_response");
+
+        value
+            .as_object_mut()
+            .expect("hello_response object")
+            .insert("unexpected".to_owned(), Value::Bool(true));
+        let error = serde_json::from_value::<HelloResponse>(value)
+            .expect_err("unknown hello_response fields must be rejected");
+        assert!(error.to_string().contains("unknown field `unexpected`"));
     }
 
     fn notification_body(message: Value) -> Value {

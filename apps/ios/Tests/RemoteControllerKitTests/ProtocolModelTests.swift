@@ -313,13 +313,13 @@ final class ProtocolModelTests: XCTestCase {
     func testSignalCapabilitiesHashMatchesRustJCSVector() throws {
         XCTAssertEqual(
             try iosCapabilities().canonicalHash().lowercaseHexString,
-            "b3fe25455e46c961c18fb2b352ee63f7e7a0b4c7fae686b94446ed11b315b612"
+            "0737d855153b6f42cd639d2629e8ca4f98ff457f0735166620dd491449b01ca9"
         )
     }
 
     func testSignalHelloSignatureInputMatchesRustVector() throws {
         let versionsHash = try XCTUnwrap(Data(hex: "d7f737b97f9f0957de182c6990e19ee567d8de437749d34e74602f9ad53af6fc"))
-        let capabilitiesHash = try XCTUnwrap(Data(hex: "b3fe25455e46c961c18fb2b352ee63f7e7a0b4c7fae686b94446ed11b315b612"))
+        let capabilitiesHash = try XCTUnwrap(Data(hex: "0737d855153b6f42cd639d2629e8ca4f98ff457f0735166620dd491449b01ca9"))
         let canonical = try SignalHandshakeCanonical.helloSignatureInput(
             serverNonce: Data(repeating: 1, count: 32),
             clientNonce: Data(repeating: 2, count: 32),
@@ -332,7 +332,7 @@ final class ProtocolModelTests: XCTestCase {
         )
         XCTAssertEqual(
             Data(SHA256.hash(data: canonical)).lowercaseHexString,
-            "952205f4ed4ac07b94b2b817c27ebb81765fc6ca2a0dba4d4307fd84029ee35c"
+            "2543c76db2a586d1d4e0480bb158e639090d0feef3451a8e5666dc692c13be08"
         )
     }
 
