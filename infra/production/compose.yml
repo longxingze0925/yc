@@ -61,6 +61,7 @@ services:
       <<: *service-build
       args:
         SERVICE: api-server
+        CARGO_REGISTRIES_CRATES_IO_INDEX: ${CARGO_REGISTRIES_CRATES_IO_INDEX:-sparse+https://index.crates.io/}
     environment:
       <<: *service-environment
       REMOTE_API_BIND: 0.0.0.0:18080
@@ -92,6 +93,7 @@ services:
       <<: *service-build
       args:
         SERVICE: signal-server
+        CARGO_REGISTRIES_CRATES_IO_INDEX: ${CARGO_REGISTRIES_CRATES_IO_INDEX:-sparse+https://index.crates.io/}
     environment:
       <<: *service-environment
       REMOTE_SIGNAL_BIND: 0.0.0.0:18081
@@ -119,6 +121,7 @@ services:
       <<: *service-build
       args:
         SERVICE: relay-server
+        CARGO_REGISTRIES_CRATES_IO_INDEX: ${CARGO_REGISTRIES_CRATES_IO_INDEX:-sparse+https://index.crates.io/}
     user: "0:0"
     environment:
       <<: *service-environment
