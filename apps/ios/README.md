@@ -61,10 +61,21 @@ Secrets：
 - `ASC_ISSUER_ID`：App Store Connect Issuer ID。
 - `ASC_PRIVATE_KEY_BASE64`：`AuthKey_*.p8` 的 base64 内容。
 
-在 GitHub Actions 中打开 `iOS`，运行 `Run workflow`：第一次先保持
-`upload_to_testflight=false` 验证签名归档；归档成功后再选择 `true` 上传。证书、profile 和
-API 私钥只进入临时 keychain/目录，任务结束会删除，不写入仓库或构建产物。
+在 GitHub Actions 中打开 `iOS`，运行 `Run workflow`：第一次选择
+`build_mode=signed_archive` 验证签名归档；归档成功后再选择
+`build_mode=testflight` 上传。证书、profile 和 API 私钥只进入临时
+keychain/目录，任务结束会删除，不写入仓库或构建产物。
 
 `tools/ios-testflight.sh` 会强制校验 HTTPS/WSS、Team ID、Bundle ID 和 provisioning
 profile 的绑定关系，并输出 IPA、dSYM 和 SHA-256。上传后仍需在 App Store Connect 中等待
 Apple 处理完成，再把构建加入 TestFlight 内部测试。
+
+### 个人签名侧载
+
+手动运行 `iOS` workflow 时选择 `build_mode=unsigned_ipa`，不读取
+`testflight` Environment，也不需要 Apple Distribution 证书。任务会生成包含
+arm64 真机 Rust Core 的未签名 IPA，并上传为 `ios-unsigned-<run_number>` artifact。
+
+下载 artifact 并解压后，可在 Windows 上使用个人 Apple ID 签名工具重签
+`RemoteController-*-unsigned.ipa` 后安装到自有 iPhone。免费个人签名通常需要每
+7 天重新签名安装，且可用 entitlement 少于 TestFlight/App Store 签名。

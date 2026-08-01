@@ -12,6 +12,7 @@ on:
       - "crates/remote-runtime/**"
       - "crates/remote-transport/**"
       - "tools/build-ios-core-xcframework.sh"
+      - "tools/ios-unsigned-ipa.sh"
       - "tools/ios-testflight.sh"
       - "Cargo.lock"
       - "Cargo.toml"
@@ -26,21 +27,41 @@ on:
       - "crates/remote-runtime/**"
       - "crates/remote-transport/**"
       - "tools/build-ios-core-xcframework.sh"
+      - "tools/ios-unsigned-ipa.sh"
       - "tools/ios-testflight.sh"
       - "Cargo.lock"
       - "Cargo.toml"
   workflow_dispatch:
     inputs:
-      upload_to_testflight:
-        description: "签名归档后上传到 TestFlight"
+      build_mode:
+        description: "构建方式"
         required: true
-        type: boolean
-        default: false
+        type: choice
+        default: unsigned_ipa
+        options:
+          - unsigned_ipa
+          - signed_archive
+          - testflight
       marketing_version:
         description: "CFBundleShortVersionString，例如 0.1.0"
         required: true
         type: string
         default: "0.1.0"
+      api_url:
+        description: "App 内置 HTTPS API 地址"
+        required: true
+        type: string
+        default: "https://121.41.115.106:8443"
+      signal_url:
+        description: "App 内置 WSS Signal 地址"
+        required: true
+        type: string
+        default: "wss://121.41.115.106:8443/ws"
+      bundle_id:
+        description: "IPA Bundle ID"
+        required: true
+        type: string
+        default: "com.rctl.remote.controller"
 
 permissions:
   contents: read
@@ -89,9 +110,47 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
+  unsigned-ipa:
+    name: Unsigned iPhone IPA
+    if: github.event_name == 'workflow_dispatch' && inputs.build_mode == 'unsigned_ipa'
+    needs: simulator-build
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build unsigned iPhone IPA
+        env:
+          RCTL_OFFICIAL_API_URL: ${{ inputs.api_url }}
+          RCTL_OFFICIAL_SIGNAL_URL: ${{ inputs.signal_url }}
+          IOS_BUNDLE_ID: ${{ inputs.bundle_id }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          MARKETING_VERSION: ${{ inputs.marketing_version }}
+          IOS_OUTPUT_DIR: ${{ runner.temp }}/ios-unsigned
+        run: ./tools/ios-unsigned-ipa.sh
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned-${{ github.run_number }}
+          path: ${{ runner.temp }}/ios-unsigned
+          if-no-files-found: error
+          retention-days: 7
+
   testflight:
     name: Signed archive
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.build_mode == 'signed_archive' || inputs.build_mode == 'testflight')
     needs: simulator-build
     runs-on: macos-15
     timeout-minutes: 90
@@ -122,7 +181,7 @@ jobs:
           ASC_PRIVATE_KEY_BASE64: ${{ secrets.ASC_PRIVATE_KEY_BASE64 }}
           BUILD_NUMBER: ${{ github.run_number }}
           MARKETING_VERSION: ${{ inputs.marketing_version }}
-          UPLOAD_TO_TESTFLIGHT: ${{ inputs.upload_to_testflight }}
+          UPLOAD_TO_TESTFLIGHT: ${{ inputs.build_mode == 'testflight' }}
           IOS_OUTPUT_DIR: ${{ runner.temp }}/ios-output
         run: ./tools/ios-testflight.sh
 
