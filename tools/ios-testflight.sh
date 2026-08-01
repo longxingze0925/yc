@@ -62,6 +62,8 @@ done
     exit 2
 }
 
+"${ROOT}/tools/generate-ios-service-config.sh"
+
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/remote-ios-signing.XXXXXX")"
 KEYCHAIN_PATH="${TEMP_DIR}/build.keychain-db"
 KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"

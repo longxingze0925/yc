@@ -91,9 +91,12 @@ public struct ServiceConfiguration: Codable, Equatable, Sendable {
     }
 
     public static func official(from bundle: Bundle = .main) throws -> ServiceConfiguration {
-        guard let apiValue = bundle.object(forInfoDictionaryKey: "RCTLOfficialAPIURL") as? String,
+        let apiValue = (bundle.object(forInfoDictionaryKey: "RCTLOfficialAPIURL") as? String)
+            ?? BuildServiceConfiguration.apiURL
+        let signalValue = (bundle.object(forInfoDictionaryKey: "RCTLOfficialSignalURL") as? String)
+            ?? BuildServiceConfiguration.signalURL
+        guard
               let apiURL = URL(string: apiValue),
-              let signalValue = bundle.object(forInfoDictionaryKey: "RCTLOfficialSignalURL") as? String,
               let signalURL = URL(string: signalValue) else {
             throw ServiceConfigurationError.officialServiceNotConfigured
         }

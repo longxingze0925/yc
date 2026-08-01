@@ -40,6 +40,8 @@ require_env RCTL_OFFICIAL_SIGNAL_URL
     exit 2
 }
 
+"$ROOT/tools/generate-ios-service-config.sh"
+
 for command_name in cargo ditto find lipo plutil rustup shasum xcodebuild xcodegen zip; do
     command -v "$command_name" >/dev/null || {
         echo "missing required command: $command_name" >&2
