@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 RCTL_MANAGER_VERSION=1
 readonly RCTL_MANAGER_VERSION
+RCTL_PROTOCOL_VERSION=1
+readonly RCTL_PROTOCOL_VERSION
 readonly REPOSITORY="${RCTL_REPOSITORY:-longxingze0925/yc}"
 readonly SOURCE_REF="${RCTL_SOURCE_REF:-main}"
 readonly INSTALL_DIR="${RCTL_INSTALL_DIR:-/opt/remote-control}"
@@ -720,6 +722,7 @@ create_account_main() {
         --arg display_name "$display_name" \
         '{email:$email,password:$password,display_name:$display_name}')"
     local_public_curl --request POST --header 'Content-Type: application/json' \
+        --header "x-rctl-protocol-version: $RCTL_PROTOCOL_VERSION" \
         --data "$payload" "$REMOTE_API_PUBLIC_URL/v1/auth/register"
     printf '\nAccount created.\n'
 }

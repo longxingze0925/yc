@@ -47,4 +47,16 @@ rendered_compose="$(docker compose --env-file "$ENV_FILE" \
 grep -F 'PUBLIC_HTTPS_REDIRECT_SUFFIX: :8443' <<< "$rendered_compose" >/dev/null
 grep -Fx ':443 {' "$repository_root/infra/production/Caddyfile" >/dev/null
 
+mkdir -p "$(dirname "$COMPOSE_FILE")"
+cp "$repository_root/infra/production/compose.yml" "$COMPOSE_FILE"
+captured_curl_arguments=()
+local_public_curl() {
+    captured_curl_arguments=("$@")
+}
+export RCTL_ACCOUNT_EMAIL='owner@example.com'
+export RCTL_ACCOUNT_DISPLAY_NAME='Owner'
+export RCTL_ACCOUNT_PASSWORD='correct-horse-battery-staple'
+create_account_main >/dev/null
+[[ " ${captured_curl_arguments[*]} " == *" x-rctl-protocol-version: 1 "* ]]
+
 printf 'production deployment smoke test passed\n'
