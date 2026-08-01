@@ -49,14 +49,18 @@ grep -Fx ':443 {' "$repository_root/infra/production/Caddyfile" >/dev/null
 
 mkdir -p "$(dirname "$COMPOSE_FILE")"
 cp "$repository_root/infra/production/compose.yml" "$COMPOSE_FILE"
-captured_curl_arguments=()
+captured_curl_arguments="$fixture_root/create-account-curl-arguments"
 local_public_curl() {
-    captured_curl_arguments=("$@")
+    printf '%s\n' "$@" > "$captured_curl_arguments"
+    printf '{"account_id":"account-1","access_token":"must-not-be-printed"}\n'
 }
 export RCTL_ACCOUNT_EMAIL='owner@example.com'
 export RCTL_ACCOUNT_DISPLAY_NAME='Owner'
 export RCTL_ACCOUNT_PASSWORD='correct-horse-battery-staple'
-create_account_main >/dev/null
-[[ " ${captured_curl_arguments[*]} " == *" x-rctl-protocol-version: 1 "* ]]
+create_account_output="$fixture_root/create-account.out"
+create_account_main > "$create_account_output"
+grep -Fx 'x-rctl-protocol-version: 1' "$captured_curl_arguments" >/dev/null
+grep -F 'Account created: account-1' "$create_account_output" >/dev/null
+! grep -F 'must-not-be-printed' "$create_account_output" >/dev/null
 
 printf 'production deployment smoke test passed\n'

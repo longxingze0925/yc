@@ -721,10 +721,13 @@ create_account_main() {
     payload="$(jq -cn --arg email "$email" --arg password "$password" \
         --arg display_name "$display_name" \
         '{email:$email,password:$password,display_name:$display_name}')"
-    local_public_curl --request POST --header 'Content-Type: application/json' \
+    local response account_id
+    response="$(local_public_curl --request POST --header 'Content-Type: application/json' \
         --header "x-rctl-protocol-version: $RCTL_PROTOCOL_VERSION" \
-        --data "$payload" "$REMOTE_API_PUBLIC_URL/v1/auth/register"
-    printf '\nAccount created.\n'
+        --data "$payload" "$REMOTE_API_PUBLIC_URL/v1/auth/register")"
+    account_id="$(jq -er '.account_id | select(type == "string" and length > 0)' \
+        <<< "$response")" || die 'account registration returned an invalid response'
+    printf '\nAccount created: %s\n' "$account_id"
 }
 
 restore_main() {
